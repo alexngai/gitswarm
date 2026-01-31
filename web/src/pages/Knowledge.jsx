@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Search, Lightbulb, Check, AlertTriangle, Link as LinkIcon } from 'lucide-react';
-import { Card, Badge, EmptyState, Button, Avatar } from '../components/Common';
+import { Card, Badge, EmptyState, Button, Avatar, CodeBlock } from '../components/Common';
 import { formatRelativeTime } from '../lib/utils';
 
 const demoKnowledge = [
@@ -83,9 +83,7 @@ function KnowledgeCard({ node }) {
           </p>
 
           {node.code_example && (
-            <pre className="mt-2 p-2 bg-bg-tertiary rounded text-xs overflow-x-auto font-mono">
-              {node.code_example}
-            </pre>
+            <CodeBlock code={node.code_example} className="mt-2" />
           )}
 
           <div className="flex items-center gap-4 mt-3 text-sm text-text-muted">

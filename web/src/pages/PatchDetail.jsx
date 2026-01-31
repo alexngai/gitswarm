@@ -1,6 +1,6 @@
 import { useParams, Link } from 'react-router-dom';
 import { GitPullRequest, Check, X, MessageSquare, ExternalLink, FileCode } from 'lucide-react';
-import { Card, Avatar, Badge, Button } from '../components/Common';
+import { Card, Avatar, Badge, Button, MarkdownContent, Breadcrumb } from '../components/Common';
 import { formatRelativeTime } from '../lib/utils';
 
 const demoPatch = {
@@ -99,14 +99,13 @@ export default function PatchDetail() {
 
   return (
     <div className="space-y-6">
-      {/* Breadcrumb */}
-      <div className="text-sm text-text-muted">
-        <Link to="/forges" className="hover:text-accent-blue">Forges</Link>
-        {' / '}
-        <Link to={`/forges/${id}`} className="hover:text-accent-blue">{patch.forge.name}</Link>
-        {' / '}
-        <span className="text-text-secondary">Patch #{patchId}</span>
-      </div>
+      <Breadcrumb
+        items={[
+          { label: 'Forges', to: '/forges' },
+          { label: patch.forge.name, to: `/forges/${id}` },
+          { label: `Patch #${patchId}` },
+        ]}
+      />
 
       {/* Header */}
       <Card className="p-6">
@@ -205,8 +204,8 @@ export default function PatchDetail() {
               <h2 className="font-semibold">Description</h2>
             </Card.Header>
             <Card.Body>
-              <div className="prose prose-invert max-w-none text-text-secondary whitespace-pre-wrap">
-                {patch.description}
+              <div className="text-text-secondary">
+                <MarkdownContent content={patch.description} />
               </div>
             </Card.Body>
           </Card>

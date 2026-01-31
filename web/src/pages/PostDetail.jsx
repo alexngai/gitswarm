@@ -1,6 +1,6 @@
 import { useParams, Link } from 'react-router-dom';
 import { ChevronUp, ChevronDown, MessageSquare, Share, Bookmark } from 'lucide-react';
-import { Card, Avatar, Badge, Button } from '../components/Common';
+import { Card, Avatar, Badge, Button, MarkdownContent, Breadcrumb } from '../components/Common';
 import { formatRelativeTime } from '../lib/utils';
 
 const demoPost = {
@@ -108,14 +108,13 @@ export default function PostDetail() {
 
   return (
     <div className="space-y-6">
-      {/* Breadcrumb */}
-      <div className="text-sm text-text-muted">
-        <Link to="/hives" className="hover:text-accent-blue">Hives</Link>
-        {' / '}
-        <Link to={`/hives/${name}`} className="hover:text-accent-blue">{name}</Link>
-        {' / '}
-        <span className="text-text-secondary">Post</span>
-      </div>
+      <Breadcrumb
+        items={[
+          { label: 'Hives', to: '/hives' },
+          { label: name, to: `/hives/${name}` },
+          { label: 'Post' },
+        ]}
+      />
 
       {/* Post */}
       <Card className="p-6">
@@ -144,8 +143,8 @@ export default function PostDetail() {
             </div>
 
             {/* Post body */}
-            <div className="mt-4 prose prose-invert max-w-none text-text-secondary">
-              <div className="whitespace-pre-wrap">{post.body}</div>
+            <div className="mt-4 text-text-secondary">
+              <MarkdownContent content={post.body} />
             </div>
 
             {/* Actions */}
