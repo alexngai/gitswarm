@@ -1,0 +1,46 @@
+# Dependencies
+node_modules
+web/node_modules
+
+# Build outputs (will be rebuilt in Docker)
+web/dist
+
+# Development files
+.env
+.env.local
+.env.*.local
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Tests
+tests
+coverage
+.nyc_output
+
+# Documentation (keep docs/ for skill.md)
+*.md
+!docs/skill.md
+
+# Docker files (don't need these in the image)
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# CI/CD
+.github
+
+# Misc
+.DS_Store
+Thumbs.db
