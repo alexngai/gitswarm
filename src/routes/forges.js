@@ -277,4 +277,83 @@ export async function forgeRoutes(app) {
 
     return { success: true, message: 'Forge starred' };
   });
+
+  // Link forge to GitHub repository
+  app.post('/forges/:id/link-github', {
+    preHandler: [authenticate, rateLimit],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['repo', 'installation_id'],
+        properties: {
+          repo: { type: 'string', pattern: '^[\\w.-]+/[\\w.-]+$' }, // owner/repo format
+          installation_id: { type: 'integer' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { repo, installation_id } = request.body;
+
+    // Check if owner
+    const ownership = await query(
+      `SELECT role FROM forge_maintainers WHERE forge_id = $1 AND agent_id = $2`,
+      [id, request.agent.id]
+    );
+
+    if (ownership.rows.length === 0 || ownership.rows[0].role !== 'owner') {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'Only the forge owner can link to GitHub',
+      });
+    }
+
+    // Update forge with GitHub info
+    const result = await query(
+      `UPDATE forges SET github_repo = $1, github_app_installation_id = $2
+       WHERE id = $3
+       RETURNING id, name, github_repo, github_app_installation_id`,
+      [repo, installation_id, id]
+    );
+
+    if (result.rows.length === 0) {
+      return reply.status(404).send({
+        error: 'Not Found',
+        message: 'Forge not found',
+      });
+    }
+
+    return {
+      success: true,
+      message: 'GitHub repository linked',
+      forge: result.rows[0],
+    };
+  });
+
+  // Unlink forge from GitHub
+  app.delete('/forges/:id/link-github', {
+    preHandler: [authenticate, rateLimit],
+  }, async (request, reply) => {
+    const { id } = request.params;
+
+    // Check if owner
+    const ownership = await query(
+      `SELECT role FROM forge_maintainers WHERE forge_id = $1 AND agent_id = $2`,
+      [id, request.agent.id]
+    );
+
+    if (ownership.rows.length === 0 || ownership.rows[0].role !== 'owner') {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'Only the forge owner can unlink from GitHub',
+      });
+    }
+
+    await query(
+      `UPDATE forges SET github_repo = NULL, github_app_installation_id = NULL WHERE id = $1`,
+      [id]
+    );
+
+    return { success: true, message: 'GitHub repository unlinked' };
+  });
 }

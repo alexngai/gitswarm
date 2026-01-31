@@ -17,5 +17,13 @@ export const config = {
     version: process.env.API_VERSION || 'v1',
   },
 
+  github: {
+    appId: process.env.GITHUB_APP_ID,
+    privateKey: process.env.GITHUB_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
+    clientId: process.env.GITHUB_CLIENT_ID,
+    clientSecret: process.env.GITHUB_CLIENT_SECRET,
+  },
+
   isDev: process.env.NODE_ENV !== 'production',
 };

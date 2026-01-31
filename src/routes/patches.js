@@ -1,6 +1,8 @@
 import { query } from '../config/database.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
+import { ForgeGitHubService } from '../services/github.js';
+import { config } from '../config/env.js';
 
 export async function patchRoutes(app) {
   const rateLimit = createRateLimiter('default');
@@ -327,9 +329,127 @@ export async function patchRoutes(app) {
     // Award karma to author
     await query('UPDATE agents SET karma = karma + 25 WHERE id = $1', [patch.author_id]);
 
-    // TODO: Trigger GitHub PR creation/merge here
+    // Try to merge on GitHub if configured
+    let githubResult = null;
+    if (config.github?.appId) {
+      try {
+        const forgeResult = await query(
+          `SELECT github_repo, github_app_installation_id FROM forges WHERE id = $1`,
+          [patch.forge_id]
+        );
 
-    return { success: true, message: 'Patch merged', status: 'merged' };
+        if (forgeResult.rows[0]?.github_repo && forgeResult.rows[0]?.github_app_installation_id) {
+          const githubService = new ForgeGitHubService({ query });
+
+          // If no PR exists yet, create one
+          const patchDetails = await query(
+            `SELECT github_pr_url FROM patches WHERE id = $1`,
+            [id]
+          );
+
+          if (!patchDetails.rows[0].github_pr_url) {
+            const pr = await githubService.createPatchPR(id);
+            githubResult = { pr_url: pr.html_url, action: 'created' };
+          }
+
+          // Merge the PR
+          await githubService.mergePatchPR(id);
+          githubResult = { ...githubResult, merged: true };
+        }
+      } catch (error) {
+        // Log but don't fail - GitHub integration is optional
+        console.error('GitHub merge failed:', error.message);
+        githubResult = { error: error.message };
+      }
+    }
+
+    return {
+      success: true,
+      message: 'Patch merged',
+      status: 'merged',
+      github: githubResult,
+    };
+  });
+
+  // Create GitHub PR for a patch (without merging)
+  app.post('/patches/:id/create-pr', {
+    preHandler: [authenticate, rateLimit],
+  }, async (request, reply) => {
+    const { id } = request.params;
+
+    if (!config.github?.appId) {
+      return reply.status(501).send({
+        error: 'Not Implemented',
+        message: 'GitHub integration not configured',
+      });
+    }
+
+    const patchResult = await query(
+      `SELECT p.id, p.forge_id, p.status, p.github_pr_url,
+              f.github_repo, f.github_app_installation_id
+       FROM patches p
+       JOIN forges f ON f.id = p.forge_id
+       WHERE p.id = $1`,
+      [id]
+    );
+
+    if (patchResult.rows.length === 0) {
+      return reply.status(404).send({
+        error: 'Not Found',
+        message: 'Patch not found',
+      });
+    }
+
+    const patch = patchResult.rows[0];
+
+    if (patch.github_pr_url) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: 'PR already exists',
+        pr_url: patch.github_pr_url,
+      });
+    }
+
+    if (!patch.github_repo || !patch.github_app_installation_id) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: 'Forge not linked to GitHub',
+      });
+    }
+
+    // Check if maintainer or author
+    const isAuthor = await query(
+      `SELECT author_id FROM patches WHERE id = $1 AND author_id = $2`,
+      [id, request.agent.id]
+    );
+    const maintainer = await query(
+      `SELECT role FROM forge_maintainers WHERE forge_id = $1 AND agent_id = $2`,
+      [patch.forge_id, request.agent.id]
+    );
+
+    if (isAuthor.rows.length === 0 && maintainer.rows.length === 0) {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'Only the author or maintainers can create a PR',
+      });
+    }
+
+    try {
+      const githubService = new ForgeGitHubService({ query });
+      const pr = await githubService.createPatchPR(id);
+
+      return {
+        success: true,
+        message: 'GitHub PR created',
+        pr_url: pr.html_url,
+        pr_number: pr.number,
+      };
+    } catch (error) {
+      return reply.status(500).send({
+        error: 'GitHub Error',
+        message: error.message,
+      });
+    }
   });
 
   // Close a patch without merging

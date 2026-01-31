@@ -14,6 +14,7 @@ import { forgeRoutes } from './routes/forges.js';
 import { patchRoutes } from './routes/patches.js';
 import { bountyRoutes } from './routes/bounties.js';
 import { syncRoutes } from './routes/syncs.js';
+import { webhookRoutes } from './routes/webhooks.js';
 
 const app = Fastify({
   logger: config.isDev
@@ -49,6 +50,9 @@ app.register(forgeRoutes, { prefix: apiPrefix });
 app.register(patchRoutes, { prefix: apiPrefix });
 app.register(bountyRoutes, { prefix: apiPrefix });
 app.register(syncRoutes, { prefix: apiPrefix });
+
+// Webhooks (no auth required, verified by signature)
+app.register(webhookRoutes, { prefix: apiPrefix });
 
 // Skill documentation endpoint
 app.get('/skill.md', async (request, reply) => {
