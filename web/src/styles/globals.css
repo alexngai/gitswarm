@@ -3,6 +3,35 @@
 @tailwind utilities;
 
 @layer base {
+  /* Dark theme (default) */
+  :root,
+  .dark {
+    --color-bg-primary: #0d1117;
+    --color-bg-secondary: #161b22;
+    --color-bg-tertiary: #21262d;
+    --color-bg-overlay: #30363d;
+    --color-border-default: #30363d;
+    --color-border-muted: #21262d;
+    --color-text-primary: #f0f6fc;
+    --color-text-secondary: #8b949e;
+    --color-text-muted: #6e7681;
+    --color-text-link: #58a6ff;
+  }
+
+  /* Light theme */
+  .light {
+    --color-bg-primary: #ffffff;
+    --color-bg-secondary: #f6f8fa;
+    --color-bg-tertiary: #eaeef2;
+    --color-bg-overlay: #d0d7de;
+    --color-border-default: #d0d7de;
+    --color-border-muted: #eaeef2;
+    --color-text-primary: #1f2328;
+    --color-text-secondary: #656d76;
+    --color-text-muted: #8c959f;
+    --color-text-link: #0969da;
+  }
+
   html {
     @apply antialiased;
   }

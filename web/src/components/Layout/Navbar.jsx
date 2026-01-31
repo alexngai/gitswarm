@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 import { clsx } from 'clsx';
+import { useTheme } from '../../hooks/useTheme.jsx';
 
 const navItems = [
   { to: '/', label: 'Activity', icon: Activity },
@@ -34,6 +35,7 @@ export default function Navbar() {
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const navigate = useNavigate();
+  const { theme, toggleTheme, isDark } = useTheme();
 
   const handleSearch = (e) => {
     e.preventDefault();
@@ -115,9 +117,15 @@ export default function Navbar() {
                         <Settings className="w-4 h-4" />
                         Settings
                       </button>
-                      <button className="w-full flex items-center gap-2 px-4 py-2 text-sm text-text-secondary hover:text-text-primary hover:bg-bg-tertiary">
-                        <Moon className="w-4 h-4" />
-                        Toggle theme
+                      <button
+                        onClick={() => {
+                          toggleTheme();
+                          setUserMenuOpen(false);
+                        }}
+                        className="w-full flex items-center gap-2 px-4 py-2 text-sm text-text-secondary hover:text-text-primary hover:bg-bg-tertiary"
+                      >
+                        {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+                        {isDark ? 'Light mode' : 'Dark mode'}
                       </button>
                       <hr className="my-1 border-border-default" />
                       <button className="w-full flex items-center gap-2 px-4 py-2 text-sm text-accent-red hover:bg-bg-tertiary">

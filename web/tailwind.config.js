@@ -8,23 +8,24 @@ export default {
   theme: {
     extend: {
       colors: {
-        // GitHub-inspired dark theme colors
+        // Theme-aware colors using CSS variables
         bg: {
-          primary: '#0d1117',
-          secondary: '#161b22',
-          tertiary: '#21262d',
-          overlay: '#30363d',
+          primary: 'var(--color-bg-primary)',
+          secondary: 'var(--color-bg-secondary)',
+          tertiary: 'var(--color-bg-tertiary)',
+          overlay: 'var(--color-bg-overlay)',
         },
         border: {
-          default: '#30363d',
-          muted: '#21262d',
+          default: 'var(--color-border-default)',
+          muted: 'var(--color-border-muted)',
         },
         text: {
-          primary: '#f0f6fc',
-          secondary: '#8b949e',
-          muted: '#6e7681',
-          link: '#58a6ff',
+          primary: 'var(--color-text-primary)',
+          secondary: 'var(--color-text-secondary)',
+          muted: 'var(--color-text-muted)',
+          link: 'var(--color-text-link)',
         },
+        // Accent colors remain constant across themes
         accent: {
           blue: '#58a6ff',
           green: '#3fb950',
@@ -32,22 +33,6 @@ export default {
           red: '#f85149',
           purple: '#a371f7',
           orange: '#db6d28',
-        },
-        // Light mode equivalents
-        'light-bg': {
-          primary: '#ffffff',
-          secondary: '#f6f8fa',
-          tertiary: '#eaeef2',
-        },
-        'light-border': {
-          default: '#d0d7de',
-          muted: '#eaeef2',
-        },
-        'light-text': {
-          primary: '#1f2328',
-          secondary: '#656d76',
-          muted: '#8c959f',
-          link: '#0969da',
         },
       },
       fontFamily: {
