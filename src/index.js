@@ -30,6 +30,7 @@ import { webhookRoutes } from './routes/webhooks.js';
 import dashboardRoutes from './routes/dashboard.js';
 import authRoutes from './routes/auth.js';
 import notificationRoutes from './routes/notifications.js';
+import metricsRoutes, { recordRequest } from './routes/metrics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -80,6 +81,19 @@ try {
 // Initialize WebSocket service
 await wsService.init();
 
+// Request timing for metrics
+app.addHook('onRequest', async (request) => {
+  request.startTime = process.hrtime.bigint();
+});
+
+app.addHook('onResponse', async (request, reply) => {
+  if (request.startTime) {
+    const duration = Number(process.hrtime.bigint() - request.startTime) / 1e9; // Convert to seconds
+    const path = request.routeOptions?.url || request.url.split('?')[0];
+    recordRequest(request.method, path, reply.statusCode, duration);
+  }
+});
+
 // Health check
 app.get('/health', async () => {
   return { status: 'ok', timestamp: new Date().toISOString() };
@@ -109,6 +123,9 @@ app.register(authRoutes, { prefix: apiPrefix, db });
 
 // Notification routes
 app.register(notificationRoutes, { prefix: apiPrefix, notificationService });
+
+// Prometheus metrics endpoint (no auth, no prefix)
+app.register(metricsRoutes, { db, wsService });
 
 // WebSocket endpoint for real-time activity
 app.get('/ws', { websocket: true }, (connection) => {
