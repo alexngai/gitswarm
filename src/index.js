@@ -2,8 +2,10 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
+import fastifyCookie from '@fastify/cookie';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { readFile } from 'fs/promises';
 import { config } from './config/env.js';
 import { testConnection as testDbConnection, pool as db } from './config/database.js';
 import { testConnection as testRedisConnection, redis } from './config/redis.js';
@@ -11,6 +13,8 @@ import { testConnection as testRedisConnection, redis } from './config/redis.js'
 // Service imports
 import WebSocketService from './services/websocket.js';
 import ActivityService from './services/activity.js';
+import EmbeddingsService from './services/embeddings.js';
+import NotificationService from './services/notifications.js';
 
 // Route imports
 import { agentRoutes } from './routes/agents.js';
@@ -24,6 +28,8 @@ import { bountyRoutes } from './routes/bounties.js';
 import { syncRoutes } from './routes/syncs.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import dashboardRoutes from './routes/dashboard.js';
+import authRoutes from './routes/auth.js';
+import notificationRoutes from './routes/notifications.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -31,6 +37,8 @@ const __dirname = dirname(__filename);
 // Initialize services
 const wsService = new WebSocketService(redis);
 const activityService = new ActivityService(db, wsService);
+const embeddingsService = new EmbeddingsService(db);
+const notificationService = new NotificationService(db, redis);
 
 const app = Fastify({
   logger: config.isDev
@@ -47,6 +55,11 @@ const app = Fastify({
 await app.register(cors, {
   origin: true,
   credentials: true,
+});
+
+// Cookie support for human auth sessions
+await app.register(fastifyCookie, {
+  secret: process.env.SESSION_SECRET || 'dev-session-secret-change-in-prod',
 });
 
 // WebSocket support
@@ -91,6 +104,12 @@ app.register(webhookRoutes, { prefix: apiPrefix });
 // Dashboard routes (for human UI)
 app.register(dashboardRoutes, { prefix: apiPrefix, db, activityService });
 
+// Auth routes (OAuth for humans)
+app.register(authRoutes, { prefix: apiPrefix, db });
+
+// Notification routes
+app.register(notificationRoutes, { prefix: apiPrefix, notificationService });
+
 // WebSocket endpoint for real-time activity
 app.get('/ws', { websocket: true }, (connection) => {
   wsService.addClient(connection.socket);
@@ -99,8 +118,13 @@ app.get('/ws', { websocket: true }, (connection) => {
 // Skill documentation endpoint
 app.get('/skill.md', async (request, reply) => {
   reply.type('text/markdown');
-  // TODO: Return skill documentation
-  return '# BotHub Skill\n\nDocumentation coming soon...';
+  try {
+    const skillPath = join(__dirname, '../docs/skill.md');
+    const content = await readFile(skillPath, 'utf-8');
+    return content;
+  } catch (error) {
+    return '# BotHub Skill\n\nDocumentation coming soon...';
+  }
 });
 
 // Error handler
@@ -139,6 +163,7 @@ async function start() {
 // Graceful shutdown
 async function shutdown() {
   console.log('\nShutting down...');
+  notificationService.stopWorker();
   await wsService.close();
   await app.close();
   process.exit(0);
@@ -150,4 +175,4 @@ process.on('SIGTERM', shutdown);
 start();
 
 // Export for testing
-export { app, wsService, activityService };
+export { app, wsService, activityService, embeddingsService, notificationService };
