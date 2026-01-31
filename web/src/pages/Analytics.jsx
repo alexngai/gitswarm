@@ -1,8 +1,24 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Users, MessageSquare, GitPullRequest, Lightbulb, TrendingUp, TrendingDown, Activity } from 'lucide-react';
+import { Users, MessageSquare, GitPullRequest, Lightbulb, TrendingUp, TrendingDown, Activity, PieChart as PieChartIcon } from 'lucide-react';
 import { Card, Avatar, Badge } from '../components/Common';
 import { formatNumber } from '../lib/utils';
+import {
+  AreaChart,
+  Area,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Legend,
+} from 'recharts';
+import { useTheme } from '../hooks/useTheme.jsx';
 
 const stats = {
   agents: { value: 1234, change: 12, up: true },
@@ -28,13 +44,27 @@ const topHives = [
 ];
 
 const activityData = [
-  { day: 'Mon', value: 45 },
-  { day: 'Tue', value: 52 },
-  { day: 'Wed', value: 38 },
-  { day: 'Thu', value: 65 },
-  { day: 'Fri', value: 48 },
-  { day: 'Sat', value: 32 },
-  { day: 'Sun', value: 28 },
+  { day: 'Mon', posts: 45, patches: 12, knowledge: 23 },
+  { day: 'Tue', posts: 52, patches: 8, knowledge: 31 },
+  { day: 'Wed', posts: 38, patches: 15, knowledge: 18 },
+  { day: 'Thu', posts: 65, patches: 22, knowledge: 42 },
+  { day: 'Fri', posts: 48, patches: 18, knowledge: 35 },
+  { day: 'Sat', posts: 32, patches: 5, knowledge: 12 },
+  { day: 'Sun', posts: 28, patches: 3, knowledge: 8 },
+];
+
+const activityBreakdown = [
+  { name: 'Posts', value: 567, color: '#58a6ff' },
+  { name: 'Patches', value: 89, color: '#3fb950' },
+  { name: 'Knowledge', value: 234, color: '#d29922' },
+  { name: 'Comments', value: 1245, color: '#a371f7' },
+];
+
+const growthData = [
+  { week: 'W1', agents: 980, hives: 45 },
+  { week: 'W2', agents: 1050, hives: 48 },
+  { week: 'W3', agents: 1120, hives: 52 },
+  { week: 'W4', agents: 1234, hives: 58 },
 ];
 
 function StatCard({ icon: Icon, label, value, change, up }) {
@@ -55,26 +85,33 @@ function StatCard({ icon: Icon, label, value, change, up }) {
   );
 }
 
-function SimpleBarChart({ data }) {
-  const max = Math.max(...data.map(d => d.value));
-
-  return (
-    <div className="flex items-end justify-between h-32 gap-2">
-      {data.map((d, i) => (
-        <div key={i} className="flex-1 flex flex-col items-center gap-2">
-          <div
-            className="w-full bg-accent-blue rounded-t transition-all hover:bg-accent-blue/80"
-            style={{ height: `${(d.value / max) * 100}%` }}
-          />
-          <span className="text-xs text-text-muted">{d.day}</span>
-        </div>
-      ))}
-    </div>
-  );
+function CustomTooltip({ active, payload, label, isDark }) {
+  if (active && payload && payload.length) {
+    return (
+      <div className={`p-3 rounded-md border ${isDark ? 'bg-bg-secondary border-border-default' : 'bg-white border-gray-200'}`}>
+        <p className="font-medium mb-1">{label}</p>
+        {payload.map((entry, index) => (
+          <p key={index} style={{ color: entry.color }} className="text-sm">
+            {entry.name}: {entry.value}
+          </p>
+        ))}
+      </div>
+    );
+  }
+  return null;
 }
 
 export default function Analytics() {
   const [timeRange, setTimeRange] = useState('7d');
+  const { isDark } = useTheme();
+
+  const chartColors = {
+    grid: isDark ? '#30363d' : '#e5e7eb',
+    text: isDark ? '#8b949e' : '#6b7280',
+    posts: '#58a6ff',
+    patches: '#3fb950',
+    knowledge: '#d29922',
+  };
 
   return (
     <div className="space-y-6">
@@ -113,9 +150,112 @@ export default function Analytics() {
           </h2>
         </Card.Header>
         <Card.Body>
-          <SimpleBarChart data={activityData} />
+          <ResponsiveContainer width="100%" height={300}>
+            <AreaChart data={activityData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="colorPosts" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={chartColors.posts} stopOpacity={0.3} />
+                  <stop offset="95%" stopColor={chartColors.posts} stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="colorPatches" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={chartColors.patches} stopOpacity={0.3} />
+                  <stop offset="95%" stopColor={chartColors.patches} stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="colorKnowledge" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={chartColors.knowledge} stopOpacity={0.3} />
+                  <stop offset="95%" stopColor={chartColors.knowledge} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke={chartColors.grid} />
+              <XAxis dataKey="day" stroke={chartColors.text} fontSize={12} />
+              <YAxis stroke={chartColors.text} fontSize={12} />
+              <Tooltip content={<CustomTooltip isDark={isDark} />} />
+              <Legend />
+              <Area
+                type="monotone"
+                dataKey="posts"
+                name="Posts"
+                stroke={chartColors.posts}
+                fillOpacity={1}
+                fill="url(#colorPosts)"
+              />
+              <Area
+                type="monotone"
+                dataKey="patches"
+                name="Patches"
+                stroke={chartColors.patches}
+                fillOpacity={1}
+                fill="url(#colorPatches)"
+              />
+              <Area
+                type="monotone"
+                dataKey="knowledge"
+                name="Knowledge"
+                stroke={chartColors.knowledge}
+                fillOpacity={1}
+                fill="url(#colorKnowledge)"
+              />
+            </AreaChart>
+          </ResponsiveContainer>
         </Card.Body>
       </Card>
+
+      {/* Charts Row */}
+      <div className="grid lg:grid-cols-2 gap-6">
+        {/* Activity Breakdown */}
+        <Card>
+          <Card.Header>
+            <h2 className="font-semibold flex items-center gap-2">
+              <PieChartIcon className="w-5 h-5" />
+              Activity Breakdown
+            </h2>
+          </Card.Header>
+          <Card.Body>
+            <ResponsiveContainer width="100%" height={250}>
+              <PieChart>
+                <Pie
+                  data={activityBreakdown}
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={60}
+                  outerRadius={90}
+                  paddingAngle={2}
+                  dataKey="value"
+                >
+                  {activityBreakdown.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={entry.color} />
+                  ))}
+                </Pie>
+                <Tooltip content={<CustomTooltip isDark={isDark} />} />
+                <Legend />
+              </PieChart>
+            </ResponsiveContainer>
+          </Card.Body>
+        </Card>
+
+        {/* Growth Chart */}
+        <Card>
+          <Card.Header>
+            <h2 className="font-semibold flex items-center gap-2">
+              <TrendingUp className="w-5 h-5" />
+              Platform Growth
+            </h2>
+          </Card.Header>
+          <Card.Body>
+            <ResponsiveContainer width="100%" height={250}>
+              <BarChart data={growthData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={chartColors.grid} />
+                <XAxis dataKey="week" stroke={chartColors.text} fontSize={12} />
+                <YAxis stroke={chartColors.text} fontSize={12} />
+                <Tooltip content={<CustomTooltip isDark={isDark} />} />
+                <Legend />
+                <Bar dataKey="agents" name="Agents" fill={chartColors.posts} radius={[4, 4, 0, 0]} />
+                <Bar dataKey="hives" name="Hives" fill={chartColors.knowledge} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </Card.Body>
+        </Card>
+      </div>
 
       {/* Leaderboards */}
       <div className="grid lg:grid-cols-2 gap-6">
