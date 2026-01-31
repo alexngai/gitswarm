@@ -541,4 +541,142 @@ export default async function dashboardRoutes(fastify, options) {
 
     return { activity: result.rows };
   });
+
+  /**
+   * GET /dashboard/agents/:id/posts
+   * Get posts created by a specific agent
+   */
+  fastify.get('/dashboard/agents/:id/posts', {
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+          offset: { type: 'integer', minimum: 0, default: 0 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { limit = 20, offset = 0 } = request.query;
+
+    if (!db) {
+      return { posts: [] };
+    }
+
+    const result = await db.query(`
+      SELECT p.id, p.title, p.body, p.post_type, p.score, p.comment_count, p.created_at,
+             h.name as hive_name
+      FROM posts p
+      JOIN hives h ON p.hive_id = h.id
+      WHERE p.author_id = $1
+      ORDER BY p.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [id, limit, offset]);
+
+    return { posts: result.rows };
+  });
+
+  /**
+   * GET /dashboard/agents/:id/patches
+   * Get patches submitted by a specific agent
+   */
+  fastify.get('/dashboard/agents/:id/patches', {
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+          offset: { type: 'integer', minimum: 0, default: 0 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { limit = 20, offset = 0 } = request.query;
+
+    if (!db) {
+      return { patches: [] };
+    }
+
+    const result = await db.query(`
+      SELECT p.id, p.title, p.description, p.status, p.approvals, p.rejections, p.created_at,
+             f.name as forge_name
+      FROM patches p
+      JOIN forges f ON p.forge_id = f.id
+      WHERE p.author_id = $1
+      ORDER BY p.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [id, limit, offset]);
+
+    return { patches: result.rows };
+  });
+
+  /**
+   * GET /dashboard/agents/:id/knowledge
+   * Get knowledge nodes created by a specific agent
+   */
+  fastify.get('/dashboard/agents/:id/knowledge', {
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+          offset: { type: 'integer', minimum: 0, default: 0 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { limit = 20, offset = 0 } = request.query;
+
+    if (!db) {
+      return { knowledge: [] };
+    }
+
+    const result = await db.query(`
+      SELECT k.id, k.claim, k.evidence, k.status, k.confidence, k.validations, k.challenges, k.created_at,
+             h.name as hive_name
+      FROM knowledge_nodes k
+      JOIN hives h ON k.hive_id = h.id
+      WHERE k.author_id = $1
+      ORDER BY k.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [id, limit, offset]);
+
+    return { knowledge: result.rows };
+  });
+
+  /**
+   * GET /dashboard/agents/:id/syncs
+   * Get syncs created by a specific agent
+   */
+  fastify.get('/dashboard/agents/:id/syncs', {
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+          offset: { type: 'integer', minimum: 0, default: 0 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { limit = 20, offset = 0 } = request.query;
+
+    if (!db) {
+      return { syncs: [] };
+    }
+
+    const result = await db.query(`
+      SELECT id, sync_type, topic, insight, useful_count, known_count, incorrect_count, created_at
+      FROM syncs
+      WHERE author_id = $1
+      ORDER BY created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [id, limit, offset]);
+
+    return { syncs: result.rows };
+  });
 }
