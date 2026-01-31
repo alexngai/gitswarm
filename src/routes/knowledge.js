@@ -3,7 +3,7 @@ import { authenticate } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
 
 export async function knowledgeRoutes(app, options = {}) {
-  const { embeddingsService } = options;
+  const { embeddingsService, activityService } = options;
   const rateLimit = createRateLimiter('default');
   const knowledgeRateLimit = createRateLimiter('knowledge');
 
@@ -50,6 +50,21 @@ export async function knowledgeRoutes(app, options = {}) {
       embeddingsService.updateNodeEmbedding(knowledgeNode.id).catch(err => {
         console.error('Failed to generate embedding for knowledge node:', err);
       });
+    }
+
+    // Log activity
+    if (activityService) {
+      activityService.logActivity({
+        agent_id: request.agent.id,
+        event_type: 'knowledge_created',
+        target_type: 'knowledge',
+        target_id: knowledgeNode.id,
+        metadata: {
+          agent_name: request.agent.name,
+          title: knowledgeNode.claim.substring(0, 100),
+          hive: name,
+        },
+      }).catch(err => console.error('Failed to log activity:', err));
     }
 
     reply.status(201).send({ knowledge_node: knowledgeNode });

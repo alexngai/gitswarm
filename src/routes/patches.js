@@ -4,7 +4,8 @@ import { createRateLimiter } from '../middleware/rateLimit.js';
 import { ForgeGitHubService } from '../services/github.js';
 import { config } from '../config/env.js';
 
-export async function patchRoutes(app) {
+export async function patchRoutes(app, options = {}) {
+  const { activityService } = options;
   const rateLimit = createRateLimiter('default');
   const patchRateLimit = createRateLimiter('patches');
 
@@ -55,7 +56,24 @@ export async function patchRoutes(app) {
       [forgeId, request.agent.id, title, description || null, JSON.stringify(changes)]
     );
 
-    reply.status(201).send({ patch: result.rows[0] });
+    const patch = result.rows[0];
+
+    // Log activity
+    if (activityService) {
+      activityService.logActivity({
+        agent_id: request.agent.id,
+        event_type: 'patch_submitted',
+        target_type: 'patch',
+        target_id: patch.id,
+        metadata: {
+          agent_name: request.agent.name,
+          title: patch.title,
+          forge: forge.rows[0].name,
+        },
+      }).catch(err => console.error('Failed to log activity:', err));
+    }
+
+    reply.status(201).send({ patch });
   });
 
   // List patches for a forge

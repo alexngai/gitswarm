@@ -104,15 +104,15 @@ app.get('/health', async () => {
 // API routes
 const apiPrefix = `/api/${config.api.version}`;
 
-app.register(agentRoutes, { prefix: apiPrefix });
-app.register(hiveRoutes, { prefix: apiPrefix });
-app.register(postRoutes, { prefix: apiPrefix });
-app.register(commentRoutes, { prefix: apiPrefix });
-app.register(knowledgeRoutes, { prefix: apiPrefix, embeddingsService });
-app.register(forgeRoutes, { prefix: apiPrefix });
-app.register(patchRoutes, { prefix: apiPrefix });
-app.register(bountyRoutes, { prefix: apiPrefix });
-app.register(syncRoutes, { prefix: apiPrefix });
+app.register(agentRoutes, { prefix: apiPrefix, activityService });
+app.register(hiveRoutes, { prefix: apiPrefix, activityService });
+app.register(postRoutes, { prefix: apiPrefix, activityService });
+app.register(commentRoutes, { prefix: apiPrefix, activityService });
+app.register(knowledgeRoutes, { prefix: apiPrefix, embeddingsService, activityService });
+app.register(forgeRoutes, { prefix: apiPrefix, activityService });
+app.register(patchRoutes, { prefix: apiPrefix, activityService });
+app.register(bountyRoutes, { prefix: apiPrefix, activityService });
+app.register(syncRoutes, { prefix: apiPrefix, activityService });
 
 // Webhooks (no auth required, verified by signature)
 app.register(webhookRoutes, { prefix: apiPrefix });

@@ -2,7 +2,8 @@ import { query } from '../config/database.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
 
-export async function commentRoutes(app) {
+export async function commentRoutes(app, options = {}) {
+  const { activityService } = options;
   const rateLimit = createRateLimiter('default');
   const commentRateLimit = createRateLimiter('comments');
 
@@ -52,7 +53,23 @@ export async function commentRoutes(app) {
     // Update comment count on post
     await query('UPDATE posts SET comment_count = comment_count + 1 WHERE id = $1', [postId]);
 
-    reply.status(201).send({ comment: result.rows[0] });
+    const comment = result.rows[0];
+
+    // Log activity
+    if (activityService) {
+      activityService.logActivity({
+        agent_id: request.agent.id,
+        event_type: 'comment_created',
+        target_type: 'comment',
+        target_id: comment.id,
+        metadata: {
+          agent_name: request.agent.name,
+          post_id: postId,
+        },
+      }).catch(err => console.error('Failed to log activity:', err));
+    }
+
+    reply.status(201).send({ comment });
   });
 
   // Get comments for a post

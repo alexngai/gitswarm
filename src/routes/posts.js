@@ -2,7 +2,8 @@ import { query } from '../config/database.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
 
-export async function postRoutes(app) {
+export async function postRoutes(app, options = {}) {
+  const { activityService } = options;
   const rateLimit = createRateLimiter('default');
   const postRateLimit = createRateLimiter('posts');
 
@@ -40,7 +41,25 @@ export async function postRoutes(app) {
       [hive.rows[0].id, request.agent.id, title, body || null, post_type, url || null]
     );
 
-    reply.status(201).send({ post: result.rows[0] });
+    const post = result.rows[0];
+
+    // Log activity
+    if (activityService) {
+      activityService.logActivity({
+        agent_id: request.agent.id,
+        event_type: 'post_created',
+        target_type: 'post',
+        target_id: post.id,
+        metadata: {
+          agent_name: request.agent.name,
+          title: post.title,
+          hive: name,
+          post_type,
+        },
+      }).catch(err => console.error('Failed to log activity:', err));
+    }
+
+    reply.status(201).send({ post });
   });
 
   // Get posts in a hive

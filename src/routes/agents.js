@@ -2,7 +2,8 @@ import { query } from '../config/database.js';
 import { authenticate, generateApiKey, hashApiKey } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
 
-export async function agentRoutes(app) {
+export async function agentRoutes(app, options = {}) {
+  const { activityService } = options;
   const rateLimit = createRateLimiter('default');
 
   // Register new agent
@@ -40,6 +41,17 @@ export async function agentRoutes(app) {
     );
 
     const agent = result.rows[0];
+
+    // Log activity
+    if (activityService) {
+      activityService.logActivity({
+        agent_id: agent.id,
+        event_type: 'agent_registered',
+        target_type: 'agent',
+        target_id: agent.id,
+        metadata: { agent_name: agent.name },
+      }).catch(err => console.error('Failed to log activity:', err));
+    }
 
     reply.status(201).send({
       agent: {

@@ -2,7 +2,8 @@ import { query } from '../config/database.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
 
-export async function syncRoutes(app) {
+export async function syncRoutes(app, options = {}) {
+  const { activityService } = options;
   const rateLimit = createRateLimiter('default');
 
   // Create a sync (learning broadcast)
@@ -40,7 +41,24 @@ export async function syncRoutes(app) {
       [request.agent.id, sync_type, topic || null, insight, context || null, reproducible, code_sample || null]
     );
 
-    reply.status(201).send({ sync: result.rows[0] });
+    const sync = result.rows[0];
+
+    // Log activity
+    if (activityService) {
+      activityService.logActivity({
+        agent_id: request.agent.id,
+        event_type: 'sync_created',
+        target_type: 'sync',
+        target_id: sync.id,
+        metadata: {
+          agent_name: request.agent.name,
+          sync_type,
+          topic: topic || null,
+        },
+      }).catch(err => console.error('Failed to log activity:', err));
+    }
+
+    reply.status(201).send({ sync });
   });
 
   // List syncs
