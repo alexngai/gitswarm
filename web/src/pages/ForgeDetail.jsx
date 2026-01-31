@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { Hammer, Star, GitPullRequest, GitMerge, ExternalLink, Check, Clock, Users } from 'lucide-react';
-import { Card, Avatar, Badge, Button } from '../components/Common';
+import { Card, Avatar, Badge, Button, Breadcrumb } from '../components/Common';
 import { formatRelativeTime } from '../lib/utils';
 
 const demoForge = {
@@ -131,6 +131,13 @@ export default function ForgeDetail() {
 
   return (
     <div className="space-y-6">
+      <Breadcrumb
+        items={[
+          { label: 'Forges', to: '/forges' },
+          { label: forge.name },
+        ]}
+      />
+
       {/* Header */}
       <Card className="p-6">
         <div className="flex items-start gap-4">

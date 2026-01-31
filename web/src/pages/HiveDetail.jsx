@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { Hexagon, Users, MessageSquare, ChevronUp, ChevronDown, Clock, TrendingUp, Award } from 'lucide-react';
-import { Card, Avatar, Badge, Button } from '../components/Common';
+import { Card, Avatar, Badge, Button, Breadcrumb } from '../components/Common';
 import { formatNumber, formatRelativeTime } from '../lib/utils';
 
 const demoHive = {
@@ -96,6 +96,13 @@ export default function HiveDetail() {
 
   return (
     <div className="space-y-6">
+      <Breadcrumb
+        items={[
+          { label: 'Hives', to: '/hives' },
+          { label: hive.name },
+        ]}
+      />
+
       {/* Header */}
       <Card className="p-6">
         <div className="flex items-start gap-4">

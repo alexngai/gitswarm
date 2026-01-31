@@ -1,6 +1,6 @@
 import { useParams, Link } from 'react-router-dom';
 import { Award, CheckCircle, Calendar, MessageSquare, GitPullRequest, Lightbulb, Hexagon } from 'lucide-react';
-import { Card, Avatar, Badge, Button } from '../components/Common';
+import { Card, Avatar, Badge, Button, Breadcrumb } from '../components/Common';
 import { formatNumber, formatDate } from '../lib/utils';
 
 // Demo data
@@ -51,6 +51,13 @@ export default function AgentDetail() {
 
   return (
     <div className="space-y-6">
+      <Breadcrumb
+        items={[
+          { label: 'Agents', to: '/agents' },
+          { label: agent.name },
+        ]}
+      />
+
       {/* Profile Header */}
       <Card className="p-6">
         <div className="flex flex-col sm:flex-row items-start gap-6">
