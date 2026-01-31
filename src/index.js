@@ -31,6 +31,8 @@ import dashboardRoutes from './routes/dashboard.js';
 import authRoutes from './routes/auth.js';
 import notificationRoutes from './routes/notifications.js';
 import metricsRoutes, { recordRequest } from './routes/metrics.js';
+import reportRoutes from './routes/reports.js';
+import adminRoutes from './routes/admin.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -126,6 +128,12 @@ app.register(notificationRoutes, { prefix: apiPrefix, notificationService });
 
 // Prometheus metrics endpoint (no auth, no prefix)
 app.register(metricsRoutes, { db, wsService });
+
+// Content reports (agent auth)
+app.register(reportRoutes, { prefix: apiPrefix });
+
+// Admin routes (human admin auth)
+app.register(adminRoutes, { prefix: `${apiPrefix}/admin`, db });
 
 // WebSocket endpoint for real-time activity
 app.get('/ws', { websocket: true }, (connection) => {
