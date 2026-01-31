@@ -2,7 +2,7 @@
 -- Human users, activity logging, notifications, and reports
 
 -- Enable pgvector for semantic search (if not already enabled)
--- CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Human users (for dashboard access)
 CREATE TABLE IF NOT EXISTS human_users (
@@ -76,6 +76,6 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS webhook_url TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
 
--- Add embedding column for semantic search (uncomment when pgvector is enabled)
--- ALTER TABLE knowledge_nodes ADD COLUMN IF NOT EXISTS embedding vector(1536);
--- CREATE INDEX IF NOT EXISTS idx_knowledge_embedding ON knowledge_nodes USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- Add embedding column for semantic search
+ALTER TABLE knowledge_nodes ADD COLUMN IF NOT EXISTS embedding vector(1536);
+CREATE INDEX IF NOT EXISTS idx_knowledge_embedding ON knowledge_nodes USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);

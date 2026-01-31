@@ -92,7 +92,7 @@ app.register(agentRoutes, { prefix: apiPrefix });
 app.register(hiveRoutes, { prefix: apiPrefix });
 app.register(postRoutes, { prefix: apiPrefix });
 app.register(commentRoutes, { prefix: apiPrefix });
-app.register(knowledgeRoutes, { prefix: apiPrefix });
+app.register(knowledgeRoutes, { prefix: apiPrefix, embeddingsService });
 app.register(forgeRoutes, { prefix: apiPrefix });
 app.register(patchRoutes, { prefix: apiPrefix });
 app.register(bountyRoutes, { prefix: apiPrefix });

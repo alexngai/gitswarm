@@ -2,7 +2,8 @@ import { query } from '../config/database.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
 
-export async function knowledgeRoutes(app) {
+export async function knowledgeRoutes(app, options = {}) {
+  const { embeddingsService } = options;
   const rateLimit = createRateLimiter('default');
   const knowledgeRateLimit = createRateLimiter('knowledge');
 
@@ -42,7 +43,16 @@ export async function knowledgeRoutes(app) {
       [hive.rows[0].id, request.agent.id, claim, evidence || null, confidence, citations, code_example || null]
     );
 
-    reply.status(201).send({ knowledge_node: result.rows[0] });
+    const knowledgeNode = result.rows[0];
+
+    // Generate embedding asynchronously (don't block response)
+    if (embeddingsService) {
+      embeddingsService.updateNodeEmbedding(knowledgeNode.id).catch(err => {
+        console.error('Failed to generate embedding for knowledge node:', err);
+      });
+    }
+
+    reply.status(201).send({ knowledge_node: knowledgeNode });
   });
 
   // List knowledge nodes in a hive
@@ -273,24 +283,65 @@ export async function knowledgeRoutes(app) {
   // Semantic search across knowledge nodes
   app.get('/knowledge/search', {
     preHandler: [authenticate, rateLimit],
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          q: { type: 'string', minLength: 3 },
+          hive: { type: 'string' },
+          status: { type: 'string', enum: ['pending', 'validated', 'disputed'] },
+          min_confidence: { type: 'number', minimum: 0, maximum: 1 },
+          limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+        },
+        required: ['q'],
+      },
+    },
   }, async (request, reply) => {
-    const { q, hive } = request.query;
-    const limit = Math.min(parseInt(request.query.limit) || 20, 50);
+    const { q, hive, status, min_confidence } = request.query;
+    const limit = request.query.limit || 20;
 
-    if (!q || q.length < 3) {
-      return reply.status(400).send({
-        error: 'Bad Request',
-        message: 'Query must be at least 3 characters',
-      });
+    // Get hive_id if hive name provided
+    let hive_id = null;
+    if (hive) {
+      const hiveResult = await query('SELECT id FROM hives WHERE name = $1', [hive]);
+      if (hiveResult.rows.length > 0) {
+        hive_id = hiveResult.rows[0].id;
+      }
     }
 
-    // For now, use simple text search. Can upgrade to pgvector later.
+    // Use embeddings service for semantic search if available
+    if (embeddingsService) {
+      const results = await embeddingsService.searchKnowledge(q, {
+        limit,
+        hive_id,
+        status,
+        min_confidence,
+      });
+
+      return {
+        knowledge_nodes: results,
+        query: q,
+        semantic: embeddingsService.enabled,
+      };
+    }
+
+    // Fallback to text search
     let whereClause = `(kn.claim ILIKE $1 OR kn.evidence ILIKE $1)`;
     const params = [`%${q}%`];
 
-    if (hive) {
-      params.push(hive);
-      whereClause += ` AND h.name = $${params.length}`;
+    if (hive_id) {
+      params.push(hive_id);
+      whereClause += ` AND kn.hive_id = $${params.length}`;
+    }
+
+    if (status) {
+      params.push(status);
+      whereClause += ` AND kn.status = $${params.length}`;
+    }
+
+    if (min_confidence !== undefined) {
+      params.push(min_confidence);
+      whereClause += ` AND kn.confidence >= $${params.length}`;
     }
 
     params.push(limit);
@@ -309,6 +360,6 @@ export async function knowledgeRoutes(app) {
       params
     );
 
-    return { knowledge_nodes: result.rows, query: q };
+    return { knowledge_nodes: result.rows, query: q, semantic: false };
   });
 }
