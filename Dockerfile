@@ -2,7 +2,7 @@
 # Multi-stage build for optimized production image
 
 # Stage 1: Build frontend
-FROM node:20-alpine AS frontend-builder
+FROM node:25-alpine AS frontend-builder
 
 WORKDIR /app/web
 
@@ -19,7 +19,7 @@ COPY web/ ./
 RUN npm run build
 
 # Stage 2: Build backend dependencies
-FROM node:20-alpine AS backend-builder
+FROM node:25-alpine AS backend-builder
 
 WORKDIR /app
 
@@ -30,7 +30,7 @@ COPY package*.json ./
 RUN npm ci --only=production
 
 # Stage 3: Production image
-FROM node:20-alpine AS production
+FROM node:25-alpine AS production
 
 # Add labels
 LABEL org.opencontainers.image.source="https://github.com/bothub/bothub"
