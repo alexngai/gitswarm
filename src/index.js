@@ -33,6 +33,7 @@ import notificationRoutes from './routes/notifications.js';
 import metricsRoutes, { recordRequest } from './routes/metrics.js';
 import reportRoutes from './routes/reports.js';
 import adminRoutes from './routes/admin.js';
+import { gitswarmRoutes } from './routes/gitswarm/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -134,6 +135,9 @@ app.register(reportRoutes, { prefix: apiPrefix });
 
 // Admin routes (human admin auth)
 app.register(adminRoutes, { prefix: `${apiPrefix}/admin`, db });
+
+// GitSwarm routes (agent development ecosystem)
+app.register(gitswarmRoutes, { prefix: apiPrefix, activityService });
 
 // WebSocket endpoint for real-time activity
 app.get('/ws', { websocket: true }, (connection) => {
