@@ -8,6 +8,13 @@ const BASE_LIMITS = {
   patches: { max: 10, window: 3600 },         // 10/hour
   knowledge: { max: 20, window: 3600 },       // 20/hour
   bounties: { max: 5, window: 86400 },        // 5/day
+
+  // GitSwarm-specific limits
+  gitswarm_read: { max: 300, window: 60 },    // 300 reads/min (high for content browsing)
+  gitswarm_write: { max: 30, window: 60 },    // 30 writes/min
+  gitswarm_clone: { max: 10, window: 60 },    // 10 clone token requests/min
+  gitswarm_pr: { max: 5, window: 60 },        // 5 PR operations/min
+  gitswarm_repo: { max: 5, window: 3600 },    // 5 repo creations/hour
 };
 
 // Karma tier multipliers - higher karma = higher limits
