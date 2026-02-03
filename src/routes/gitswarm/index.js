@@ -3,12 +3,18 @@ import { authenticate } from '../../middleware/authenticate.js';
 import { createRateLimiter } from '../../middleware/rateLimit.js';
 import { GitSwarmPermissionService } from '../../services/gitswarm-permissions.js';
 import { GitSwarmService, gitswarmService as defaultGitswarmService } from '../../services/gitswarm.js';
+import { installRoutes } from './install.js';
+import { packageRoutes } from './packages.js';
 
 const permissionService = new GitSwarmPermissionService();
 
 export async function gitswarmRoutes(app, options = {}) {
   const { activityService } = options;
   const gitswarmService = options.gitswarmService || defaultGitswarmService;
+
+  // Register sub-routes
+  await app.register(installRoutes, { activityService });
+  await app.register(packageRoutes, { activityService });
 
   // Different rate limits for different operation types
   const rateLimitRead = createRateLimiter('gitswarm_read');

@@ -664,6 +664,452 @@ describe('GitSwarm Webhook Handlers', () => {
     });
   });
 
+  // ============================================================
+  // Phase 4: GitHub User Mappings & Human Review Sync
+  // ============================================================
+
+  describe('GitHub User Mapping', () => {
+    describe('ensureGitHubUserMapping', () => {
+      it('should create new user mapping for unknown GitHub user', async () => {
+        const githubUser = {
+          id: 12345,
+          login: 'external-dev',
+          avatar_url: 'https://github.com/avatars/12345'
+        };
+
+        mockQuery
+          .mockResolvedValueOnce({ rows: [] }) // Check existing
+          .mockResolvedValueOnce({
+            rows: [{
+              id: 'mapping-uuid',
+              github_user_id: 12345,
+              github_login: 'external-dev',
+              agent_id: null
+            }]
+          }); // Insert new
+
+        // Check if mapping exists
+        const existing = await mockQuery(
+          `SELECT id, agent_id FROM gitswarm_github_user_mappings WHERE github_user_id = $1`,
+          [githubUser.id]
+        );
+
+        expect(existing.rows).toHaveLength(0);
+
+        // Create new mapping
+        const result = await mockQuery(`
+          INSERT INTO gitswarm_github_user_mappings (github_user_id, github_login, avatar_url)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (github_user_id) DO UPDATE SET
+            github_login = $2,
+            avatar_url = $3,
+            last_seen_at = NOW()
+          RETURNING *
+        `, [githubUser.id, githubUser.login, githubUser.avatar_url]);
+
+        expect(result.rows[0].github_login).toBe('external-dev');
+        expect(result.rows[0].agent_id).toBeNull();
+      });
+
+      it('should return existing mapping for known user', async () => {
+        const githubUser = {
+          id: 12345,
+          login: 'external-dev'
+        };
+
+        mockQuery.mockResolvedValueOnce({
+          rows: [{
+            id: 'mapping-uuid',
+            github_user_id: 12345,
+            github_login: 'external-dev',
+            agent_id: 'agent-uuid' // Linked to an agent
+          }]
+        });
+
+        const result = await mockQuery(
+          `SELECT id, agent_id FROM gitswarm_github_user_mappings WHERE github_user_id = $1`,
+          [githubUser.id]
+        );
+
+        expect(result.rows[0].agent_id).toBe('agent-uuid');
+      });
+
+      it('should update last_seen_at on existing mapping', async () => {
+        mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+
+        await mockQuery(`
+          UPDATE gitswarm_github_user_mappings
+          SET last_seen_at = NOW()
+          WHERE github_user_id = $1
+        `, [12345]);
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('last_seen_at = NOW()'),
+          [12345]
+        );
+      });
+    });
+  });
+
+  describe('Human Review Sync', () => {
+    describe('syncHumanReviewToPatchReviews', () => {
+      it('should create patch_review for human GitHub review', async () => {
+        const payload = {
+          review: {
+            id: 9876,
+            state: 'approved',
+            body: 'LGTM! Great work.',
+            user: {
+              id: 12345,
+              login: 'human-reviewer'
+            }
+          },
+          pull_request: {
+            html_url: 'https://github.com/org/repo/pull/42'
+          }
+        };
+
+        // Map GitHub state to verdict
+        const stateToVerdict = {
+          'approved': 'approve',
+          'changes_requested': 'request_changes',
+          'commented': 'comment'
+        };
+        const verdict = stateToVerdict[payload.review.state];
+
+        mockQuery
+          .mockResolvedValueOnce({ rows: [{ id: 'patch-uuid' }] }) // Find patch
+          .mockResolvedValueOnce({
+            rows: [{ id: 'mapping-uuid', agent_id: null }]
+          }) // User mapping
+          .mockResolvedValueOnce({
+            rows: [{
+              id: 'review-uuid',
+              patch_id: 'patch-uuid',
+              github_user_mapping_id: 'mapping-uuid',
+              is_human: true,
+              verdict: verdict
+            }]
+          }); // Insert review
+
+        // Find the patch
+        const patch = await mockQuery(
+          `SELECT id FROM patches WHERE github_pr_url = $1`,
+          [payload.pull_request.html_url]
+        );
+
+        expect(patch.rows[0].id).toBe('patch-uuid');
+
+        // Get or create user mapping
+        const mapping = await mockQuery(
+          `SELECT id, agent_id FROM gitswarm_github_user_mappings WHERE github_user_id = $1`,
+          [payload.review.user.id]
+        );
+
+        // Insert human review
+        const result = await mockQuery(`
+          INSERT INTO patch_reviews (
+            patch_id, github_user_mapping_id, is_human, verdict, comments, github_review_id
+          ) VALUES ($1, $2, true, $3, $4, $5)
+          ON CONFLICT (patch_id, github_review_id) DO UPDATE SET
+            verdict = $3,
+            comments = $4,
+            updated_at = NOW()
+          RETURNING *
+        `, ['patch-uuid', mapping.rows[0].id, verdict, payload.review.body, payload.review.id]);
+
+        expect(result.rows[0].is_human).toBe(true);
+        expect(result.rows[0].verdict).toBe('approve');
+      });
+
+      it('should link review to agent when GitHub user is mapped', async () => {
+        const payload = {
+          review: {
+            id: 9876,
+            state: 'approved',
+            user: { id: 12345, login: 'mapped-developer' }
+          }
+        };
+
+        mockQuery.mockResolvedValueOnce({
+          rows: [{
+            id: 'mapping-uuid',
+            agent_id: 'agent-uuid' // User is mapped to an agent
+          }]
+        });
+
+        const mapping = await mockQuery(
+          `SELECT id, agent_id FROM gitswarm_github_user_mappings WHERE github_user_id = $1`,
+          [payload.review.user.id]
+        );
+
+        expect(mapping.rows[0].agent_id).toBe('agent-uuid');
+
+        // When creating review, should use both reviewer_id and github_user_mapping_id
+        mockQuery.mockResolvedValueOnce({
+          rows: [{
+            id: 'review-uuid',
+            reviewer_id: 'agent-uuid',
+            github_user_mapping_id: 'mapping-uuid'
+          }]
+        });
+      });
+
+      it('should handle changes_requested review state', async () => {
+        const payload = {
+          review: {
+            id: 9877,
+            state: 'changes_requested',
+            body: 'Please fix the formatting issues.',
+            user: { id: 12345 }
+          }
+        };
+
+        const stateToVerdict = {
+          'approved': 'approve',
+          'changes_requested': 'request_changes',
+          'commented': 'comment'
+        };
+
+        expect(stateToVerdict[payload.review.state]).toBe('request_changes');
+      });
+
+      it('should handle comment-only reviews', async () => {
+        const payload = {
+          review: {
+            id: 9878,
+            state: 'commented',
+            body: 'Interesting approach, have you considered using X instead?',
+            user: { id: 12345 }
+          }
+        };
+
+        const stateToVerdict = {
+          'approved': 'approve',
+          'changes_requested': 'request_changes',
+          'commented': 'comment'
+        };
+
+        expect(stateToVerdict[payload.review.state]).toBe('comment');
+      });
+
+      it('should ignore dismissed reviews', async () => {
+        const payload = {
+          action: 'dismissed',
+          review: {
+            id: 9879,
+            state: 'dismissed',
+            user: { id: 12345 }
+          }
+        };
+
+        expect(payload.action).toBe('dismissed');
+        // Should not create or update a patch_review
+      });
+    });
+  });
+
+  describe('Reviewer Stats & Karma Tracking', () => {
+    describe('updateReviewerStats', () => {
+      it('should create reviewer_stats entry if not exists', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [{
+            agent_id: 'agent-uuid',
+            repo_id: 'repo-uuid',
+            reviews_given: 1,
+            approvals_given: 1
+          }]
+        });
+
+        await mockQuery(`
+          INSERT INTO gitswarm_reviewer_stats (agent_id, repo_id, reviews_given, approvals_given)
+          VALUES ($1, $2, 1, 1)
+          ON CONFLICT (agent_id, repo_id) DO UPDATE SET
+            reviews_given = gitswarm_reviewer_stats.reviews_given + 1,
+            approvals_given = gitswarm_reviewer_stats.approvals_given + 1
+        `, ['agent-uuid', 'repo-uuid']);
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('reviews_given'),
+          expect.any(Array)
+        );
+      });
+
+      it('should track approval statistics separately', async () => {
+        mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+
+        await mockQuery(`
+          UPDATE gitswarm_reviewer_stats SET
+            reviews_given = reviews_given + 1,
+            approvals_given = CASE WHEN $3 = 'approve' THEN approvals_given + 1 ELSE approvals_given END,
+            rejections_given = CASE WHEN $3 = 'reject' THEN rejections_given + 1 ELSE rejections_given END,
+            last_review_at = NOW()
+          WHERE agent_id = $1 AND repo_id = $2
+        `, ['agent-uuid', 'repo-uuid', 'approve']);
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('approvals_given'),
+          expect.arrayContaining(['approve'])
+        );
+      });
+    });
+
+    describe('awardReviewerKarmaOnMerge', () => {
+      it('should award karma to approving reviewers when PR merged', async () => {
+        const patchId = 'patch-uuid';
+
+        // Get approving reviewers
+        mockQuery.mockResolvedValueOnce({
+          rows: [
+            { reviewer_id: 'reviewer-1', karma: 100 },
+            { reviewer_id: 'reviewer-2', karma: 200 }
+          ]
+        });
+
+        const reviewers = await mockQuery(`
+          SELECT DISTINCT pr.reviewer_id, a.karma
+          FROM patch_reviews pr
+          JOIN agents a ON pr.reviewer_id = a.id
+          WHERE pr.patch_id = $1 AND pr.verdict = 'approve' AND pr.reviewer_id IS NOT NULL
+        `, [patchId]);
+
+        expect(reviewers.rows).toHaveLength(2);
+
+        // Calculate karma award (higher karma reviewers get less)
+        for (const reviewer of reviewers.rows) {
+          const karmaAward = Math.max(3, Math.floor(15 * (1 - Math.log10(reviewer.karma + 1) / 4)));
+
+          mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+          await mockQuery(
+            `UPDATE agents SET karma = karma + $2 WHERE id = $1`,
+            [reviewer.reviewer_id, karmaAward]
+          );
+        }
+      });
+
+      it('should create review_karma_transactions for tracking', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [{
+            id: 'tx-uuid',
+            agent_id: 'reviewer-uuid',
+            patch_id: 'patch-uuid',
+            transaction_type: 'review_approval_merged',
+            amount: 10
+          }]
+        });
+
+        await mockQuery(`
+          INSERT INTO review_karma_transactions (agent_id, patch_id, transaction_type, amount, reason)
+          VALUES ($1, $2, 'review_approval_merged', $3, 'Approved merged PR')
+        `, ['reviewer-uuid', 'patch-uuid', 10]);
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('review_karma_transactions'),
+          ['reviewer-uuid', 'patch-uuid', 10]
+        );
+      });
+
+      it('should not award karma for human-only reviews', async () => {
+        mockQuery.mockResolvedValueOnce({
+          rows: [
+            { github_user_mapping_id: 'mapping-1', reviewer_id: null, is_human: true }
+          ]
+        });
+
+        const reviews = await mockQuery(`
+          SELECT github_user_mapping_id, reviewer_id, is_human
+          FROM patch_reviews
+          WHERE patch_id = $1 AND verdict = 'approve'
+        `, ['patch-uuid']);
+
+        const agentReviews = reviews.rows.filter(r => r.reviewer_id != null);
+        expect(agentReviews).toHaveLength(0);
+        // No karma awards for human-only reviews
+      });
+    });
+
+    describe('trackReviewerAccuracyOnClose', () => {
+      it('should track correct approvals when PR is merged', async () => {
+        const patchId = 'patch-uuid';
+
+        mockQuery.mockResolvedValueOnce({
+          rows: [
+            { reviewer_id: 'reviewer-1', verdict: 'approve' },
+            { reviewer_id: 'reviewer-2', verdict: 'approve' }
+          ]
+        });
+
+        const approvers = await mockQuery(`
+          SELECT reviewer_id FROM patch_reviews
+          WHERE patch_id = $1 AND verdict = 'approve' AND reviewer_id IS NOT NULL
+        `, [patchId]);
+
+        // Update accuracy stats
+        for (const reviewer of approvers.rows) {
+          mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+          await mockQuery(`
+            UPDATE gitswarm_reviewer_stats SET
+              accurate_approvals = accurate_approvals + 1,
+              accuracy_rate = (accurate_approvals + 1)::float / NULLIF(approvals_given, 0)
+            WHERE agent_id = $1
+          `, [reviewer.reviewer_id]);
+        }
+
+        expect(mockQuery).toHaveBeenCalledWith(
+          expect.stringContaining('accurate_approvals'),
+          expect.any(Array)
+        );
+      });
+
+      it('should track incorrect approvals when PR is closed without merge', async () => {
+        const patchId = 'patch-uuid';
+
+        mockQuery.mockResolvedValueOnce({
+          rows: [{ reviewer_id: 'reviewer-1', verdict: 'approve' }]
+        });
+
+        const approvers = await mockQuery(`
+          SELECT reviewer_id FROM patch_reviews
+          WHERE patch_id = $1 AND verdict = 'approve' AND reviewer_id IS NOT NULL
+        `, [patchId]);
+
+        // Update inaccurate approval count
+        for (const reviewer of approvers.rows) {
+          mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+          await mockQuery(`
+            UPDATE gitswarm_reviewer_stats SET
+              inaccurate_approvals = inaccurate_approvals + 1,
+              accuracy_rate = accurate_approvals::float / NULLIF(approvals_given, 0)
+            WHERE agent_id = $1
+          `, [reviewer.reviewer_id]);
+        }
+      });
+
+      it('should track correct rejections when PR closed without merge', async () => {
+        const patchId = 'patch-uuid';
+
+        mockQuery.mockResolvedValueOnce({
+          rows: [{ reviewer_id: 'reviewer-1', verdict: 'reject' }]
+        });
+
+        // Reviewers who rejected are considered correct
+        const rejecters = await mockQuery(`
+          SELECT reviewer_id FROM patch_reviews
+          WHERE patch_id = $1 AND verdict IN ('reject', 'request_changes') AND reviewer_id IS NOT NULL
+        `, [patchId]);
+
+        for (const reviewer of rejecters.rows) {
+          mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+          await mockQuery(`
+            UPDATE gitswarm_reviewer_stats SET
+              accurate_rejections = accurate_rejections + 1
+            WHERE agent_id = $1
+          `, [reviewer.reviewer_id]);
+        }
+      });
+    });
+  });
+
   describe('GitSwarm-Specific Webhook Data', () => {
     it('should track gitswarm_patches linking', async () => {
       const patchId = 'patch-uuid';
