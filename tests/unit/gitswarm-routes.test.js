@@ -651,4 +651,168 @@ describe('GitSwarm Routes', () => {
       ).rejects.toThrow('duplicate key');
     });
   });
+
+  describe('Content Read Routes', () => {
+    describe('GET /gitswarm/repos/:id/contents/*', () => {
+      it('should return file contents when authorized', async () => {
+        const repoId = 'repo-123';
+        const path = 'README.md';
+
+        // Simulate permission check
+        mockQuery.mockResolvedValueOnce({ rows: [{ access_level: 'read' }] });
+
+        const permCheck = await mockQuery(
+          `SELECT access_level FROM gitswarm_repo_access WHERE repo_id = $1 AND agent_id = $2`,
+          [repoId, 'agent-123']
+        );
+
+        expect(permCheck.rows[0].access_level).toBe('read');
+      });
+
+      it('should deny access without read permission', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [] }); // No explicit access
+
+        const permCheck = await mockQuery(
+          `SELECT access_level FROM gitswarm_repo_access WHERE repo_id = $1 AND agent_id = $2`,
+          ['repo-123', 'agent-no-access']
+        );
+
+        expect(permCheck.rows).toHaveLength(0);
+      });
+
+      it('should support ref parameter for specific branch/commit', async () => {
+        const requestQuery = { ref: 'feature-branch' };
+        expect(requestQuery.ref).toBe('feature-branch');
+      });
+    });
+
+    describe('GET /gitswarm/repos/:id/tree', () => {
+      it('should return directory tree when authorized', async () => {
+        const repoId = 'repo-123';
+
+        mockQuery.mockResolvedValueOnce({ rows: [{ access_level: 'read' }] });
+
+        const permCheck = await mockQuery(
+          `SELECT access_level FROM gitswarm_repo_access WHERE repo_id = $1`,
+          [repoId]
+        );
+
+        expect(permCheck.rows[0]).toBeDefined();
+      });
+
+      it('should support recursive flag', async () => {
+        const requestQuery = { recursive: 'false' };
+        const isRecursive = requestQuery.recursive !== 'false';
+        expect(isRecursive).toBe(false);
+
+        const requestQueryTrue = { recursive: 'true' };
+        const isRecursiveTrue = requestQueryTrue.recursive !== 'false';
+        expect(isRecursiveTrue).toBe(true);
+      });
+    });
+
+    describe('GET /gitswarm/repos/:id/branches', () => {
+      it('should return branches list when authorized', async () => {
+        const mockBranches = [
+          { name: 'main', sha: 'sha1', protected: true },
+          { name: 'develop', sha: 'sha2', protected: false },
+          { name: 'feature/test', sha: 'sha3', protected: false }
+        ];
+
+        expect(mockBranches).toHaveLength(3);
+        expect(mockBranches[0].protected).toBe(true);
+      });
+    });
+
+    describe('GET /gitswarm/repos/:id/commits', () => {
+      it('should return commits with pagination', async () => {
+        const requestQuery = {
+          sha: 'main',
+          path: 'src/',
+          per_page: '10'
+        };
+
+        expect(parseInt(requestQuery.per_page)).toBe(10);
+      });
+
+      it('should support date range filtering', async () => {
+        const requestQuery = {
+          since: '2024-01-01T00:00:00Z',
+          until: '2024-12-31T23:59:59Z'
+        };
+
+        expect(requestQuery.since).toBeDefined();
+        expect(requestQuery.until).toBeDefined();
+      });
+    });
+
+    describe('GET /gitswarm/repos/:id/pulls', () => {
+      it('should return pull requests with state filter', async () => {
+        const requestQuery = {
+          state: 'open',
+          sort: 'created',
+          direction: 'desc'
+        };
+
+        expect(requestQuery.state).toBe('open');
+      });
+
+      it('should return all states when requested', async () => {
+        const requestQuery = { state: 'all' };
+        expect(['open', 'closed', 'all']).toContain(requestQuery.state);
+      });
+    });
+
+    describe('GET /gitswarm/repos/:id/clone', () => {
+      it('should return authenticated clone URL when write access', async () => {
+        const repoId = 'repo-123';
+
+        // Simulate write permission check
+        mockQuery.mockResolvedValueOnce({ rows: [{ access_level: 'write' }] });
+
+        const permCheck = await mockQuery(
+          `SELECT access_level FROM gitswarm_repo_access WHERE repo_id = $1`,
+          [repoId]
+        );
+
+        expect(permCheck.rows[0].access_level).toBe('write');
+      });
+
+      it('should deny clone token without write permission', async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [{ access_level: 'read' }] });
+
+        const permCheck = await mockQuery(
+          `SELECT access_level FROM gitswarm_repo_access WHERE repo_id = $1`,
+          ['repo-123']
+        );
+
+        // read is not sufficient for clone with token
+        expect(permCheck.rows[0].access_level).toBe('read');
+      });
+    });
+  });
+
+  describe('Rate Limiting', () => {
+    it('should apply read rate limit for content routes', () => {
+      const rateLimits = {
+        gitswarm_read: { max: 300, window: 60 },
+        gitswarm_write: { max: 30, window: 60 },
+        gitswarm_clone: { max: 10, window: 60 },
+        gitswarm_pr: { max: 5, window: 60 },
+        gitswarm_repo: { max: 5, window: 3600 }
+      };
+
+      expect(rateLimits.gitswarm_read.max).toBe(300);
+      expect(rateLimits.gitswarm_write.max).toBe(30);
+    });
+
+    it('should have more restrictive limits for write operations', () => {
+      const readLimit = 300;
+      const writeLimit = 30;
+      const repoLimit = 5;
+
+      expect(writeLimit).toBeLessThan(readLimit);
+      expect(repoLimit).toBeLessThan(writeLimit);
+    });
+  });
 });

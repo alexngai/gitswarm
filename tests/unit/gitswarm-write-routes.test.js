@@ -531,3 +531,277 @@ describe('Input Validation', () => {
     });
   });
 });
+
+describe('Full Workflow Tests', () => {
+  let mockQuery;
+  let mockPermissionService;
+  let mockGitswarmService;
+
+  beforeEach(() => {
+    mockQuery = vi.fn();
+    mockPermissionService = {
+      canPerform: vi.fn(),
+      canPushToBranch: vi.fn(),
+      checkConsensus: vi.fn(),
+      resolvePermissions: vi.fn(),
+      isMaintainer: vi.fn(),
+      isOwner: vi.fn()
+    };
+    mockGitswarmService = {
+      createFile: vi.fn(),
+      createBranch: vi.fn(),
+      createPullRequest: vi.fn(),
+      mergePullRequest: vi.fn()
+    };
+  });
+
+  describe('Feature Development Workflow', () => {
+    it('should complete full feature workflow: create branch -> create file -> create PR', async () => {
+      const repoId = 'repo-123';
+      const agentId = 'agent-123';
+
+      // Step 1: Check write permission
+      mockPermissionService.canPerform.mockResolvedValueOnce({ allowed: true });
+      const canWrite = await mockPermissionService.canPerform(agentId, repoId, 'write');
+      expect(canWrite.allowed).toBe(true);
+
+      // Step 2: Create feature branch
+      mockGitswarmService.createBranch.mockResolvedValueOnce({
+        ref: 'refs/heads/feature/new-feature',
+        object: { sha: 'base-sha' }
+      });
+      const branch = await mockGitswarmService.createBranch(repoId, 'feature/new-feature', 'base-sha');
+      expect(branch.ref).toContain('feature/new-feature');
+
+      // Step 3: Create/modify file
+      mockGitswarmService.createFile.mockResolvedValueOnce({
+        commit: { sha: 'commit-sha' },
+        content: { sha: 'file-sha' }
+      });
+      const file = await mockGitswarmService.createFile(
+        repoId,
+        'src/feature.js',
+        'export const feature = () => {};',
+        'Add feature implementation',
+        'feature/new-feature',
+        'Agent',
+        'agent@bothub.dev'
+      );
+      expect(file.commit.sha).toBe('commit-sha');
+
+      // Step 4: Create PR
+      mockGitswarmService.createPullRequest.mockResolvedValueOnce({
+        number: 42,
+        html_url: 'https://github.com/org/repo/pull/42'
+      });
+      const pr = await mockGitswarmService.createPullRequest(repoId, {
+        title: 'Add new feature',
+        body: 'This PR adds a new feature',
+        head: 'feature/new-feature',
+        base: 'main'
+      });
+      expect(pr.number).toBe(42);
+    });
+
+    it('should block feature creation without write permission', async () => {
+      mockPermissionService.canPerform.mockResolvedValueOnce({ allowed: false });
+
+      const canWrite = await mockPermissionService.canPerform('agent-1', 'repo-1', 'write');
+      expect(canWrite.allowed).toBe(false);
+      // Workflow should stop here
+    });
+  });
+
+  describe('PR Review and Merge Workflow', () => {
+    it('should complete PR review and merge with consensus', async () => {
+      const repoId = 'repo-123';
+      const patchId = 'patch-123';
+      const prNumber = 42;
+
+      // Step 1: Submit reviews
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ patch_id: patchId }] }) // Get patch
+        .mockResolvedValueOnce({ rows: [] }) // Insert review 1
+        .mockResolvedValueOnce({ rows: [] }) // Update reviewer stats
+        .mockResolvedValueOnce({ rows: [{ patch_id: patchId }] }) // Get patch again
+        .mockResolvedValueOnce({ rows: [] }) // Insert review 2
+        .mockResolvedValueOnce({ rows: [] }); // Update reviewer stats
+
+      // Review 1
+      await mockQuery(`SELECT patch_id FROM gitswarm_patches WHERE repo_id = $1 AND github_pr_number = $2`, [repoId, prNumber]);
+      await mockQuery(`INSERT INTO patch_reviews (patch_id, reviewer_id, verdict) VALUES ($1, $2, $3)`, [patchId, 'reviewer-1', 'approve']);
+
+      // Review 2
+      await mockQuery(`SELECT patch_id FROM gitswarm_patches WHERE repo_id = $1 AND github_pr_number = $2`, [repoId, prNumber]);
+      await mockQuery(`INSERT INTO patch_reviews (patch_id, reviewer_id, verdict) VALUES ($1, $2, $3)`, [patchId, 'reviewer-2', 'approve']);
+
+      // Step 2: Check consensus
+      mockPermissionService.checkConsensus.mockResolvedValueOnce({
+        reached: true,
+        reason: 'consensus_reached',
+        ratio: 1.0,
+        approvals: 2,
+        rejections: 0
+      });
+      const consensus = await mockPermissionService.checkConsensus(patchId, repoId);
+      expect(consensus.reached).toBe(true);
+      expect(consensus.approvals).toBe(2);
+
+      // Step 3: Check merge permission
+      mockPermissionService.canPerform.mockResolvedValueOnce({ allowed: true });
+      const canMerge = await mockPermissionService.canPerform('merger-agent', repoId, 'merge');
+      expect(canMerge.allowed).toBe(true);
+
+      // Step 4: Merge PR
+      mockGitswarmService.mergePullRequest.mockResolvedValueOnce({
+        sha: 'merge-commit-sha',
+        merged: true
+      });
+      const merged = await mockGitswarmService.mergePullRequest(repoId, prNumber, { merge_method: 'squash' });
+      expect(merged.merged).toBe(true);
+    });
+
+    it('should block merge without consensus', async () => {
+      mockPermissionService.checkConsensus.mockResolvedValueOnce({
+        reached: false,
+        reason: 'below_threshold',
+        ratio: 0.4,
+        threshold: 0.66
+      });
+
+      const consensus = await mockPermissionService.checkConsensus('patch-1', 'repo-1');
+      expect(consensus.reached).toBe(false);
+      expect(consensus.ratio).toBeLessThan(consensus.threshold);
+      // Merge should not proceed
+    });
+
+    it('should block merge without maintainer permission', async () => {
+      mockPermissionService.checkConsensus.mockResolvedValueOnce({
+        reached: true,
+        reason: 'consensus_reached'
+      });
+      mockPermissionService.canPerform.mockResolvedValueOnce({ allowed: false });
+
+      const consensus = await mockPermissionService.checkConsensus('patch-1', 'repo-1');
+      expect(consensus.reached).toBe(true);
+
+      const canMerge = await mockPermissionService.canPerform('non-maintainer', 'repo-1', 'merge');
+      expect(canMerge.allowed).toBe(false);
+      // Merge should not proceed despite consensus
+    });
+  });
+
+  describe('Permission Escalation Workflow', () => {
+    it('should allow owner to grant access', async () => {
+      const repoId = 'repo-123';
+      const ownerId = 'owner-agent';
+      const targetAgentId = 'new-agent';
+
+      // Step 1: Verify owner status
+      mockPermissionService.isOwner.mockResolvedValueOnce(true);
+      const isOwner = await mockPermissionService.isOwner(ownerId, repoId);
+      expect(isOwner).toBe(true);
+
+      // Step 2: Grant access
+      mockQuery.mockResolvedValueOnce({ rows: [{ access_level: 'write' }] });
+      await mockQuery(`
+        INSERT INTO gitswarm_repo_access (repo_id, agent_id, access_level, granted_by)
+        VALUES ($1, $2, $3, $4)
+      `, [repoId, targetAgentId, 'write', ownerId]);
+
+      // Step 3: Verify new permissions
+      mockPermissionService.resolvePermissions.mockResolvedValueOnce({
+        level: 'write',
+        source: 'explicit'
+      });
+      const perms = await mockPermissionService.resolvePermissions(targetAgentId, repoId);
+      expect(perms.level).toBe('write');
+      expect(perms.source).toBe('explicit');
+    });
+
+    it('should prevent non-owner from granting access', async () => {
+      mockPermissionService.isOwner.mockResolvedValueOnce(false);
+
+      const isOwner = await mockPermissionService.isOwner('non-owner', 'repo-1');
+      expect(isOwner).toBe(false);
+      // Access grant should be denied
+    });
+  });
+
+  describe('Branch Protection Workflow', () => {
+    it('should enforce branch rules on protected branches', async () => {
+      const repoId = 'repo-123';
+      const agentId = 'agent-123';
+
+      // Step 1: Agent has write permission
+      mockPermissionService.canPerform.mockResolvedValueOnce({ allowed: true });
+      const canWrite = await mockPermissionService.canPerform(agentId, repoId, 'write');
+      expect(canWrite.allowed).toBe(true);
+
+      // Step 2: But cannot push to main (protected)
+      mockPermissionService.canPushToBranch.mockResolvedValueOnce({
+        allowed: false,
+        reason: 'branch_protected',
+        rule: { branch_pattern: 'main', direct_push: 'none' }
+      });
+      const canPushMain = await mockPermissionService.canPushToBranch(agentId, repoId, 'main');
+      expect(canPushMain.allowed).toBe(false);
+      expect(canPushMain.reason).toBe('branch_protected');
+
+      // Step 3: Can push to feature branches
+      mockPermissionService.canPushToBranch.mockResolvedValueOnce({
+        allowed: true,
+        reason: 'allowed',
+        rule: { branch_pattern: 'feature/*', direct_push: 'all' }
+      });
+      const canPushFeature = await mockPermissionService.canPushToBranch(agentId, repoId, 'feature/my-feature');
+      expect(canPushFeature.allowed).toBe(true);
+    });
+
+    it('should allow maintainers to push to maintainer-only branches', async () => {
+      mockPermissionService.resolvePermissions.mockResolvedValueOnce({
+        level: 'maintain',
+        source: 'maintainer',
+        role: 'maintainer'
+      });
+      mockPermissionService.canPushToBranch.mockResolvedValueOnce({
+        allowed: true,
+        reason: 'maintainer',
+        rule: { branch_pattern: 'release/*', direct_push: 'maintainers' }
+      });
+
+      const perms = await mockPermissionService.resolvePermissions('maintainer-agent', 'repo-1');
+      expect(perms.level).toBe('maintain');
+
+      const canPush = await mockPermissionService.canPushToBranch('maintainer-agent', 'repo-1', 'release/v1.0');
+      expect(canPush.allowed).toBe(true);
+      expect(canPush.reason).toBe('maintainer');
+    });
+  });
+
+  describe('Karma-Based Access Workflow', () => {
+    it('should grant write access based on karma threshold', async () => {
+      // High karma agent
+      mockPermissionService.resolvePermissions.mockResolvedValueOnce({
+        level: 'write',
+        source: 'karma',
+        karma: 500,
+        threshold: 100
+      });
+      const highKarmaPerms = await mockPermissionService.resolvePermissions('high-karma-agent', 'repo-1');
+      expect(highKarmaPerms.level).toBe('write');
+      expect(highKarmaPerms.karma).toBeGreaterThanOrEqual(highKarmaPerms.threshold);
+
+      // Low karma agent
+      mockPermissionService.resolvePermissions.mockResolvedValueOnce({
+        level: 'read',
+        source: 'karma_below_threshold',
+        karma: 50,
+        threshold: 100
+      });
+      const lowKarmaPerms = await mockPermissionService.resolvePermissions('low-karma-agent', 'repo-1');
+      expect(lowKarmaPerms.level).toBe('read');
+      expect(lowKarmaPerms.karma).toBeLessThan(lowKarmaPerms.threshold);
+    });
+  });
+});

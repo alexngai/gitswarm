@@ -584,6 +584,130 @@ describe('GitSwarmPermissionService', () => {
       expect(result.reached).toBe(false);
       expect(result.reason).toBe('repo_not_found');
     });
+
+    it('should handle guild model with no maintainer reviews', async () => {
+      mockQuery
+        .mockResolvedValueOnce({
+          rows: [{
+            consensus_threshold: 0.66,
+            min_reviews: 2,
+            ownership_model: 'guild',
+            human_review_weight: 1.5
+          }]
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            { verdict: 'approve', karma: 100, is_maintainer: false, is_human: false },
+            { verdict: 'approve', karma: 200, is_maintainer: false, is_human: false }
+          ]
+        });
+
+      const result = await service.checkConsensus('patch-1', 'repo-1');
+
+      expect(result.reached).toBe(false);
+      expect(result.reason).toBe('no_maintainer_reviews');
+    });
+
+    it('should handle guild model below threshold', async () => {
+      mockQuery
+        .mockResolvedValueOnce({
+          rows: [{
+            consensus_threshold: 0.75,
+            min_reviews: 3,
+            ownership_model: 'guild',
+            human_review_weight: 1.5
+          }]
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            { verdict: 'approve', karma: 100, is_maintainer: true, is_human: false },
+            { verdict: 'reject', karma: 200, is_maintainer: true, is_human: false },
+            { verdict: 'reject', karma: 300, is_maintainer: true, is_human: false }
+          ]
+        });
+
+      const result = await service.checkConsensus('patch-1', 'repo-1');
+
+      expect(result.reached).toBe(false);
+      expect(result.reason).toBe('below_threshold');
+      expect(result.maintainer_approvals).toBe(1);
+      expect(result.maintainer_rejections).toBe(2);
+    });
+
+    it('should handle mixed human and agent reviews in open model', async () => {
+      mockQuery
+        .mockResolvedValueOnce({
+          rows: [{
+            consensus_threshold: 0.5,
+            min_reviews: 3,
+            ownership_model: 'open',
+            human_review_weight: 5.0
+          }]
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            { verdict: 'approve', karma: null, is_maintainer: false, is_human: true },
+            { verdict: 'reject', karma: 100, is_maintainer: false, is_human: false },
+            { verdict: 'reject', karma: 100, is_maintainer: false, is_human: false }
+          ]
+        });
+
+      const result = await service.checkConsensus('patch-1', 'repo-1');
+
+      // Human approval weight: 5.0
+      // Two agent rejections: sqrt(101) * 2 ≈ 20.1
+      // Approval ratio: 5.0 / 25.1 ≈ 0.199 < 0.5
+      expect(result.reached).toBe(false);
+    });
+
+    it('should handle human rejection correctly', async () => {
+      mockQuery
+        .mockResolvedValueOnce({
+          rows: [{
+            consensus_threshold: 0.5,
+            min_reviews: 2,
+            ownership_model: 'open',
+            human_review_weight: 10.0
+          }]
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            { verdict: 'approve', karma: 1000, is_maintainer: false, is_human: false },
+            { verdict: 'reject', karma: null, is_maintainer: false, is_human: true }
+          ]
+        });
+
+      const result = await service.checkConsensus('patch-1', 'repo-1');
+
+      // Agent approval weight: sqrt(1001) ≈ 31.6
+      // Human rejection weight: 10.0
+      // Approval ratio: 31.6 / 41.6 ≈ 0.76 > 0.5
+      expect(result.reached).toBe(true);
+    });
+
+    it('should count request_changes as rejection', async () => {
+      mockQuery
+        .mockResolvedValueOnce({
+          rows: [{
+            consensus_threshold: 0.66,
+            min_reviews: 2,
+            ownership_model: 'open',
+            human_review_weight: 1.5
+          }]
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            { verdict: 'approve', karma: 100, is_maintainer: false, is_human: false },
+            { verdict: 'request_changes', karma: 100, is_maintainer: false, is_human: false }
+          ]
+        });
+
+      const result = await service.checkConsensus('patch-1', 'repo-1');
+
+      // 50/50 split should not meet 66% threshold
+      expect(result.reached).toBe(false);
+      expect(result.rejections).toBe(1);
+    });
   });
 
   describe('matchesBranchPattern', () => {
@@ -606,6 +730,37 @@ describe('GitSwarmPermissionService', () => {
     it('should handle complex patterns', () => {
       expect(service.matchesBranchPattern('release/v1.0.0', 'release/*')).toBe(true);
       expect(service.matchesBranchPattern('hotfix/critical-bug', 'hotfix/*')).toBe(true);
+    });
+
+    it('should handle patterns with special regex characters', () => {
+      // Ensure special chars are escaped properly
+      expect(service.matchesBranchPattern('test.branch', 'test.branch')).toBe(true);
+      expect(service.matchesBranchPattern('testXbranch', 'test.branch')).toBe(false);
+    });
+
+    it('should handle multiple wildcards', () => {
+      expect(service.matchesBranchPattern('prefix/middle/suffix', 'prefix/*/suffix')).toBe(true);
+      expect(service.matchesBranchPattern('prefix/a/b/suffix', 'prefix/*/suffix')).toBe(true);
+    });
+
+    it('should handle wildcard at beginning', () => {
+      expect(service.matchesBranchPattern('anything-release', '*-release')).toBe(true);
+      expect(service.matchesBranchPattern('something-release', '*-release')).toBe(true);
+    });
+
+    it('should handle wildcard in middle', () => {
+      expect(service.matchesBranchPattern('feat-123-done', 'feat-*-done')).toBe(true);
+      expect(service.matchesBranchPattern('feat-abc-xyz-done', 'feat-*-done')).toBe(true);
+    });
+
+    it('should not match partial branch names without wildcard', () => {
+      expect(service.matchesBranchPattern('main-v2', 'main')).toBe(false);
+      expect(service.matchesBranchPattern('feature', 'feature/test')).toBe(false);
+    });
+
+    it('should handle empty and single character patterns', () => {
+      expect(service.matchesBranchPattern('a', 'a')).toBe(true);
+      expect(service.matchesBranchPattern('a', 'b')).toBe(false);
     });
   });
 
@@ -701,6 +856,17 @@ describe('GitSwarmPermissionService', () => {
       expect(result.reason).toBe('weekly_limit_reached');
     });
 
+    it('should deny when monthly limit reached', async () => {
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ karma: 500 }] })
+        .mockResolvedValueOnce({ rows: [{ daily: '0', weekly: '0', monthly: '15' }] });
+
+      const result = await service.checkRepoCreationLimit('agent-1');
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('monthly_limit_reached');
+    });
+
     it('should grant higher limits to high karma agents', async () => {
       mockQuery
         .mockResolvedValueOnce({ rows: [{ karma: 10000 }] })
@@ -711,6 +877,56 @@ describe('GitSwarmPermissionService', () => {
       expect(result.allowed).toBe(true);
       expect(result.limit.daily).toBe(20);
       expect(result.limit.monthly).toBe(-1); // Unlimited
+    });
+
+    it('should handle zero karma agents', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [{ karma: 0 }] });
+
+      const result = await service.checkRepoCreationLimit('agent-1');
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('karma_too_low');
+    });
+
+    it('should handle missing agent karma', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      const result = await service.checkRepoCreationLimit('non-existent');
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('karma_too_low');
+    });
+
+    it('should tier limits correctly for each karma level', async () => {
+      // Test karma 100 tier
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ karma: 100 }] })
+        .mockResolvedValueOnce({ rows: [{ daily: '0', weekly: '0', monthly: '0' }] });
+
+      let result = await service.checkRepoCreationLimit('agent-1');
+      expect(result.limit.daily).toBe(1);
+      expect(result.limit.weekly).toBe(2);
+      expect(result.limit.monthly).toBe(5);
+
+      // Test karma 1000 tier
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ karma: 1000 }] })
+        .mockResolvedValueOnce({ rows: [{ daily: '0', weekly: '0', monthly: '0' }] });
+
+      result = await service.checkRepoCreationLimit('agent-2');
+      expect(result.limit.daily).toBe(5);
+      expect(result.limit.weekly).toBe(15);
+      expect(result.limit.monthly).toBe(50);
+
+      // Test karma 5000 tier
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ karma: 5000 }] })
+        .mockResolvedValueOnce({ rows: [{ daily: '0', weekly: '0', monthly: '0' }] });
+
+      result = await service.checkRepoCreationLimit('agent-3');
+      expect(result.limit.daily).toBe(10);
+      expect(result.limit.weekly).toBe(30);
+      expect(result.limit.monthly).toBe(100);
     });
   });
 

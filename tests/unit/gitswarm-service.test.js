@@ -643,4 +643,391 @@ describe('GitSwarmService', () => {
       );
     });
   });
+
+  describe('getDirectoryContents', () => {
+    it('should fetch directory contents from GitHub API', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+      const path = 'src';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ([
+          { name: 'index.js', path: 'src/index.js', type: 'file', sha: 'sha1', size: 500 },
+          { name: 'utils', path: 'src/utils', type: 'dir', sha: 'sha2' }
+        ])
+      });
+
+      const result = await service.getDirectoryContents(repoId, path);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('api.github.com/repos/org/repo/contents/src'),
+        expect.anything()
+      );
+      expect(result).toHaveLength(2);
+      expect(result[0].name).toBe('index.js');
+      expect(result[1].type).toBe('dir');
+    });
+
+    it('should fetch root directory when path is empty', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ([
+          { name: 'README.md', path: 'README.md', type: 'file', sha: 'sha1', size: 100 }
+        ])
+      });
+
+      const result = await service.getDirectoryContents(repoId, '');
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('api.github.com/repos/org/repo/contents?ref=main'),
+        expect.anything()
+      );
+      expect(result).toHaveLength(1);
+    });
+
+    it('should handle single file response', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      // GitHub returns object instead of array when path is a file
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          name: 'README.md',
+          path: 'README.md',
+          type: 'file',
+          sha: 'sha1',
+          size: 100
+        })
+      });
+
+      const result = await service.getDirectoryContents(repoId, 'README.md');
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('README.md');
+    });
+
+    it('should throw error for non-existent path', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 404
+      });
+
+      await expect(service.getDirectoryContents(repoId, 'nonexistent')).rejects.toThrow(
+        'Path not found'
+      );
+    });
+  });
+
+  describe('updateFile', () => {
+    it('should update file with SHA verification', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          commit: { sha: 'updated-commit' },
+          content: { sha: 'new-file-sha' }
+        })
+      });
+
+      const result = await service.updateFile(
+        repoId,
+        'file.txt',
+        'updated content',
+        'Update file',
+        'old-sha',
+        'main',
+        'Agent',
+        'agent@bothub.dev'
+      );
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('contents/file.txt'),
+        expect.objectContaining({
+          method: 'PUT',
+          body: expect.stringContaining('"sha":"old-sha"')
+        })
+      );
+      expect(result.commit.sha).toBe('updated-commit');
+    });
+
+    it('should throw error on SHA mismatch', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        json: async () => ({ message: 'SHA does not match' })
+      });
+
+      await expect(
+        service.updateFile(repoId, 'file.txt', 'content', 'msg', 'wrong-sha', 'main', 'Agent', 'agent@bothub.dev')
+      ).rejects.toThrow('GitHub API error');
+    });
+  });
+
+  describe('error handling', () => {
+    it('should handle generic GitHub API errors', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 500
+      });
+
+      await expect(service.getFileContents(repoId, 'file.txt')).rejects.toThrow(
+        'GitHub API error: 500'
+      );
+    });
+
+    it('should handle rate limiting errors', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403
+      });
+
+      await expect(service.getTree(repoId)).rejects.toThrow('GitHub API error: 403');
+    });
+
+    it('should handle network errors', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockRejectedValueOnce(new Error('Network error'));
+
+      await expect(service.getBranches(repoId)).rejects.toThrow('Network error');
+    });
+
+    it('should handle PR creation errors', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId,
+          default_branch: 'main'
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        json: async () => ({ message: 'A pull request already exists' })
+      });
+
+      await expect(
+        service.createPullRequest(repoId, { title: 'PR', head: 'feature', base: 'main' })
+      ).rejects.toThrow('GitHub API error');
+    });
+
+    it('should handle branch creation errors', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        json: async () => ({ message: 'Reference already exists' })
+      });
+
+      await expect(
+        service.createBranch(repoId, 'existing-branch', 'sha')
+      ).rejects.toThrow('GitHub API error');
+    });
+
+    it('should handle merge failures', async () => {
+      const repoId = 'repo-123';
+      const orgId = 'org-123';
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          github_full_name: 'org/repo',
+          org_id: orgId
+        }]
+      });
+
+      service.tokenCache.set(orgId, {
+        token: 'test-token',
+        expiresAt: new Date(Date.now() + 3600000).toISOString()
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        json: async () => ({ message: 'Pull request is not mergeable' })
+      });
+
+      await expect(
+        service.mergePullRequest(repoId, 42, { merge_method: 'squash' })
+      ).rejects.toThrow('GitHub API error');
+    });
+  });
+
+  describe('token cache edge cases', () => {
+    it('should refresh token when near expiration', async () => {
+      const orgId = 'org-123';
+
+      // Token expiring in 30 seconds (less than 60 second buffer)
+      service.tokenCache.set(orgId, {
+        token: 'expiring-token',
+        expiresAt: new Date(Date.now() + 30000).toISOString()
+      });
+
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ github_installation_id: 12345 }]
+      });
+
+      // The method will attempt to fetch new token since cached is near expiry
+      // This tests the 60 second buffer logic
+      const cached = service.tokenCache.get(orgId);
+      const needsRefresh = new Date(cached.expiresAt) <= new Date(Date.now() + 60000);
+
+      expect(needsRefresh).toBe(true);
+    });
+  });
 });
