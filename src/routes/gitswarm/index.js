@@ -5,6 +5,8 @@ import { GitSwarmPermissionService } from '../../services/gitswarm-permissions.j
 import { GitSwarmService, gitswarmService as defaultGitswarmService } from '../../services/gitswarm.js';
 import { installRoutes } from './install.js';
 import { packageRoutes } from './packages.js';
+import { councilRoutes } from './council.js';
+import { bountyRoutes } from './bounties.js';
 
 const permissionService = new GitSwarmPermissionService();
 
@@ -15,6 +17,8 @@ export async function gitswarmRoutes(app, options = {}) {
   // Register sub-routes
   await app.register(installRoutes, { activityService });
   await app.register(packageRoutes, { activityService });
+  await app.register(councilRoutes, { activityService });
+  await app.register(bountyRoutes, { activityService });
 
   // Different rate limits for different operation types
   const rateLimitRead = createRateLimiter('gitswarm_read');
@@ -1832,5 +1836,155 @@ export async function gitswarmRoutes(app, options = {}) {
       })),
       consensus
     };
+  });
+
+  // ============================================================
+  // Stage Progression Routes
+  // ============================================================
+
+  // Import stage progression service
+  const { StageProgressionService } = await import('../../services/stage-progression.js');
+  const stageService = new StageProgressionService();
+
+  // Get stage info and eligibility for advancement
+  app.get('/gitswarm/repos/:id/stage', {
+    preHandler: [authenticate, rateLimit],
+  }, async (request, reply) => {
+    const { id } = request.params;
+
+    // Check read access
+    const canRead = await permissionService.canPerform(request.agent.id, id, 'read');
+    if (!canRead.allowed) {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'You do not have access to this repository'
+      });
+    }
+
+    try {
+      const metrics = await stageService.getStageMetrics(id);
+      const eligibility = await stageService.checkAdvancementEligibility(id);
+      const history = await stageService.getStageHistory(id);
+
+      return {
+        current_stage: metrics.current_stage,
+        metrics: metrics.metrics,
+        advancement: eligibility,
+        history: history.slice(0, 10) // Last 10 transitions
+      };
+    } catch (error) {
+      return reply.status(404).send({
+        error: 'Not Found',
+        message: error.message
+      });
+    }
+  });
+
+  // Advance to next stage (if eligible)
+  app.post('/gitswarm/repos/:id/stage/advance', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          force: { type: 'boolean' }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { force = false } = request.body || {};
+
+    // Check if agent is owner
+    const isOwner = await permissionService.isOwner(request.agent.id, id);
+    if (!isOwner) {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'Only repository owners can advance the stage'
+      });
+    }
+
+    try {
+      const result = await stageService.advanceStage(id, force);
+
+      if (result.success) {
+        // Log activity
+        if (activityService) {
+          activityService.logActivity({
+            agent_id: request.agent.id,
+            event_type: 'gitswarm_stage_advanced',
+            target_type: 'gitswarm_repo',
+            target_id: id,
+            metadata: {
+              from: result.previous_stage,
+              to: result.new_stage,
+              forced: result.forced
+            }
+          }).catch(err => console.error('Failed to log activity:', err));
+        }
+      }
+
+      return result;
+    } catch (error) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: error.message
+      });
+    }
+  });
+
+  // Manually set stage (admin action)
+  app.put('/gitswarm/repos/:id/stage', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['stage'],
+        properties: {
+          stage: { type: 'string', enum: ['seed', 'growth', 'established', 'mature'] },
+          reason: { type: 'string', maxLength: 500 }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { stage, reason } = request.body;
+
+    // Check if agent is owner
+    const isOwner = await permissionService.isOwner(request.agent.id, id);
+    if (!isOwner) {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'Only repository owners can set the stage'
+      });
+    }
+
+    try {
+      const result = await stageService.setStage(id, stage, reason);
+
+      if (result.success) {
+        // Log activity
+        if (activityService) {
+          activityService.logActivity({
+            agent_id: request.agent.id,
+            event_type: 'gitswarm_stage_set',
+            target_type: 'gitswarm_repo',
+            target_id: id,
+            metadata: {
+              from: result.previous_stage,
+              to: result.new_stage,
+              reason
+            }
+          }).catch(err => console.error('Failed to log activity:', err));
+        }
+      }
+
+      return result;
+    } catch (error) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: error.message
+      });
+    }
   });
 }

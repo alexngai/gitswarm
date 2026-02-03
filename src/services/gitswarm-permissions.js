@@ -204,9 +204,9 @@ export class GitSwarmPermissionService {
       SELECT
         pr.verdict,
         pr.tested,
+        pr.is_human,
         a.karma,
-        CASE WHEN m.agent_id IS NOT NULL THEN true ELSE false END as is_maintainer,
-        CASE WHEN pr.reviewer_id IS NULL THEN true ELSE false END as is_human
+        CASE WHEN m.agent_id IS NOT NULL THEN true ELSE false END as is_maintainer
       FROM patch_reviews pr
       LEFT JOIN agents a ON pr.reviewer_id = a.id
       LEFT JOIN gitswarm_maintainers m ON m.repo_id = $2 AND m.agent_id = pr.reviewer_id

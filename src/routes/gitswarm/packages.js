@@ -577,4 +577,115 @@ export async function packageRoutes(app, options = {}) {
 
     return { advisories };
   });
+
+  // ============================================================
+  // Package Deprecation
+  // ============================================================
+
+  /**
+   * Deprecate a package
+   */
+  app.post('/gitswarm/packages/:type/:name/deprecate', {
+    preHandler: [authenticate, rateLimitPublish],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', maxLength: 1000 },
+          alternative: { type: 'string', maxLength: 255 }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { type, name } = request.params;
+    const { message, alternative } = request.body || {};
+
+    const pkg = await packageRegistry.getPackage(type, name);
+
+    if (!pkg) {
+      return reply.status(404).send({
+        error: 'Not Found',
+        message: 'Package not found'
+      });
+    }
+
+    // Check deprecate permission
+    const canDeprecate = await packageRegistry.canPerform(request.agent.id, pkg.id, 'deprecate');
+    if (!canDeprecate.allowed) {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'You do not have permission to deprecate this package'
+      });
+    }
+
+    try {
+      const result = await packageRegistry.deprecatePackage(pkg.id, request.agent.id, message, alternative);
+
+      // Log activity
+      if (activityService) {
+        activityService.logActivity({
+          agent_id: request.agent.id,
+          event_type: 'gitswarm_package_deprecated',
+          target_type: 'gitswarm_package',
+          target_id: pkg.id,
+          metadata: { alternative }
+        }).catch(err => console.error('Failed to log activity:', err));
+      }
+
+      return result;
+    } catch (error) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: error.message
+      });
+    }
+  });
+
+  /**
+   * Undeprecate a package
+   */
+  app.delete('/gitswarm/packages/:type/:name/deprecate', {
+    preHandler: [authenticate, rateLimitPublish],
+  }, async (request, reply) => {
+    const { type, name } = request.params;
+
+    const pkg = await packageRegistry.getPackage(type, name);
+
+    if (!pkg) {
+      return reply.status(404).send({
+        error: 'Not Found',
+        message: 'Package not found'
+      });
+    }
+
+    // Check deprecate permission
+    const canDeprecate = await packageRegistry.canPerform(request.agent.id, pkg.id, 'deprecate');
+    if (!canDeprecate.allowed) {
+      return reply.status(403).send({
+        error: 'Forbidden',
+        message: 'You do not have permission to undeprecate this package'
+      });
+    }
+
+    try {
+      const result = await packageRegistry.undeprecatePackage(pkg.id, request.agent.id);
+
+      // Log activity
+      if (activityService) {
+        activityService.logActivity({
+          agent_id: request.agent.id,
+          event_type: 'gitswarm_package_undeprecated',
+          target_type: 'gitswarm_package',
+          target_id: pkg.id
+        }).catch(err => console.error('Failed to log activity:', err));
+      }
+
+      return result;
+    } catch (error) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: error.message
+      });
+    }
+  });
 }

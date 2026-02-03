@@ -615,18 +615,580 @@ export class CouncilCommandsService {
   }
 
   async commandNominate(repoId, nominatorId, nomineeRef) {
-    // Implementation for nominating a council member
-    return { message: 'Nomination command not yet implemented' };
+    const council = await this.getCouncil(repoId);
+    if (!council) {
+      return { error: 'No council exists for this repository' };
+    }
+
+    // Parse nomineeRef - could be @username or agent UUID
+    let nomineeId = nomineeRef;
+    if (nomineeRef.startsWith('@')) {
+      // Look up agent by name
+      const agent = await this.query(`
+        SELECT id FROM agents WHERE name = $1
+      `, [nomineeRef.substring(1)]);
+
+      if (agent.rows.length === 0) {
+        return { error: `Agent not found: ${nomineeRef}` };
+      }
+      nomineeId = agent.rows[0].id;
+    }
+
+    // Check eligibility
+    const eligibility = await this.checkEligibility(nomineeId, repoId);
+    if (!eligibility.eligible) {
+      return {
+        error: `Agent not eligible for council: ${eligibility.reason}`,
+        details: eligibility
+      };
+    }
+
+    // Add member
+    try {
+      const member = await this.addMember(council.id, nomineeId, 'member');
+      return {
+        success: true,
+        message: `Successfully nominated agent to council`,
+        member: {
+          agent_id: nomineeId,
+          role: member.role,
+          joined_at: member.joined_at
+        }
+      };
+    } catch (error) {
+      return { error: error.message };
+    }
   }
 
   async commandVote(repoId, voterId, proposalRef, voteValue) {
-    // Implementation for voting on a proposal
-    return { message: 'Vote command not yet implemented' };
+    const council = await this.getCouncil(repoId);
+    if (!council) {
+      return { error: 'No council exists for this repository' };
+    }
+
+    // Parse vote value
+    const voteMap = {
+      'yes': 'for',
+      'no': 'against',
+      'for': 'for',
+      'against': 'against',
+      'abstain': 'abstain'
+    };
+
+    const vote = voteMap[voteValue?.toLowerCase()];
+    if (!vote) {
+      return { error: `Invalid vote value: ${voteValue}. Use yes/no/abstain` };
+    }
+
+    // Find the proposal - proposalRef could be ID or #number
+    let proposalId = proposalRef;
+    if (proposalRef.startsWith('#')) {
+      // Find by recent proposal number (order by created)
+      const proposals = await this.query(`
+        SELECT id FROM gitswarm_council_proposals
+        WHERE council_id = $1 AND status = 'open'
+        ORDER BY proposed_at DESC
+      `, [council.id]);
+
+      const index = parseInt(proposalRef.substring(1)) - 1;
+      if (index < 0 || index >= proposals.rows.length) {
+        return { error: `Proposal not found: ${proposalRef}` };
+      }
+      proposalId = proposals.rows[index].id;
+    }
+
+    try {
+      const result = await this.vote(proposalId, voterId, vote);
+
+      // Get updated proposal status
+      const proposal = await this.query(`
+        SELECT title, status, votes_for, votes_against, quorum_required
+        FROM gitswarm_council_proposals WHERE id = $1
+      `, [proposalId]);
+
+      return {
+        success: true,
+        message: `Vote '${vote}' recorded`,
+        proposal: {
+          title: proposal.rows[0].title,
+          status: proposal.rows[0].status,
+          votes_for: proposal.rows[0].votes_for,
+          votes_against: proposal.rows[0].votes_against,
+          quorum_required: proposal.rows[0].quorum_required
+        }
+      };
+    } catch (error) {
+      return { error: error.message };
+    }
   }
 
   async commandPropose(repoId, proposerId, args) {
-    // Implementation for creating a proposal
-    return { message: 'Propose command not yet implemented' };
+    const council = await this.getCouncil(repoId);
+    if (!council) {
+      return { error: 'No council exists for this repository' };
+    }
+
+    // Check if proposer is a member
+    const membership = await this.query(`
+      SELECT 1 FROM gitswarm_council_members
+      WHERE council_id = $1 AND agent_id = $2
+    `, [council.id, proposerId]);
+
+    if (membership.rows.length === 0) {
+      return { error: 'Only council members can create proposals' };
+    }
+
+    // Parse command: /council propose <type> <title> [description]
+    // E.g., /council propose add_maintainer "Add @agent as maintainer" "They have contributed significantly"
+    if (args.length < 2) {
+      return {
+        error: 'Usage: /council propose <type> <title> [description]',
+        types: ['add_maintainer', 'remove_maintainer', 'modify_branch_rule',
+                'modify_access', 'change_settings', 'custom']
+      };
+    }
+
+    const proposalType = args[0];
+    const validTypes = ['add_maintainer', 'remove_maintainer', 'modify_branch_rule',
+                        'modify_access', 'change_ownership', 'change_settings', 'custom'];
+
+    if (!validTypes.includes(proposalType)) {
+      return {
+        error: `Invalid proposal type: ${proposalType}`,
+        types: validTypes
+      };
+    }
+
+    // Join remaining args as title (handle quoted strings)
+    const remainingText = args.slice(1).join(' ');
+
+    // Try to parse quoted title and description
+    const quotedMatch = remainingText.match(/^"([^"]+)"(?:\s+"([^"]+)")?/);
+    let title, description;
+
+    if (quotedMatch) {
+      title = quotedMatch[1];
+      description = quotedMatch[2] || '';
+    } else {
+      title = remainingText;
+      description = '';
+    }
+
+    try {
+      const proposal = await this.createProposal(council.id, proposerId, {
+        title,
+        description,
+        proposal_type: proposalType,
+        expires_in_days: 7
+      });
+
+      return {
+        success: true,
+        message: 'Proposal created',
+        proposal: {
+          id: proposal.id,
+          title: proposal.title,
+          type: proposal.proposal_type,
+          quorum_required: proposal.quorum_required,
+          expires_at: proposal.expires_at
+        }
+      };
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+
+  // ============================================================
+  // Elections
+  // ============================================================
+
+  /**
+   * Start a new council election
+   */
+  async startElection(councilId, creatorId, options = {}) {
+    const {
+      election_type = 'regular',
+      seats_available = 1,
+      nominations_days = 7,
+      voting_days = 7
+    } = options;
+
+    // Check council exists and is active
+    const council = await this.query(`
+      SELECT * FROM gitswarm_repo_councils WHERE id = $1
+    `, [councilId]);
+
+    if (council.rows.length === 0) {
+      throw new Error('Council not found');
+    }
+
+    // Check no active election
+    const activeElection = await this.query(`
+      SELECT id FROM gitswarm_council_elections
+      WHERE council_id = $1 AND status IN ('nominations', 'voting')
+    `, [councilId]);
+
+    if (activeElection.rows.length > 0) {
+      throw new Error('An election is already in progress');
+    }
+
+    // Calculate dates
+    const nominationsEndAt = new Date();
+    nominationsEndAt.setDate(nominationsEndAt.getDate() + nominations_days);
+
+    const votingStartAt = new Date(nominationsEndAt);
+    const votingEndAt = new Date(votingStartAt);
+    votingEndAt.setDate(votingEndAt.getDate() + voting_days);
+
+    // Create election
+    const result = await this.query(`
+      INSERT INTO gitswarm_council_elections (
+        council_id, election_type, seats_available, status,
+        nominations_end_at, voting_start_at, voting_end_at, created_by
+      ) VALUES ($1, $2, $3, 'nominations', $4, $5, $6, $7)
+      RETURNING *
+    `, [councilId, election_type, seats_available, nominationsEndAt, votingStartAt, votingEndAt, creatorId]);
+
+    return result.rows[0];
+  }
+
+  /**
+   * Get current or recent election
+   */
+  async getElection(electionId) {
+    const result = await this.query(`
+      SELECT e.*, c.repo_id
+      FROM gitswarm_council_elections e
+      JOIN gitswarm_repo_councils c ON e.council_id = c.id
+      WHERE e.id = $1
+    `, [electionId]);
+
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Get active election for a council
+   */
+  async getActiveElection(councilId) {
+    const result = await this.query(`
+      SELECT * FROM gitswarm_council_elections
+      WHERE council_id = $1 AND status IN ('nominations', 'voting')
+      ORDER BY created_at DESC
+      LIMIT 1
+    `, [councilId]);
+
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Nominate a candidate for election
+   */
+  async nominateCandidate(electionId, agentId, nominatedBy, statement = null) {
+    const election = await this.getElection(electionId);
+    if (!election) {
+      throw new Error('Election not found');
+    }
+
+    if (election.status !== 'nominations') {
+      throw new Error('Nominations are closed for this election');
+    }
+
+    // Check if agent is eligible (karma, contributions)
+    const eligibility = await this.checkEligibility(agentId, election.repo_id);
+    if (!eligibility.eligible) {
+      throw new Error(`Agent not eligible: ${eligibility.reason}`);
+    }
+
+    // Create nomination
+    const result = await this.query(`
+      INSERT INTO gitswarm_election_candidates (
+        election_id, agent_id, nominated_by, statement
+      ) VALUES ($1, $2, $3, $4)
+      ON CONFLICT (election_id, agent_id) DO UPDATE SET
+        statement = COALESCE($4, gitswarm_election_candidates.statement)
+      RETURNING *
+    `, [electionId, agentId, nominatedBy, statement]);
+
+    return result.rows[0];
+  }
+
+  /**
+   * Accept nomination
+   */
+  async acceptNomination(candidateId, agentId) {
+    const result = await this.query(`
+      UPDATE gitswarm_election_candidates
+      SET status = 'accepted'
+      WHERE id = $1 AND agent_id = $2 AND status = 'nominated'
+      RETURNING *
+    `, [candidateId, agentId]);
+
+    if (result.rows.length === 0) {
+      throw new Error('Nomination not found or already processed');
+    }
+
+    return result.rows[0];
+  }
+
+  /**
+   * Withdraw candidacy
+   */
+  async withdrawCandidacy(candidateId, agentId) {
+    const result = await this.query(`
+      UPDATE gitswarm_election_candidates
+      SET status = 'withdrawn'
+      WHERE id = $1 AND agent_id = $2 AND status IN ('nominated', 'accepted')
+      RETURNING *
+    `, [candidateId, agentId]);
+
+    if (result.rows.length === 0) {
+      throw new Error('Candidacy not found or cannot be withdrawn');
+    }
+
+    return result.rows[0];
+  }
+
+  /**
+   * Get candidates for an election
+   */
+  async getElectionCandidates(electionId) {
+    const result = await this.query(`
+      SELECT c.*, a.name as agent_name, a.karma, a.avatar_url
+      FROM gitswarm_election_candidates c
+      JOIN agents a ON c.agent_id = a.id
+      WHERE c.election_id = $1 AND c.status IN ('nominated', 'accepted')
+      ORDER BY c.vote_count DESC, c.nominated_at
+    `, [electionId]);
+
+    return result.rows;
+  }
+
+  /**
+   * Transition election to voting phase
+   */
+  async startVoting(electionId) {
+    const election = await this.getElection(electionId);
+    if (!election) {
+      throw new Error('Election not found');
+    }
+
+    if (election.status !== 'nominations') {
+      throw new Error('Election is not in nominations phase');
+    }
+
+    // Check we have enough candidates
+    const candidates = await this.getElectionCandidates(electionId);
+    if (candidates.length < election.seats_available) {
+      throw new Error(`Not enough candidates (${candidates.length}) for ${election.seats_available} seats`);
+    }
+
+    // Update status
+    await this.query(`
+      UPDATE gitswarm_council_elections
+      SET status = 'voting', voting_start_at = NOW()
+      WHERE id = $1
+    `, [electionId]);
+
+    return { success: true, candidates_count: candidates.length };
+  }
+
+  /**
+   * Cast a vote in an election
+   */
+  async castElectionVote(electionId, voterId, candidateId) {
+    const election = await this.getElection(electionId);
+    if (!election) {
+      throw new Error('Election not found');
+    }
+
+    if (election.status !== 'voting') {
+      throw new Error('Voting is not open for this election');
+    }
+
+    // Check voter is eligible (council member or eligible contributor)
+    const membership = await this.query(`
+      SELECT 1 FROM gitswarm_council_members
+      WHERE council_id = $1 AND agent_id = $2
+    `, [election.council_id, voterId]);
+
+    // For now, only council members can vote
+    // Could expand to include eligible agents based on settings
+    if (membership.rows.length === 0) {
+      throw new Error('Only council members can vote in elections');
+    }
+
+    // Check candidate exists
+    const candidate = await this.query(`
+      SELECT id FROM gitswarm_election_candidates
+      WHERE id = $1 AND election_id = $2 AND status IN ('nominated', 'accepted')
+    `, [candidateId, electionId]);
+
+    if (candidate.rows.length === 0) {
+      throw new Error('Candidate not found or not eligible');
+    }
+
+    // Check not already voted for this candidate
+    const existingVote = await this.query(`
+      SELECT id FROM gitswarm_election_votes
+      WHERE election_id = $1 AND voter_id = $2 AND candidate_id = $3
+    `, [electionId, voterId, candidateId]);
+
+    if (existingVote.rows.length > 0) {
+      throw new Error('You have already voted for this candidate');
+    }
+
+    // Record vote
+    await this.query(`
+      INSERT INTO gitswarm_election_votes (election_id, voter_id, candidate_id)
+      VALUES ($1, $2, $3)
+    `, [electionId, voterId, candidateId]);
+
+    // Update candidate vote count
+    await this.query(`
+      UPDATE gitswarm_election_candidates
+      SET vote_count = vote_count + 1
+      WHERE id = $1
+    `, [candidateId]);
+
+    return { success: true, voted_for: candidateId };
+  }
+
+  /**
+   * Complete election and elect winners
+   */
+  async completeElection(electionId) {
+    const election = await this.getElection(electionId);
+    if (!election) {
+      throw new Error('Election not found');
+    }
+
+    if (election.status !== 'voting') {
+      throw new Error('Election is not in voting phase');
+    }
+
+    // Get candidates sorted by votes
+    const candidates = await this.query(`
+      SELECT c.*, a.name as agent_name
+      FROM gitswarm_election_candidates c
+      JOIN agents a ON c.agent_id = a.id
+      WHERE c.election_id = $1 AND c.status IN ('nominated', 'accepted')
+      ORDER BY c.vote_count DESC
+    `, [electionId]);
+
+    const winners = candidates.rows.slice(0, election.seats_available);
+    const losers = candidates.rows.slice(election.seats_available);
+
+    // Calculate term expiration
+    const council = await this.query(`
+      SELECT term_limit_months FROM gitswarm_repo_councils WHERE id = $1
+    `, [election.council_id]);
+
+    let termExpiresAt = null;
+    if (council.rows[0].term_limit_months) {
+      termExpiresAt = new Date();
+      termExpiresAt.setMonth(termExpiresAt.getMonth() + council.rows[0].term_limit_months);
+    }
+
+    // Update winner statuses and add to council
+    for (const winner of winners) {
+      await this.query(`
+        UPDATE gitswarm_election_candidates SET status = 'elected' WHERE id = $1
+      `, [winner.id]);
+
+      // Add or update membership
+      await this.query(`
+        INSERT INTO gitswarm_council_members (council_id, agent_id, role, term_expires_at)
+        VALUES ($1, $2, 'member', $3)
+        ON CONFLICT (council_id, agent_id) DO UPDATE SET
+          term_expires_at = $3,
+          joined_at = NOW()
+      `, [election.council_id, winner.agent_id, termExpiresAt]);
+    }
+
+    // Update loser statuses
+    for (const loser of losers) {
+      await this.query(`
+        UPDATE gitswarm_election_candidates SET status = 'not_elected' WHERE id = $1
+      `, [loser.id]);
+    }
+
+    // Complete election
+    await this.query(`
+      UPDATE gitswarm_council_elections
+      SET status = 'completed', completed_at = NOW()
+      WHERE id = $1
+    `, [electionId]);
+
+    // Update council status if needed
+    await this.updateCouncilStatus(election.council_id);
+
+    return {
+      success: true,
+      winners: winners.map(w => ({ agent_id: w.agent_id, name: w.agent_name, votes: w.vote_count })),
+      term_expires_at: termExpiresAt
+    };
+  }
+
+  /**
+   * Get election results
+   */
+  async getElectionResults(electionId) {
+    const election = await this.getElection(electionId);
+    if (!election) {
+      throw new Error('Election not found');
+    }
+
+    const candidates = await this.query(`
+      SELECT c.*, a.name as agent_name, a.karma
+      FROM gitswarm_election_candidates c
+      JOIN agents a ON c.agent_id = a.id
+      WHERE c.election_id = $1
+      ORDER BY c.vote_count DESC, c.nominated_at
+    `, [electionId]);
+
+    const totalVotes = await this.query(`
+      SELECT COUNT(DISTINCT voter_id) as count FROM gitswarm_election_votes
+      WHERE election_id = $1
+    `, [electionId]);
+
+    return {
+      election: {
+        id: election.id,
+        status: election.status,
+        seats_available: election.seats_available,
+        completed_at: election.completed_at
+      },
+      candidates: candidates.rows.map(c => ({
+        agent_id: c.agent_id,
+        name: c.agent_name,
+        karma: c.karma,
+        vote_count: c.vote_count,
+        status: c.status,
+        statement: c.statement
+      })),
+      total_voters: parseInt(totalVotes.rows[0].count)
+    };
+  }
+
+  /**
+   * Check for and handle expired member terms
+   */
+  async checkExpiredTerms(councilId) {
+    // Find members with expired terms
+    const expired = await this.query(`
+      SELECT agent_id FROM gitswarm_council_members
+      WHERE council_id = $1 AND term_expires_at IS NOT NULL AND term_expires_at < NOW()
+    `, [councilId]);
+
+    // Remove expired members
+    for (const member of expired.rows) {
+      await this.removeMember(councilId, member.agent_id);
+    }
+
+    return {
+      expired_count: expired.rows.length,
+      removed: expired.rows.map(m => m.agent_id)
+    };
   }
 }
 

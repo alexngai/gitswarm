@@ -41,6 +41,12 @@ export async function webhookRoutes(app) {
         case 'push':
           await handlePushEvent(request.body);
           break;
+        case 'issues':
+          await handleIssuesEvent(request.body);
+          break;
+        case 'issue_comment':
+          await handleIssueCommentEvent(request.body);
+          break;
         default:
           app.log.info({ event }, 'Unhandled GitHub event');
       }
@@ -623,4 +629,240 @@ async function handlePushEvent(payload) {
     `UPDATE patches SET updated_at = NOW() WHERE id = $1`,
     [patchResult.rows[0].id]
   );
+}
+
+// ============================================================
+// Issue Events (for GitSwarm bounties)
+// ============================================================
+
+// Handle issue events (opened, closed, labeled, etc.)
+async function handleIssuesEvent(payload) {
+  const { action, issue, repository, label } = payload;
+
+  // Check if this is a GitSwarm repo
+  const repoResult = await query(`
+    SELECT id, github_full_name FROM gitswarm_repos
+    WHERE github_repo_id = $1 AND status = 'active'
+  `, [repository.id]);
+
+  if (repoResult.rows.length === 0) {
+    return; // Not a GitSwarm-tracked repo
+  }
+
+  const repo = repoResult.rows[0];
+
+  // Map the issue author
+  if (issue.user) {
+    await ensureGitHubUserMapping(issue.user);
+  }
+
+  switch (action) {
+    case 'opened':
+      console.log(`New issue #${issue.number} opened on GitSwarm repo ${repo.github_full_name}`);
+      // Could auto-create bounty based on labels or config
+      break;
+
+    case 'closed':
+      // If issue has a bounty, check if it should be marked as complete
+      await handleIssueClosedForBounty(repo.id, issue);
+      break;
+
+    case 'labeled':
+      // Check if bounty label was added
+      if (label && label.name.toLowerCase().includes('bounty')) {
+        console.log(`Bounty label added to issue #${issue.number}`);
+        // Could auto-create bounty
+      }
+      break;
+
+    case 'unlabeled':
+      // Check if bounty label was removed
+      if (label && label.name.toLowerCase().includes('bounty')) {
+        console.log(`Bounty label removed from issue #${issue.number}`);
+      }
+      break;
+
+    case 'assigned':
+      // Track assignment for bounty claims
+      if (issue.assignee) {
+        await ensureGitHubUserMapping(issue.assignee);
+        console.log(`Issue #${issue.number} assigned to ${issue.assignee.login}`);
+      }
+      break;
+  }
+}
+
+// Handle issue closed for bounty completion
+async function handleIssueClosedForBounty(repoId, issue) {
+  // Check if there's a bounty for this issue
+  const bountyResult = await query(`
+    SELECT id, status FROM gitswarm_bounties
+    WHERE repo_id = $1 AND github_issue_number = $2
+  `, [repoId, issue.number]);
+
+  if (bountyResult.rows.length === 0) {
+    return; // No bounty for this issue
+  }
+
+  const bounty = bountyResult.rows[0];
+
+  // If bounty is open or claimed, update status
+  if (['open', 'claimed', 'in_progress'].includes(bounty.status)) {
+    // Check if closed via a PR (indicating work was completed)
+    if (issue.state_reason === 'completed' || issue.state_reason === 'not_planned') {
+      // Mark bounty as awaiting review
+      await query(`
+        UPDATE gitswarm_bounties SET status = 'submitted'
+        WHERE id = $1 AND status IN ('open', 'claimed', 'in_progress')
+      `, [bounty.id]);
+
+      console.log(`Bounty ${bounty.id} moved to submitted state after issue #${issue.number} closed`);
+    }
+  }
+}
+
+// Handle issue comment events
+async function handleIssueCommentEvent(payload) {
+  const { action, comment, issue, repository } = payload;
+
+  if (action !== 'created') {
+    return; // Only process new comments
+  }
+
+  // Check if this is a GitSwarm repo
+  const repoResult = await query(`
+    SELECT id, github_full_name FROM gitswarm_repos
+    WHERE github_repo_id = $1 AND status = 'active'
+  `, [repository.id]);
+
+  if (repoResult.rows.length === 0) {
+    return; // Not a GitSwarm-tracked repo
+  }
+
+  const repo = repoResult.rows[0];
+
+  // Map the commenter
+  if (comment.user) {
+    await ensureGitHubUserMapping(comment.user);
+  }
+
+  // Check for GitSwarm commands in comment
+  const commandMatch = comment.body.match(/^\/gitswarm\s+(\w+)(?:\s+(.*))?$/im);
+
+  if (commandMatch) {
+    const [, command, args] = commandMatch;
+    await handleGitSwarmCommand(repo.id, issue, comment, command, args);
+  }
+
+  // Check for bounty claim commands
+  const bountyMatch = comment.body.match(/^\/bounty\s+(\w+)(?:\s+(.*))?$/im);
+
+  if (bountyMatch) {
+    const [, command, args] = bountyMatch;
+    await handleBountyCommand(repo.id, issue, comment, command, args);
+  }
+}
+
+// Handle /gitswarm commands in issue comments
+async function handleGitSwarmCommand(repoId, issue, comment, command, args) {
+  console.log(`GitSwarm command in issue #${issue.number}: /${command} ${args || ''}`);
+
+  // Map commenter to agent if possible
+  const userMapping = await query(`
+    SELECT agent_id FROM github_user_mappings WHERE github_user_id = $1
+  `, [comment.user.id]);
+
+  if (!userMapping.rows[0]?.agent_id) {
+    console.log(`User ${comment.user.login} not mapped to an agent`);
+    return;
+  }
+
+  switch (command.toLowerCase()) {
+    case 'status':
+      // Could post a status comment
+      console.log(`Status requested for repo ${repoId}`);
+      break;
+
+    case 'help':
+      // Could post a help comment
+      console.log('Help requested');
+      break;
+
+    default:
+      console.log(`Unknown gitswarm command: ${command}`);
+  }
+}
+
+// Handle /bounty commands in issue comments
+async function handleBountyCommand(repoId, issue, comment, command, args) {
+  console.log(`Bounty command in issue #${issue.number}: /${command} ${args || ''}`);
+
+  // Check if there's a bounty for this issue
+  const bountyResult = await query(`
+    SELECT id, status, amount FROM gitswarm_bounties
+    WHERE repo_id = $1 AND github_issue_number = $2
+  `, [repoId, issue.number]);
+
+  // Map commenter to agent
+  const userMapping = await query(`
+    SELECT agent_id FROM github_user_mappings WHERE github_user_id = $1
+  `, [comment.user.id]);
+
+  const agentId = userMapping.rows[0]?.agent_id;
+
+  switch (command.toLowerCase()) {
+    case 'claim':
+      if (bountyResult.rows.length === 0) {
+        console.log(`No bounty exists for issue #${issue.number}`);
+        return;
+      }
+      if (!agentId) {
+        console.log(`User ${comment.user.login} not mapped to an agent`);
+        return;
+      }
+      // Process claim
+      console.log(`Agent ${agentId} claiming bounty for issue #${issue.number}`);
+      try {
+        await query(`
+          INSERT INTO gitswarm_bounty_claims (bounty_id, agent_id)
+          VALUES ($1, $2)
+          ON CONFLICT (bounty_id, agent_id) DO NOTHING
+        `, [bountyResult.rows[0].id, agentId]);
+
+        await query(`
+          UPDATE gitswarm_bounties SET status = 'claimed'
+          WHERE id = $1 AND status = 'open'
+        `, [bountyResult.rows[0].id]);
+      } catch (error) {
+        console.error('Failed to claim bounty:', error.message);
+      }
+      break;
+
+    case 'abandon':
+      if (bountyResult.rows.length === 0 || !agentId) {
+        return;
+      }
+      // Process abandon
+      console.log(`Agent ${agentId} abandoning bounty for issue #${issue.number}`);
+      try {
+        await query(`
+          UPDATE gitswarm_bounty_claims SET status = 'abandoned'
+          WHERE bounty_id = $1 AND agent_id = $2 AND status = 'active'
+        `, [bountyResult.rows[0].id, agentId]);
+      } catch (error) {
+        console.error('Failed to abandon bounty:', error.message);
+      }
+      break;
+
+    case 'status':
+      if (bountyResult.rows.length === 0) {
+        console.log(`No bounty exists for issue #${issue.number}`);
+      } else {
+        console.log(`Bounty for issue #${issue.number}: ${bountyResult.rows[0].amount} credits, status: ${bountyResult.rows[0].status}`);
+      }
+      break;
+
+    default:
+      console.log(`Unknown bounty command: ${command}`);
+  }
 }

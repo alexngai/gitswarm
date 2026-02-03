@@ -202,18 +202,66 @@ describe('PackageRegistryService', () => {
 
   describe('deprecatePackage', () => {
     it('should deprecate package with message', async () => {
+      // Check package exists and is not deprecated
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ id: 'pkg-1', deprecated: false }]
+      });
+      // Update package
       mockQuery.mockResolvedValueOnce({
         rows: [{
           id: 'pkg-1',
-          status: 'deprecated',
-          deprecated_message: 'Use v2 instead'
+          deprecated: true,
+          deprecation_message: 'Use v2 instead',
+          deprecated_alternative: '@new/package'
         }]
       });
 
-      const result = await service.deprecatePackage('pkg-1', 'Use v2 instead');
+      const result = await service.deprecatePackage('pkg-1', 'agent-uuid', 'Use v2 instead', '@new/package');
 
-      expect(result.status).toBe('deprecated');
-      expect(result.deprecated_message).toBe('Use v2 instead');
+      expect(result.success).toBe(true);
+      expect(result.package.deprecated).toBe(true);
+      expect(result.package.deprecation_message).toBe('Use v2 instead');
+    });
+
+    it('should reject if package already deprecated', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ id: 'pkg-1', deprecated: true }]
+      });
+
+      await expect(service.deprecatePackage('pkg-1', 'agent-uuid', 'message'))
+        .rejects.toThrow('already deprecated');
+    });
+
+    it('should reject if package not found', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      await expect(service.deprecatePackage('bad-pkg', 'agent-uuid', 'message'))
+        .rejects.toThrow('not found');
+    });
+  });
+
+  describe('undeprecatePackage', () => {
+    it('should undeprecate a deprecated package', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ id: 'pkg-1', deprecated: true }]
+      });
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ id: 'pkg-1', deprecated: false }]
+      });
+
+      const result = await service.undeprecatePackage('pkg-1', 'agent-uuid');
+
+      expect(result.success).toBe(true);
+      expect(result.package.deprecated).toBe(false);
+    });
+
+    it('should reject if package not deprecated', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ id: 'pkg-1', deprecated: false }]
+      });
+
+      await expect(service.undeprecatePackage('pkg-1', 'agent-uuid'))
+        .rejects.toThrow('not deprecated');
     });
   });
 

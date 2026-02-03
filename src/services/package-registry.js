@@ -670,6 +670,80 @@ export class PackageRegistryService {
         return `/packages/${key}`;
     }
   }
+
+  // ============================================================
+  // Package Deprecation
+  // ============================================================
+
+  /**
+   * Deprecate a package
+   */
+  async deprecatePackage(packageId, agentId, message = null, alternative = null) {
+    const pkg = await this.query(`
+      SELECT id, deprecated FROM gitswarm_packages WHERE id = $1
+    `, [packageId]);
+
+    if (pkg.rows.length === 0) {
+      throw new Error('Package not found');
+    }
+
+    if (pkg.rows[0].deprecated) {
+      throw new Error('Package is already deprecated');
+    }
+
+    const result = await this.query(`
+      UPDATE gitswarm_packages SET
+        deprecated = true,
+        deprecated_at = NOW(),
+        deprecated_by = $2,
+        deprecation_message = $3,
+        deprecated_alternative = $4,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `, [packageId, agentId, message, alternative]);
+
+    return {
+      success: true,
+      package: result.rows[0],
+      message: 'Package has been deprecated'
+    };
+  }
+
+  /**
+   * Undeprecate a package
+   */
+  async undeprecatePackage(packageId, agentId) {
+    const pkg = await this.query(`
+      SELECT id, deprecated FROM gitswarm_packages WHERE id = $1
+    `, [packageId]);
+
+    if (pkg.rows.length === 0) {
+      throw new Error('Package not found');
+    }
+
+    if (!pkg.rows[0].deprecated) {
+      throw new Error('Package is not deprecated');
+    }
+
+    const result = await this.query(`
+      UPDATE gitswarm_packages SET
+        deprecated = false,
+        deprecated_at = NULL,
+        deprecated_by = NULL,
+        deprecation_message = NULL,
+        deprecated_alternative = NULL,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `, [packageId]);
+
+    return {
+      success: true,
+      package: result.rows[0],
+      message: 'Package is no longer deprecated'
+    };
+  }
 }
 
 // Export singleton instance
