@@ -501,29 +501,56 @@ All plugin actions are logged as gitswarm activity events:
 
 ---
 
-### Implementation Approach
+### Implementation Status
 
-#### Phase 1: Foundation
+#### Phase 1: Foundation (IMPLEMENTED)
 
-- Define the `.gitswarm/` directory convention and schema
-- Implement config sync: `.gitswarm/config.yml` → gitswarm database
-- Add `repository_dispatch` for gitswarm-only events (consensus_reached, stabilization_passed)
-- Build the safe outputs enforcement layer
-- Implement 2-3 Tier 1 plugins (auto-promote, stale-cleanup, notify-slack)
+The initial implementation is in place:
 
-#### Phase 2: AI Plugins
+**Database** (`src/db/migrations/003_repo_plugins.sql`):
+- `gitswarm_repo_plugins` — plugin registrations per repo
+- `gitswarm_plugin_executions` — audit trail of all executions
+- `gitswarm_repo_config` — synced `.gitswarm/` config cache
+- `gitswarm_plugin_rate_limits` — per-plugin rate limiting
 
-- Build the AI engine abstraction (Claude, Codex, Copilot routing)
-- Implement issue-triage and pr-summarize plugins
-- Add plugin execution logging and dashboard
-- Support GitHub Actions-based plugin execution
+**Services**:
+- `src/services/plugin-engine.js` — Core orchestrator. Receives events, matches plugins, evaluates conditions, dispatches to GitHub Actions or executes built-in actions. Never runs AI itself.
+- `src/services/safe-outputs.js` — Mutation budget enforcement. Tracks action consumption per execution, blocks over-budget actions.
+- `src/services/config-sync.js` — Reads `.gitswarm/config.yml` and `.gitswarm/plugins.yml` from repos via GitHub API, syncs to database, reconciles plugin registrations.
+
+**Routes** (`src/routes/gitswarm/plugins.js`):
+- `GET /gitswarm/repos/:id/plugins` — List plugins
+- `POST /gitswarm/repos/:id/plugins` — Install via API
+- `PATCH /gitswarm/repos/:id/plugins/:name` — Update config
+- `DELETE /gitswarm/repos/:id/plugins/:name` — Remove
+- `POST /gitswarm/repos/:id/plugins/sync` — Sync from `.gitswarm/`
+- `GET /gitswarm/repos/:id/plugins/executions` — Audit log
+- `POST /gitswarm/repos/:id/plugins/executions/:id/report` — Callback from GitHub Actions
+
+**Webhook Integration** (`src/routes/webhooks.js`):
+- All webhook events are routed through the plugin engine after normal processing
+- Push events that touch `.gitswarm/` files trigger automatic config sync
+
+**Templates** (`templates/`):
+- `.gitswarm/config.yml` — Repo configuration template
+- `.gitswarm/plugins.yml` — Plugin configuration template with Tier 1-3 examples
+- `.github/workflows/gitswarm-issue-triage.yml` — Issue triage workflow
+- `.github/workflows/gitswarm-pr-risk.yml` — PR risk assessment workflow
+- `.github/workflows/gitswarm-consensus-merge.yml` — Consensus-based merge workflow
+
+#### Phase 2: AI Plugins (NEXT)
+
+- Build AI engine detection (which agents are installed on the repo)
+- Enhance workflow templates with Claude/Codex/Copilot integration
+- Add plugin execution dashboard
+- Support multi-engine fallback (from agentbook pattern)
 
 #### Phase 3: Governance Delegation
 
-- Implement consensus-merge and karma-fast-track plugins
-- Build council-execute plugin
-- Enable standalone mode (no gitswarm server required)
-- Cross-repo policy plugins
+- Council proposal auto-execution at repo level
+- Karma-weighted auto-merge for safe paths
+- Cross-repo policy enforcement
+- Standalone mode (no gitswarm server required)
 
 #### Phase 4: Ecosystem
 

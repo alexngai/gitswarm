@@ -15,6 +15,8 @@ import WebSocketService from './services/websocket.js';
 import ActivityService from './services/activity.js';
 import EmbeddingsService from './services/embeddings.js';
 import NotificationService from './services/notifications.js';
+import PluginEngine from './services/plugin-engine.js';
+import ConfigSyncService from './services/config-sync.js';
 
 // Route imports
 import { agentRoutes } from './routes/agents.js';
@@ -43,6 +45,8 @@ const wsService = new WebSocketService(redis);
 const activityService = new ActivityService(db, wsService);
 const embeddingsService = new EmbeddingsService(db);
 const notificationService = new NotificationService(db, redis);
+const pluginEngine = new PluginEngine(db, activityService);
+const configSyncService = new ConfigSyncService(db);
 
 const app = Fastify({
   logger: config.isDev
@@ -116,7 +120,7 @@ app.register(bountyRoutes, { prefix: apiPrefix, activityService });
 app.register(syncRoutes, { prefix: apiPrefix, activityService });
 
 // Webhooks (no auth required, verified by signature)
-app.register(webhookRoutes, { prefix: apiPrefix, activityService });
+app.register(webhookRoutes, { prefix: apiPrefix, activityService, pluginEngine, configSyncService });
 
 // Dashboard routes (for human UI)
 app.register(dashboardRoutes, { prefix: apiPrefix, db, activityService });
@@ -137,7 +141,7 @@ app.register(reportRoutes, { prefix: apiPrefix });
 app.register(adminRoutes, { prefix: `${apiPrefix}/admin`, db });
 
 // GitSwarm routes (agent development ecosystem)
-app.register(gitswarmRoutes, { prefix: apiPrefix, activityService });
+app.register(gitswarmRoutes, { prefix: apiPrefix, activityService, pluginEngine, configSyncService });
 
 // WebSocket endpoint for real-time activity
 app.get('/ws', { websocket: true }, (connection) => {

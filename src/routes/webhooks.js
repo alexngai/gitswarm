@@ -2,9 +2,13 @@ import { query } from '../config/database.js';
 import { githubApp } from '../services/github.js';
 
 let _activityService = null;
+let _pluginEngine = null;
+let _configSyncService = null;
 
 export async function webhookRoutes(app, options = {}) {
   _activityService = options.activityService || null;
+  _pluginEngine = options.pluginEngine || null;
+  _configSyncService = options.configSyncService || null;
   // GitHub webhook handler
   app.post('/webhooks/github', {
     config: {
@@ -52,6 +56,28 @@ export async function webhookRoutes(app, options = {}) {
           break;
         default:
           app.log.info({ event }, 'Unhandled GitHub event');
+      }
+
+      // Route event through plugin engine (non-blocking)
+      if (_pluginEngine) {
+        _pluginEngine.processWebhookEvent(event, request.body)
+          .catch(err => app.log.error({ error: err.message }, 'Plugin engine error'));
+      }
+
+      // Check if push touches .gitswarm/ files — trigger config sync
+      if (event === 'push' && _configSyncService) {
+        const commits = request.body.commits || [];
+        const touchesConfig = commits.some(c =>
+          [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]
+            .some(f => f.startsWith('.gitswarm/'))
+        );
+        if (touchesConfig) {
+          const repoId = await _resolveRepoIdFromPayload(request.body);
+          if (repoId) {
+            _configSyncService.syncRepoConfig(repoId)
+              .catch(err => app.log.error({ error: err.message }, 'Config sync error on push'));
+          }
+        }
       }
 
       return { received: true };
@@ -1044,4 +1070,17 @@ async function handleBountyCommand(repoId, issue, comment, command, args) {
     default:
       console.log(`Unknown bounty command: ${command}`);
   }
+}
+
+// Helper to resolve gitswarm repo ID from webhook payload
+async function _resolveRepoIdFromPayload(payload) {
+  const repository = payload.repository;
+  if (!repository) return null;
+
+  const result = await query(`
+    SELECT id FROM gitswarm_repos
+    WHERE github_repo_id = $1 AND status = 'active'
+  `, [repository.id]);
+
+  return result.rows[0]?.id || null;
 }

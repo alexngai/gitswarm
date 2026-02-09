@@ -1,0 +1,138 @@
+# GitSwarm Consensus Merge — GitHub Actions Workflow
+#
+# Triggered when gitswarm community consensus is reached on a stream.
+# This is the Tier 3 governance delegation pattern: the community votes
+# in gitswarm, and this workflow executes the merge at the repo level.
+#
+# This is the key workflow that enables repos to have merge decisions
+# driven by gitswarm consensus without routing through the web app.
+#
+# Install: Copy to .github/workflows/ in your repo.
+
+name: "GitSwarm: Consensus Merge"
+
+on:
+  repository_dispatch:
+    types: [gitswarm.plugin.consensus-merge]
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract event data
+        id: event
+        run: |
+          echo "execution_id=${{ github.event.client_payload.gitswarm.execution_id }}" >> "$GITHUB_OUTPUT"
+
+          # Extract consensus data
+          CONSENSUS='${{ toJSON(github.event.client_payload.event) }}'
+          STREAM_NAME=$(echo "$CONSENSUS" | jq -r '.stream_name // empty')
+          PR_NUMBER=$(echo "$CONSENSUS" | jq -r '.pr_number // empty')
+          THRESHOLD_MET=$(echo "$CONSENSUS" | jq -r '.consensus.achieved // 0')
+
+          echo "stream_name=$STREAM_NAME" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "threshold_met=$THRESHOLD_MET" >> "$GITHUB_OUTPUT"
+
+      - name: Verify consensus
+        id: verify
+        run: |
+          THRESHOLD="${{ steps.event.outputs.threshold_met }}"
+
+          # Safety check: only proceed if consensus threshold was actually met
+          if [ -z "$THRESHOLD" ] || [ "$(echo "$THRESHOLD < 0.5" | bc -l 2>/dev/null || echo 1)" = "1" ]; then
+            echo "Consensus threshold not met or invalid. Aborting."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Find PR to merge
+        if: steps.verify.outputs.proceed == 'true'
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ steps.event.outputs.pr_number }}"
+          STREAM="${{ steps.event.outputs.stream_name }}"
+
+          # If we have a PR number, use it directly
+          if [ -n "$PR_NUM" ] && [ "$PR_NUM" != "null" ]; then
+            echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          elif [ -n "$STREAM" ] && [ "$STREAM" != "null" ]; then
+            # Find PR by branch name
+            PR_NUM=$(gh pr list --head "$STREAM" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          else
+            echo "No PR number or stream name found"
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge PR
+        if: steps.verify.outputs.proceed == 'true' && steps.find_pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ steps.find_pr.outputs.pr_number }}"
+          THRESHOLD="${{ steps.event.outputs.threshold_met }}"
+
+          echo "Merging PR #${PR_NUM} (consensus: ${THRESHOLD})"
+
+          gh pr merge "$PR_NUM" \
+            --squash \
+            --subject "Merge via GitSwarm consensus (${THRESHOLD})" \
+            --body "Merged automatically by GitSwarm consensus-merge plugin.
+
+          Consensus achieved: ${THRESHOLD}
+          Plugin: consensus-merge
+          " || {
+            echo "Merge failed — PR may not be mergeable"
+            exit 1
+          }
+
+      - name: Post merge notification
+        if: steps.verify.outputs.proceed == 'true' && steps.find_pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ steps.find_pr.outputs.pr_number }}"
+          THRESHOLD="${{ steps.event.outputs.threshold_met }}"
+
+          COMMENT="### GitSwarm Consensus Merge
+
+          This PR was merged automatically after reaching community consensus.
+
+          | | |
+          |---|---|
+          | **Consensus** | ${THRESHOLD} |
+          | **Plugin** | consensus-merge |
+          | **Action** | squash merge |
+
+          ---
+          *Merged by [GitSwarm](https://gitswarm.dev) governance delegation*"
+
+          gh pr comment "$PR_NUM" --body "$COMMENT" 2>/dev/null || true
+
+      - name: Report result to GitSwarm
+        if: always()
+        env:
+          GITSWARM_API_KEY: ${{ secrets.GITSWARM_API_KEY }}
+          GITSWARM_API_URL: ${{ secrets.GITSWARM_API_URL }}
+        run: |
+          EXEC_ID="${{ steps.event.outputs.execution_id }}"
+          STATUS="${{ job.status == 'success' && 'completed' || 'failed' }}"
+          PR_NUM="${{ steps.find_pr.outputs.pr_number }}"
+
+          if [ -n "$GITSWARM_API_URL" ] && [ -n "$GITSWARM_API_KEY" ] && [ -n "$EXEC_ID" ]; then
+            curl -s -X POST \
+              "${GITSWARM_API_URL}/plugins/executions/${EXEC_ID}/report" \
+              -H "Authorization: Bearer ${GITSWARM_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\": \"${STATUS}\", \"actions_taken\": [{\"action\": \"merge\", \"pr_number\": \"${PR_NUM}\"}]}" \
+              || true
+          fi
