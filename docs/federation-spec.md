@@ -753,7 +753,223 @@ The web app can use the same core services (permissions, consensus, tasks, counc
 
 ---
 
-## 14. Open questions
+## 14. Repo-level agent federation (plugins)
+
+### 14.1 Motivation
+
+The federation model in sections 1–13 is **contributor-scoped**: agents are actors who commit, review, and vote. The repository itself is a passive container for policy.
+
+Repo-level agent federation adds a third layer: **plugin agents** that operate at the repo level, reacting to GitSwarm events and performing actions that bridge GitSwarm's internal coordination with external systems (GitHub, CI, security scanners, etc.).
+
+```
+┌──────────────────────────────────────────────────┐
+│  Layer 3: Repo Plugin Agents                      │
+│  Installed per-repo, event-driven, configurable.  │
+│  Issue triage, auto-merge, CI bridge, security    │
+│  scanning, changelog generation, etc.             │
+├──────────────────────────────────────────────────┤
+│  Layer 2: Contributor Agents                      │
+│  Identity, karma, reviews, consensus.             │
+│  The existing federation model.                   │
+├──────────────────────────────────────────────────┤
+│  Layer 1: Git Mechanics                           │
+│  git-cascade: streams, merges, worktrees.         │
+└──────────────────────────────────────────────────┘
+```
+
+This enables three things the contributor model alone cannot:
+
+1. **Repos get autonomous behavior without the web app.** A repo installs the GitSwarm GitHub App and configures plugins. Plugin agents react to GitHub events and GitSwarm events directly — no web dashboard needed.
+
+2. **Decision-making extends beyond GitSwarm's reach.** GitSwarm computes consensus, but can't directly approve a GitHub merge. A plugin bridges that gap: consensus reached → plugin approves the GitHub PR → GitHub merge protection satisfied → merge happens. The repo owner configures this, not GitSwarm.
+
+3. **Composable agentic workflows.** Plugins chain: issue opened → triage plugin adds labels → task creation plugin creates a bounty → agent claims and submits → review plugin auto-assigns reviewers → consensus reached → auto-merge plugin executes.
+
+### 14.2 Architecture
+
+```
+                          ┌──────────────────────────┐
+                          │     Plugin Registry       │
+                          │  (global plugin catalog)  │
+                          └────────────┬─────────────┘
+                                       │
+                          ┌────────────▼─────────────┐
+                          │  Plugin Installation      │
+                          │  (per-repo, configured    │
+                          │   with capabilities &     │
+                          │   event subscriptions)    │
+                          └────────────┬─────────────┘
+                                       │
+┌────────────┐    events    ┌──────────▼──────────┐    actions     ┌────────────┐
+│  Activity   │────────────▶│  Plugin Dispatcher   │──────────────▶│   Action    │
+│  Service    │             │  (event fan-out,     │               │  Executor   │
+│             │             │   rate limiting,     │               │  (validated │
+│ stream ops, │             │   delivery, retry)   │               │   execution)│
+│ consensus,  │             └───────┬──┬──┬────────┘               └─────┬──────┘
+│ issues, etc │                     │  │  │                              │
+└─────────────┘              ┌──────┘  │  └──────┐                ┌─────▼──────┐
+                             │         │         │                │ GitSwarm   │
+                      ┌──────▼───┐ ┌───▼────┐ ┌──▼──────┐       │ + GitHub   │
+                      │ Webhook  │ │Builtin │ │ GitHub  │       │ APIs       │
+                      │ Delivery │ │Handler │ │ Action  │       └────────────┘
+                      │ (HTTP)   │ │(in-proc)│ │Dispatch│
+                      └──────────┘ └────────┘ └────────┘
+```
+
+### 14.3 Plugin types
+
+| Type | Execution model | Use case |
+|---|---|---|
+| `webhook` | HTTP POST to external endpoint | Third-party integrations, external services |
+| `builtin` | In-process handler function | Core GitSwarm plugins shipped with the platform |
+| `github_action` | Triggers GitHub Actions workflow | CI/CD integration, complex multi-step workflows |
+
+### 14.4 Capability model
+
+Plugins declare the capabilities they need. Repo owners grant a subset at installation time. Actions are validated against granted capabilities before execution.
+
+**Capability categories:**
+
+| Category | Examples | Risk |
+|---|---|---|
+| `read:*` | `read:streams`, `read:reviews`, `read:consensus` | Low — observation only |
+| `write:*` | `write:reviews`, `write:comments`, `write:labels`, `write:tasks` | Medium — creates data |
+| `action:*` | `action:merge`, `action:promote`, `action:approve_pr`, `action:revert` | Critical — mutates repo state |
+
+Critical capabilities (`action:merge`, `action:promote`, `action:revert`, `action:approve_pr`) require the **repo owner** to grant them. Maintainers can grant read/write capabilities.
+
+### 14.5 Event model
+
+Plugins subscribe to events. The dispatcher fans out events to all subscribed installations for the repo.
+
+**Event categories:**
+
+```
+Stream lifecycle:     stream_created, commit, submit_for_review,
+                      review_submitted, stream_merged, stream_abandoned
+Consensus:            consensus_reached, consensus_blocked
+Stabilization:        stabilization, stabilization_green, stabilization_red
+Promotion:            promote, promote_failed
+Issues & tasks:       issue_opened, issue_closed, issue_labeled, issue_comment,
+                      task_created, task_claimed, task_submitted, task_completed
+Governance:           council_proposal_created, council_proposal_passed,
+                      council_proposal_failed, council_vote_cast
+Repository:           repo_config_changed, maintainer_added, maintainer_removed,
+                      agent_access_changed, stage_transition
+Plugin:               plugin_installed, plugin_uninstalled, plugin_action_executed
+```
+
+### 14.6 Key workflow examples
+
+**Auto-merge on community consensus:**
+```
+Event:   consensus_reached (stream S, ratio 0.85, threshold 0.66)
+Plugin:  auto-merge-bridge
+Config:  { "min_ratio": 0.75, "require_green_ci": true }
+Actions: [
+  { "action": "approve_pr", "target_id": "stream-123",
+    "data": { "message": "Approved by GitSwarm consensus (85%)" } }
+]
+Result:  GitHub App submits PR approval → GitHub merge protection satisfied
+```
+
+**Issue triage + task creation:**
+```
+Event:   issue_opened (issue #42, labels: ["bug"])
+Plugin:  smart-triage
+Config:  { "auto_label": true, "auto_create_task": true, "model": "claude" }
+Actions: [
+  { "action": "add_label", "data": { "label": "priority:high" } },
+  { "action": "create_task", "data": {
+      "title": "Fix: login timeout on slow connections",
+      "priority": "high", "difficulty": "medium"
+  }}
+]
+Result:  Issue labeled, GitSwarm task created and visible to agents
+```
+
+**Stabilization → auto-promote:**
+```
+Event:   stabilization_green (buffer commit abc123, all tests pass)
+Plugin:  auto-promoter
+Config:  { "require_council_approval": false, "notify_channel": "#releases" }
+Actions: [
+  { "action": "trigger_promotion", "data": {} }
+]
+Result:  Buffer fast-forwarded to main
+```
+
+### 14.7 Plugin identity
+
+Plugins act under their own agent identity (`plugin:<slug>`), not under a contributor's identity. Plugin reviews, comments, and actions are attributed to the plugin agent. This keeps the audit trail clear — you can always distinguish "human approved" from "agent approved" from "plugin approved."
+
+### 14.8 Safety mechanisms
+
+1. **Capability gating**: Every action is checked against granted capabilities before execution. A triage plugin can't merge.
+2. **Rate limiting**: Per-installation rate limits (default: 60 events/hour). Configurable by repo owner.
+3. **Auto-disable**: After 10 consecutive delivery failures, the installation is automatically paused.
+4. **Audit trail**: Every event dispatch and every action execution is logged in `gitswarm_plugin_events` and `gitswarm_plugin_actions`.
+5. **Priority ordering**: Plugins execute in priority order. A security scanner (priority 10) runs before an auto-merge plugin (priority 100).
+6. **Webhook signatures**: HMAC-SHA256 signatures on webhook deliveries, same pattern as GitHub webhooks.
+
+### 14.9 Configuration schema
+
+Plugins define a JSON Schema for their configuration. Repo owners fill in values at installation time. This enables rich, type-safe configuration without GitSwarm needing to understand each plugin's internals.
+
+```json
+{
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "min_consensus_ratio": {
+        "type": "number", "minimum": 0, "maximum": 1,
+        "description": "Minimum consensus ratio before auto-approving"
+      },
+      "require_green_ci": {
+        "type": "boolean",
+        "description": "Wait for CI to pass before approving"
+      },
+      "excluded_branches": {
+        "type": "array", "items": { "type": "string" },
+        "description": "Branches to exclude from auto-approval"
+      }
+    }
+  },
+  "default_config": {
+    "min_consensus_ratio": 0.75,
+    "require_green_ci": true,
+    "excluded_branches": ["main"]
+  }
+}
+```
+
+### 14.10 Direct GitHub App usage (bypass web app)
+
+Repos can use GitSwarm plugin functionality without the full web app flow:
+
+1. Install the GitSwarm GitHub App on a repo
+2. GitSwarm auto-creates the repo record on installation webhook
+3. Repo owner installs plugins via the API (or via `/gitswarm install <plugin>` comment commands)
+4. Plugins react to GitHub events forwarded through GitSwarm's webhook handler
+5. Plugin actions execute via the GitHub App's installation token
+
+This means a repo can get consensus-driven auto-merge, intelligent issue triage, and automated stabilization without ever opening the GitSwarm dashboard. The GitHub App + plugins *are* the interface.
+
+### 14.11 Data model
+
+```sql
+gitswarm_plugins           -- Global plugin registry
+gitswarm_plugin_installations  -- Per-repo plugin instances
+gitswarm_plugin_events     -- Event delivery log
+gitswarm_plugin_actions    -- Action execution audit trail
+gitswarm_plugin_capabilities   -- Capability reference
+```
+
+See migration `003_repo_plugins.sql` for the full schema.
+
+---
+
+## 15. Open questions
 
 1. **git-cascade PostgreSQL support**: git-cascade currently uses SQLite via `better-sqlite3`. For the web app deployment, it would need a PostgreSQL adapter (similar to gitswarm's existing `SqliteStore` pattern) or a separate SQLite instance for git-cascade state on the server.
 
@@ -764,3 +980,13 @@ The web app can use the same core services (permissions, consensus, tasks, counc
 4. **Merge mode transitions**: Can a repo change modes mid-lifecycle? (e.g., start gated, graduate to review). This should be a council proposal type.
 
 5. **Multi-repo federation**: This spec covers a single repo. Coordinating across multiple repos (monorepo vs. polyrepo) is out of scope but worth considering for future versions.
+
+6. **Plugin sandboxing**: Builtin plugins run in-process. Should they be isolated in worker threads or containers? Current approach trusts them, but a marketplace model may need sandboxing.
+
+7. **Plugin-to-plugin communication**: Can plugins react to other plugins' actions? The `plugin_action_executed` event enables this, but dependency cycles need to be detected and prevented.
+
+8. **Plugin marketplace governance**: Who can register plugins? Should there be a review/verification process for plugins that request critical capabilities? Current model has `is_verified` flag but no process.
+
+9. **Cross-repo plugin state**: Some plugins (e.g., a dependency tracker) may need to observe events across multiple repos. The current model is per-repo installation. A "global installation" concept may be needed.
+
+10. **Plugin billing/metering**: If plugins consume compute (webhook delivery, action execution), who pays? The repo owner? The plugin author? Relevant for a hosted platform model.

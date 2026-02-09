@@ -22,9 +22,10 @@ const STREAM_EVENTS = new Set([
 ]);
 
 class ActivityService {
-  constructor(db, wsService) {
+  constructor(db, wsService, pluginDispatcher) {
     this.db = db;
     this.wsService = wsService;
+    this.pluginDispatcher = pluginDispatcher;
   }
 
   /**
@@ -48,6 +49,19 @@ class ActivityService {
         INSERT INTO activity_log (agent_id, event_type, target_type, target_id, metadata)
         VALUES ($1, $2, $3, $4, $5)
       `, [agent_id, event_type, target_type, target_id, JSON.stringify(metadata)]);
+    }
+
+    // Dispatch to repo-level plugin agents
+    if (this.pluginDispatcher && metadata.repo_id) {
+      // Fire-and-forget: plugin dispatch is async and non-blocking
+      this.pluginDispatcher.dispatch(metadata.repo_id, event_type, {
+        agent_id,
+        target_type,
+        target_id,
+        ...metadata,
+      }).catch(err => {
+        console.error('Plugin dispatch error:', err.message);
+      });
     }
 
     // Broadcast via WebSocket
