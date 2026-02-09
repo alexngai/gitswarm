@@ -206,7 +206,7 @@ async function processPullRequestAction(action, pull_request, patch) {
   }
 }
 
-// Handle PRs created externally on GitSwarm repos
+// Handle PRs created externally on GitSwarm repos — create stream records
 async function handleExternalPullRequest(payload) {
   const { action, pull_request, repository } = payload;
 
@@ -220,18 +220,60 @@ async function handleExternalPullRequest(payload) {
 
   const repo = repoResult.rows[0];
 
-  if (action === 'opened' || action === 'synchronize') {
-    // Track as an externally created PR
-    console.log(`External PR #${pull_request.number} on GitSwarm repo ${repo.github_full_name}`);
+  // Map the author
+  const mapping = await ensureGitHubUserMapping(pull_request.user);
+  const agentId = mapping?.agent_id || null;
 
-    // Map the author
-    const mapping = await ensureGitHubUserMapping(pull_request.user);
+  if (action === 'opened') {
+    // Create a stream record for this PR
+    const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
+    await query(`
+      INSERT INTO gitswarm_streams (
+        id, repo_id, agent_id, name, branch, source,
+        github_pr_number, github_pr_url, base_branch
+      ) VALUES ($1, $2, $3, $4, $5, 'github_pr', $6, $7, $8)
+      ON CONFLICT (id) DO UPDATE SET
+        agent_id = COALESCE(EXCLUDED.agent_id, gitswarm_streams.agent_id),
+        updated_at = NOW()
+    `, [
+      streamId, repo.id, agentId,
+      pull_request.title,
+      pull_request.head.ref,
+      pull_request.number,
+      pull_request.html_url,
+      pull_request.base.ref,
+    ]);
 
-    // If the GitHub user is mapped to a BotHub agent, we could create a patch
-    // For now, just log it
-    if (mapping && mapping.agent_id) {
-      console.log(`PR author ${pull_request.user.login} is mapped to agent ${mapping.agent_id}`);
+    console.log(`Stream ${streamId} created for PR #${pull_request.number} on ${repo.github_full_name}`);
+  } else if (action === 'closed') {
+    const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
+    const newStatus = pull_request.merged ? 'merged' : 'abandoned';
+
+    await query(`
+      UPDATE gitswarm_streams SET status = $1, updated_at = NOW()
+      WHERE id = $2
+    `, [newStatus, streamId]);
+
+    if (pull_request.merged && agentId) {
+      // Record merge
+      await query(`
+        INSERT INTO gitswarm_merges (repo_id, stream_id, agent_id, merge_commit, target_branch)
+        VALUES ($1, $2, $3, $4, $5)
+      `, [repo.id, streamId, agentId, pull_request.merge_commit_sha, pull_request.base.ref]);
+
+      // Award karma
+      await query(`UPDATE agents SET karma = karma + 25 WHERE id = $1`, [agentId]);
     }
+  } else if (action === 'synchronize') {
+    // New commits pushed — record them
+    const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
+    const headSha = pull_request.head.sha;
+
+    await query(`
+      INSERT INTO gitswarm_stream_commits (stream_id, agent_id, commit_hash, message)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT DO NOTHING
+    `, [streamId, agentId, headSha, `Push to PR #${pull_request.number}`]);
   }
 }
 
@@ -289,7 +331,7 @@ async function handlePullRequestReviewEvent(payload) {
 
   // Check if the reviewer is mapped to a BotHub agent
   if (reviewerMapping && reviewerMapping.agent_id) {
-    // Agent review - insert/update normally
+    // Agent review - insert/update normally (legacy patch_reviews)
     await query(`
       INSERT INTO patch_reviews (patch_id, reviewer_id, verdict, feedback, is_human)
       VALUES ($1, $2, $3, $4, false)
@@ -299,11 +341,34 @@ async function handlePullRequestReviewEvent(payload) {
         reviewed_at = NOW()
     `, [patch.id, reviewerMapping.agent_id, verdict, review.body]);
 
+    // Also insert into gitswarm_stream_reviews if there's a linked stream
+    const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
+    await query(`
+      INSERT INTO gitswarm_stream_reviews (stream_id, reviewer_id, verdict, feedback, is_human)
+      VALUES ($1, $2, $3, $4, false)
+      ON CONFLICT (stream_id, reviewer_id) DO UPDATE SET
+        verdict = $3, feedback = $4, reviewed_at = NOW()
+    `, [streamId, reviewerMapping.agent_id, verdict, review.body]).catch(() => {
+      // Stream may not exist yet — ignore
+    });
+
     // Update reviewer stats
     await updateReviewerStats(reviewerMapping.agent_id, verdict);
   } else {
     // Human review from GitHub - store differently
     await storeHumanReview(patch.id, review, reviewerMapping);
+
+    // Also record in stream reviews if there's a linked stream
+    const humanId = await getHumanReviewerPlaceholder(review.user);
+    if (humanId) {
+      const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
+      await query(`
+        INSERT INTO gitswarm_stream_reviews (stream_id, reviewer_id, verdict, feedback, is_human)
+        VALUES ($1, $2, $3, $4, true)
+        ON CONFLICT (stream_id, reviewer_id) DO UPDATE SET
+          verdict = $3, feedback = $4, reviewed_at = NOW()
+      `, [streamId, humanId, verdict, review.body]).catch(() => {});
+    }
   }
 
   console.log(`Review synced: ${review.user.login} ${verdict} on patch ${patch.id}`);
@@ -603,32 +668,48 @@ async function syncGitSwarmRepository(orgId, githubRepo) {
   }
 }
 
-// Handle push events (for tracking commits)
+// Handle push events (for tracking commits on streams and patches)
 async function handlePushEvent(payload) {
   const { ref, commits, repository } = payload;
 
-  // We mainly care about pushes to branches that correspond to patches
   const branchName = ref.replace('refs/heads/', '');
 
-  if (!branchName.startsWith('bothub/patch-')) {
+  // Check if this push corresponds to a stream branch
+  const streamResult = await query(`
+    SELECT s.id, s.agent_id FROM gitswarm_streams s
+    JOIN gitswarm_repos r ON s.repo_id = r.id
+    WHERE r.github_repo_id = $1 AND s.branch = $2 AND s.status = 'active'
+  `, [repository.id, branchName]);
+
+  if (streamResult.rows.length > 0) {
+    const stream = streamResult.rows[0];
+    // Record each new commit on the stream
+    if (commits) {
+      for (const commit of commits) {
+        await query(`
+          INSERT INTO gitswarm_stream_commits (stream_id, agent_id, commit_hash, message)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT DO NOTHING
+        `, [stream.id, stream.agent_id, commit.id, commit.message]);
+      }
+    }
     return;
   }
 
-  // Find the patch
-  const patchResult = await query(
-    `SELECT id FROM patches WHERE github_branch = $1`,
-    [branchName]
-  );
+  // Legacy: check for old-style patch branches
+  if (branchName.startsWith('bothub/patch-')) {
+    const patchResult = await query(
+      `SELECT id FROM patches WHERE github_branch = $1`,
+      [branchName]
+    );
 
-  if (patchResult.rows.length === 0) {
-    return;
+    if (patchResult.rows.length > 0) {
+      await query(
+        `UPDATE patches SET updated_at = NOW() WHERE id = $1`,
+        [patchResult.rows[0].id]
+      );
+    }
   }
-
-  // Update the patch's updated_at timestamp
-  await query(
-    `UPDATE patches SET updated_at = NOW() WHERE id = $1`,
-    [patchResult.rows[0].id]
-  );
 }
 
 // ============================================================
@@ -692,31 +773,29 @@ async function handleIssuesEvent(payload) {
   }
 }
 
-// Handle issue closed for bounty completion
+// Handle issue closed for task/bounty completion
 async function handleIssueClosedForBounty(repoId, issue) {
-  // Check if there's a bounty for this issue
-  const bountyResult = await query(`
-    SELECT id, status FROM gitswarm_bounties
+  // Check if there's a task for this issue
+  const taskResult = await query(`
+    SELECT id, status FROM gitswarm_tasks
     WHERE repo_id = $1 AND github_issue_number = $2
   `, [repoId, issue.number]);
 
-  if (bountyResult.rows.length === 0) {
-    return; // No bounty for this issue
+  if (taskResult.rows.length === 0) {
+    return; // No task for this issue
   }
 
-  const bounty = bountyResult.rows[0];
+  const task = taskResult.rows[0];
 
-  // If bounty is open or claimed, update status
-  if (['open', 'claimed', 'in_progress'].includes(bounty.status)) {
-    // Check if closed via a PR (indicating work was completed)
+  // If task is open or claimed, update status
+  if (['open', 'claimed'].includes(task.status)) {
     if (issue.state_reason === 'completed' || issue.state_reason === 'not_planned') {
-      // Mark bounty as awaiting review
       await query(`
-        UPDATE gitswarm_bounties SET status = 'submitted'
-        WHERE id = $1 AND status IN ('open', 'claimed', 'in_progress')
-      `, [bounty.id]);
+        UPDATE gitswarm_tasks SET status = 'submitted', updated_at = NOW()
+        WHERE id = $1 AND status IN ('open', 'claimed')
+      `, [task.id]);
 
-      console.log(`Bounty ${bounty.id} moved to submitted state after issue #${issue.number} closed`);
+      console.log(`Task ${task.id} moved to submitted state after issue #${issue.number} closed`);
     }
   }
 }
@@ -793,13 +872,13 @@ async function handleGitSwarmCommand(repoId, issue, comment, command, args) {
   }
 }
 
-// Handle /bounty commands in issue comments
+// Handle /bounty commands in issue comments (now using gitswarm_tasks)
 async function handleBountyCommand(repoId, issue, comment, command, args) {
   console.log(`Bounty command in issue #${issue.number}: /${command} ${args || ''}`);
 
-  // Check if there's a bounty for this issue
-  const bountyResult = await query(`
-    SELECT id, status, amount FROM gitswarm_bounties
+  // Check if there's a task for this issue
+  const taskResult = await query(`
+    SELECT id, status, amount FROM gitswarm_tasks
     WHERE repo_id = $1 AND github_issue_number = $2
   `, [repoId, issue.number]);
 
@@ -812,53 +891,51 @@ async function handleBountyCommand(repoId, issue, comment, command, args) {
 
   switch (command.toLowerCase()) {
     case 'claim':
-      if (bountyResult.rows.length === 0) {
-        console.log(`No bounty exists for issue #${issue.number}`);
+      if (taskResult.rows.length === 0) {
+        console.log(`No task exists for issue #${issue.number}`);
         return;
       }
       if (!agentId) {
         console.log(`User ${comment.user.login} not mapped to an agent`);
         return;
       }
-      // Process claim
-      console.log(`Agent ${agentId} claiming bounty for issue #${issue.number}`);
+      console.log(`Agent ${agentId} claiming task for issue #${issue.number}`);
       try {
         await query(`
-          INSERT INTO gitswarm_bounty_claims (bounty_id, agent_id)
+          INSERT INTO gitswarm_task_claims (task_id, agent_id)
           VALUES ($1, $2)
-          ON CONFLICT (bounty_id, agent_id) DO NOTHING
-        `, [bountyResult.rows[0].id, agentId]);
+          ON CONFLICT (task_id, agent_id) DO NOTHING
+        `, [taskResult.rows[0].id, agentId]);
 
         await query(`
-          UPDATE gitswarm_bounties SET status = 'claimed'
+          UPDATE gitswarm_tasks SET status = 'claimed', updated_at = NOW()
           WHERE id = $1 AND status = 'open'
-        `, [bountyResult.rows[0].id]);
+        `, [taskResult.rows[0].id]);
       } catch (error) {
-        console.error('Failed to claim bounty:', error.message);
+        console.error('Failed to claim task:', error.message);
       }
       break;
 
     case 'abandon':
-      if (bountyResult.rows.length === 0 || !agentId) {
+      if (taskResult.rows.length === 0 || !agentId) {
         return;
       }
-      // Process abandon
-      console.log(`Agent ${agentId} abandoning bounty for issue #${issue.number}`);
+      console.log(`Agent ${agentId} abandoning task for issue #${issue.number}`);
       try {
         await query(`
-          UPDATE gitswarm_bounty_claims SET status = 'abandoned'
-          WHERE bounty_id = $1 AND agent_id = $2 AND status = 'active'
-        `, [bountyResult.rows[0].id, agentId]);
+          UPDATE gitswarm_task_claims SET status = 'abandoned'
+          WHERE task_id = $1 AND agent_id = $2 AND status = 'active'
+        `, [taskResult.rows[0].id, agentId]);
       } catch (error) {
-        console.error('Failed to abandon bounty:', error.message);
+        console.error('Failed to abandon task:', error.message);
       }
       break;
 
     case 'status':
-      if (bountyResult.rows.length === 0) {
-        console.log(`No bounty exists for issue #${issue.number}`);
+      if (taskResult.rows.length === 0) {
+        console.log(`No task exists for issue #${issue.number}`);
       } else {
-        console.log(`Bounty for issue #${issue.number}: ${bountyResult.rows[0].amount} credits, status: ${bountyResult.rows[0].status}`);
+        console.log(`Task for issue #${issue.number}: ${taskResult.rows[0].amount} credits, status: ${taskResult.rows[0].status}`);
       }
       break;
 

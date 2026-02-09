@@ -332,7 +332,7 @@ export async function bountyRoutes(app, options = {}) {
   });
 
   /**
-   * Submit work for a claim
+   * Submit work for a claim (supports stream_id linkage)
    */
   app.post('/gitswarm/repos/:repoId/bounties/:bountyId/claims/:claimId/submit', {
     preHandler: [authenticate, rateLimitWrite],
@@ -340,8 +340,7 @@ export async function bountyRoutes(app, options = {}) {
       body: {
         type: 'object',
         properties: {
-          patch_id: { type: 'string', format: 'uuid' },
-          pr_url: { type: 'string', maxLength: 500 },
+          stream_id: { type: 'string' },
           notes: { type: 'string', maxLength: 2000 }
         }
       }
@@ -451,5 +450,223 @@ export async function bountyRoutes(app, options = {}) {
     const { status } = request.query;
     const claims = await bountyService.getAgentClaims(request.agent.id, status);
     return { claims };
+  });
+
+  // ============================================================
+  // Task Routes (unified: task = bounty with optional budget)
+  // ============================================================
+
+  /**
+   * List tasks for a repository
+   */
+  app.get('/gitswarm/repos/:repoId/tasks', {
+    preHandler: [authenticate, rateLimit],
+  }, async (request) => {
+    const { repoId } = request.params;
+    const { status, limit, offset } = request.query;
+    const tasks = await bountyService.listTasks(repoId, {
+      status,
+      limit: parseInt(limit) || 50,
+      offset: parseInt(offset) || 0,
+    });
+    return { tasks };
+  });
+
+  /**
+   * Create a task
+   */
+  app.post('/gitswarm/repos/:repoId/tasks', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['title'],
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 500 },
+          description: { type: 'string', maxLength: 5000 },
+          priority: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+          amount: { type: 'integer', minimum: 0 },
+          labels: { type: 'array', items: { type: 'string' } },
+          difficulty: { type: 'string', enum: ['beginner', 'intermediate', 'advanced', 'expert'] },
+          expires_in_days: { type: 'integer', minimum: 1, maximum: 365 },
+          github_issue_number: { type: 'integer' },
+          github_issue_url: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { repoId } = request.params;
+    const canWrite = await permissionService.canPerform(request.agent.id, repoId, 'write');
+    if (!canWrite.allowed) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    try {
+      const task = await bountyService.createTask(repoId, request.body, request.agent.id);
+      if (activityService) {
+        activityService.logActivity({
+          agent_id: request.agent.id,
+          event_type: 'task_created',
+          target_type: 'task',
+          target_id: task.id,
+          metadata: { repo_id: repoId, title: task.title, amount: task.amount },
+        }).catch(() => {});
+      }
+      return reply.status(201).send({ task });
+    } catch (error) {
+      return reply.status(400).send({ error: 'Bad Request', message: error.message });
+    }
+  });
+
+  /**
+   * Get task details
+   */
+  app.get('/gitswarm/repos/:repoId/tasks/:taskId', {
+    preHandler: [authenticate, rateLimit],
+  }, async (request, reply) => {
+    const task = await bountyService.getTask(request.params.taskId);
+    if (!task) return reply.status(404).send({ error: 'Task not found' });
+    const claims = await bountyService.listClaims(request.params.taskId);
+    return { task, claims };
+  });
+
+  /**
+   * Cancel a task
+   */
+  app.delete('/gitswarm/repos/:repoId/tasks/:taskId', {
+    preHandler: [authenticate, rateLimitWrite],
+  }, async (request, reply) => {
+    const { repoId, taskId } = request.params;
+    const { reason } = request.body || {};
+
+    const task = await bountyService.getTask(taskId);
+    if (!task) return reply.status(404).send({ error: 'Task not found' });
+
+    const isOwner = await permissionService.isOwner(request.agent.id, repoId);
+    if (!isOwner && task.created_by !== request.agent.id) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    try {
+      await bountyService.cancelTask(taskId, request.agent.id, reason);
+      return { success: true };
+    } catch (error) {
+      return reply.status(400).send({ error: 'Bad Request', message: error.message });
+    }
+  });
+
+  /**
+   * Claim a task (optionally with stream_id)
+   */
+  app.post('/gitswarm/repos/:repoId/tasks/:taskId/claim', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          stream_id: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { taskId } = request.params;
+    const { stream_id } = request.body || {};
+
+    try {
+      const claim = await bountyService.claimTask(taskId, request.agent.id, stream_id);
+      return reply.status(201).send({ claim });
+    } catch (error) {
+      return reply.status(400).send({ error: 'Bad Request', message: error.message });
+    }
+  });
+
+  /**
+   * Submit work on a task claim (with stream linkage)
+   */
+  app.post('/gitswarm/repos/:repoId/tasks/:taskId/claims/:claimId/submit', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          stream_id: { type: 'string' },
+          notes: { type: 'string', maxLength: 2000 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { claimId } = request.params;
+    try {
+      const claim = await bountyService.submitClaim(claimId, request.agent.id, request.body);
+      return { claim };
+    } catch (error) {
+      return reply.status(400).send({ error: 'Bad Request', message: error.message });
+    }
+  });
+
+  /**
+   * Review a task claim
+   */
+  app.post('/gitswarm/repos/:repoId/tasks/:taskId/claims/:claimId/review', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['decision'],
+        properties: {
+          decision: { type: 'string', enum: ['approve', 'reject'] },
+          notes: { type: 'string', maxLength: 2000 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { repoId, claimId } = request.params;
+    const { decision, notes } = request.body;
+
+    const isMaintainer = await permissionService.canPerform(request.agent.id, repoId, 'merge');
+    if (!isMaintainer.allowed) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    try {
+      return await bountyService.reviewClaim(claimId, request.agent.id, decision, notes);
+    } catch (error) {
+      return reply.status(400).send({ error: 'Bad Request', message: error.message });
+    }
+  });
+
+  /**
+   * Get claim linked to a stream
+   */
+  app.get('/gitswarm/streams/:streamId/claim', {
+    preHandler: [authenticate, rateLimit],
+  }, async (request) => {
+    const claim = await bountyService.getClaimByStream(request.params.streamId);
+    return { claim };
+  });
+
+  /**
+   * Link a claim to a stream
+   */
+  app.post('/gitswarm/claims/:claimId/link-stream', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['stream_id'],
+        properties: {
+          stream_id: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { claimId } = request.params;
+    const { stream_id } = request.body;
+    try {
+      await bountyService.linkClaimToStream(claimId, stream_id);
+      return { success: true };
+    } catch (error) {
+      return reply.status(400).send({ error: 'Bad Request', message: error.message });
+    }
   });
 }

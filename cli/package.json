@@ -1,0 +1,34 @@
+{
+  "name": "gitswarm-cli",
+  "version": "0.1.0",
+  "description": "Standalone CLI for local multi-agent federation coordination",
+  "type": "module",
+  "bin": {
+    "gitswarm": "./bin/gitswarm.js"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./core/*": "./src/core/*.js",
+    "./store": "./src/store/sqlite.js"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "gitswarm",
+    "federation",
+    "multi-agent",
+    "coordination",
+    "consensus"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "git-cascade": "file:/tmp/git-cascade"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.1"
+  }
+}
