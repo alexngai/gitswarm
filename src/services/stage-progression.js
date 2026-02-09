@@ -277,24 +277,22 @@ export class StageProgressionService {
   }
 
   /**
-   * Update repository metrics (contributor and patch counts)
-   * Called after patches are merged or contributors are added
+   * Update repository metrics (contributor and merged stream counts)
+   * Called after streams are merged or contributors are added
    */
   async updateRepoMetrics(repoId) {
-    // Count unique contributors (authors of merged patches)
+    // Count unique contributors (agents with merged streams)
     const contributors = await this.query(`
-      SELECT COUNT(DISTINCT p.author_id) as count
-      FROM patches p
-      JOIN gitswarm_patches gp ON gp.patch_id = p.id
-      WHERE gp.repo_id = $1 AND p.status = 'merged'
+      SELECT COUNT(DISTINCT s.agent_id) as count
+      FROM gitswarm_streams s
+      WHERE s.repo_id = $1 AND s.status = 'merged'
     `, [repoId]);
 
-    // Count merged patches
-    const patches = await this.query(`
+    // Count merged streams
+    const streams = await this.query(`
       SELECT COUNT(*) as count
-      FROM patches p
-      JOIN gitswarm_patches gp ON gp.patch_id = p.id
-      WHERE gp.repo_id = $1 AND p.status = 'merged'
+      FROM gitswarm_streams s
+      WHERE s.repo_id = $1 AND s.status = 'merged'
     `, [repoId]);
 
     // Update repo
@@ -306,13 +304,13 @@ export class StageProgressionService {
       WHERE id = $3
     `, [
       parseInt(contributors.rows[0].count),
-      parseInt(patches.rows[0].count),
+      parseInt(streams.rows[0].count),
       repoId
     ]);
 
     return {
       contributor_count: parseInt(contributors.rows[0].count),
-      patch_count: parseInt(patches.rows[0].count)
+      patch_count: parseInt(streams.rows[0].count)
     };
   }
 

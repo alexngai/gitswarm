@@ -7,6 +7,7 @@ import { installRoutes } from './install.js';
 import { packageRoutes } from './packages.js';
 import { councilRoutes } from './council.js';
 import { bountyRoutes } from './bounties.js';
+import { streamRoutes } from './streams.js';
 
 const permissionService = new GitSwarmPermissionService();
 
@@ -19,6 +20,7 @@ export async function gitswarmRoutes(app, options = {}) {
   await app.register(packageRoutes, { activityService });
   await app.register(councilRoutes, { activityService });
   await app.register(bountyRoutes, { activityService });
+  await app.register(streamRoutes, { activityService });
 
   // Different rate limits for different operation types
   const rateLimitRead = createRateLimiter('gitswarm_read');

@@ -181,15 +181,15 @@ export class GitSwarmPermissionService {
   }
 
   /**
-   * Check if consensus is reached for merging a patch
-   * @param {string} patchId - Patch UUID
+   * Check if consensus is reached for merging a stream
+   * @param {string} streamId - Stream ID (git-cascade stream)
    * @param {string} repoId - Repository UUID
    * @returns {Promise<{reached: boolean, reason: string, ...}>}
    */
-  async checkConsensus(patchId, repoId) {
+  async checkConsensus(streamId, repoId) {
     // Get repo consensus settings
     const repo = await this.query(`
-      SELECT consensus_threshold, min_reviews, ownership_model, human_review_weight
+      SELECT consensus_threshold, min_reviews, ownership_model, merge_mode, human_review_weight
       FROM gitswarm_repos WHERE id = $1
     `, [repoId]);
 
@@ -197,21 +197,26 @@ export class GitSwarmPermissionService {
       return { reached: false, reason: 'repo_not_found' };
     }
 
-    const { consensus_threshold, min_reviews, ownership_model, human_review_weight } = repo.rows[0];
+    const { consensus_threshold, min_reviews, ownership_model, merge_mode, human_review_weight } = repo.rows[0];
 
-    // Get patch reviews
+    // In swarm mode, consensus is automatic
+    if (merge_mode === 'swarm') {
+      return { reached: true, reason: 'swarm_mode' };
+    }
+
+    // Get stream reviews
     const reviews = await this.query(`
       SELECT
-        pr.verdict,
-        pr.tested,
-        pr.is_human,
+        sr.verdict,
+        sr.tested,
+        sr.is_human,
         a.karma,
         CASE WHEN m.agent_id IS NOT NULL THEN true ELSE false END as is_maintainer
-      FROM patch_reviews pr
-      LEFT JOIN agents a ON pr.reviewer_id = a.id
-      LEFT JOIN gitswarm_maintainers m ON m.repo_id = $2 AND m.agent_id = pr.reviewer_id
-      WHERE pr.patch_id = $1
-    `, [patchId, repoId]);
+      FROM gitswarm_stream_reviews sr
+      LEFT JOIN agents a ON sr.reviewer_id = a.id
+      LEFT JOIN gitswarm_maintainers m ON m.repo_id = $2 AND m.agent_id = sr.reviewer_id
+      WHERE sr.stream_id = $1
+    `, [streamId, repoId]);
 
     const approvals = reviews.rows.filter(r => r.verdict === 'approve');
     const rejections = reviews.rows.filter(r => r.verdict === 'reject' || r.verdict === 'request_changes');

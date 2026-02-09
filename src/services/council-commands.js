@@ -112,11 +112,10 @@ export class CouncilCommandsService {
       };
     }
 
-    // Check contributions to this repo
+    // Check contributions to this repo (merged streams)
     const contributions = await this.query(`
-      SELECT COUNT(*) as count FROM patches p
-      JOIN gitswarm_patches gp ON gp.patch_id = p.id
-      WHERE gp.repo_id = $1 AND p.author_id = $2 AND p.status = 'merged'
+      SELECT COUNT(*) as count FROM gitswarm_streams s
+      WHERE s.repo_id = $1 AND s.agent_id = $2 AND s.status = 'merged'
     `, [repoId, agentId]);
 
     const contributionCount = parseInt(contributions.rows[0].count);
@@ -244,7 +243,7 @@ export class CouncilCommandsService {
     }
 
     // Determine quorum based on proposal type
-    const criticalTypes = ['change_ownership', 'change_settings', 'remove_maintainer'];
+    const criticalTypes = ['change_ownership', 'change_settings', 'remove_maintainer', 'revert_stream'];
     const quorum = criticalTypes.includes(proposal_type)
       ? council.rows[0].critical_quorum
       : council.rows[0].standard_quorum;
@@ -456,6 +455,15 @@ export class CouncilCommandsService {
         case 'change_settings':
           result = await this.executeChangeSettings(repoId, action_data);
           break;
+        case 'merge_stream':
+          result = await this.executeMergeStream(repoId, action_data);
+          break;
+        case 'revert_stream':
+          result = await this.executeRevertStream(repoId, action_data);
+          break;
+        case 'promote':
+          result = await this.executePromote(repoId, action_data);
+          break;
         default:
           result = { executed: false, reason: 'unsupported_action_type' };
       }
@@ -520,6 +528,36 @@ export class CouncilCommandsService {
     const { settings } = data;
     // Implementation would update repo settings
     return { executed: true, action: 'change_settings', settings };
+  }
+
+  async executeMergeStream(repoId, data) {
+    const { stream_id } = data;
+    // Mark stream as approved for merge by council
+    await this.query(`
+      UPDATE gitswarm_streams SET review_status = 'approved', updated_at = NOW()
+      WHERE id = $1 AND repo_id = $2
+    `, [stream_id, repoId]);
+    return { executed: true, action: 'merge_stream', stream_id };
+  }
+
+  async executeRevertStream(repoId, data) {
+    const { stream_id } = data;
+    // Mark stream for revert
+    await this.query(`
+      UPDATE gitswarm_streams SET status = 'reverted', updated_at = NOW()
+      WHERE id = $1 AND repo_id = $2
+    `, [stream_id, repoId]);
+    return { executed: true, action: 'revert_stream', stream_id };
+  }
+
+  async executePromote(repoId, data) {
+    // Record that council approved promotion
+    await this.query(`
+      INSERT INTO gitswarm_promotions (repo_id, from_branch, to_branch, triggered_by)
+      SELECT id, buffer_branch, promote_target, 'council'
+      FROM gitswarm_repos WHERE id = $1
+    `, [repoId]);
+    return { executed: true, action: 'promote' };
   }
 
   // ============================================================
@@ -744,13 +782,15 @@ export class CouncilCommandsService {
       return {
         error: 'Usage: /council propose <type> <title> [description]',
         types: ['add_maintainer', 'remove_maintainer', 'modify_branch_rule',
-                'modify_access', 'change_settings', 'custom']
+                'modify_access', 'change_settings', 'merge_stream',
+                'revert_stream', 'promote', 'custom']
       };
     }
 
     const proposalType = args[0];
     const validTypes = ['add_maintainer', 'remove_maintainer', 'modify_branch_rule',
-                        'modify_access', 'change_ownership', 'change_settings', 'custom'];
+                        'modify_access', 'change_ownership', 'change_settings',
+                        'merge_stream', 'revert_stream', 'promote', 'custom'];
 
     if (!validTypes.includes(proposalType)) {
       return {
