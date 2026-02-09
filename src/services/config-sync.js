@@ -122,10 +122,14 @@ export class ConfigSyncService {
       await this._syncPlugins(repoId, pluginsData.plugins);
     }
 
+    // Detect gh-aw workflows (.github/workflows/*.md)
+    const ghawWorkflows = await this._detectGhAwWorkflows(ghRepo, repo.default_branch);
+
     return {
       synced: true,
       plugins_enabled: pluginsEnabled,
       plugins_count: pluginsData?.plugins ? Object.keys(pluginsData.plugins).length : 0,
+      ghaw_workflows: ghawWorkflows.length,
     };
   }
 
@@ -355,6 +359,143 @@ export class ConfigSyncService {
     }
 
     return result;
+  }
+
+  /**
+   * Detect gh-aw workflow files (.md in .github/workflows/) and register
+   * them as plugins. gh-aw workflows are self-contained — they define their
+   * own triggers, permissions, safe-outputs, and AI engine. We register
+   * them in the plugin DB for visibility/tracking but they execute directly
+   * via GitHub Actions (no dispatch from our server needed for native triggers).
+   *
+   * For gitswarm-only triggers (repository_dispatch types), our plugin engine
+   * still dispatches the event.
+   */
+  async _detectGhAwWorkflows(ghRepo, branch) {
+    const workflows = [];
+
+    try {
+      // List .github/workflows/ directory
+      const listing = await ghRepo.request(
+        'GET',
+        `/repos/${ghRepo.owner}/${ghRepo.repo}/contents/.github/workflows?ref=${branch}`
+      );
+
+      if (!Array.isArray(listing)) return workflows;
+
+      // Find .md files that are gh-aw workflows
+      const mdFiles = listing.filter(f => f.name.endsWith('.md') && f.name.startsWith('gitswarm-'));
+
+      for (const file of mdFiles) {
+        try {
+          const content = await ghRepo.getFileContent(`.github/workflows/${file.name}`, branch);
+          if (!content) continue;
+
+          const parsed = this._parseGhAwFrontmatter(content.content);
+          if (!parsed) continue;
+
+          workflows.push({
+            filename: file.name,
+            name: file.name.replace('.md', ''),
+            ...parsed,
+          });
+        } catch (err) {
+          // Skip files that can't be parsed
+          console.log(`Skipping gh-aw file ${file.name}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      // Workflows directory doesn't exist or isn't accessible
+      return workflows;
+    }
+
+    // Register detected gh-aw workflows as plugins (source = 'ghaw')
+    for (const wf of workflows) {
+      const triggerEvent = this._extractGhAwTrigger(wf.on);
+      const tier = wf.engine ? 'ai' : 'automation';
+
+      await this.db.query(`
+        INSERT INTO gitswarm_repo_plugins (
+          repo_id, name, enabled, tier, trigger_event, conditions,
+          actions, safe_outputs, config, execution_model, dispatch_target,
+          priority, source
+        ) VALUES (
+          (SELECT id FROM gitswarm_repos WHERE github_full_name = $1 LIMIT 1),
+          $2, true, $3, $4, '{}', '[]', $5, $6, 'ghaw', $7, 0, 'ghaw'
+        )
+        ON CONFLICT (repo_id, name) DO UPDATE SET
+          tier = $3, trigger_event = $4, safe_outputs = $5,
+          config = $6, execution_model = 'ghaw', dispatch_target = $7,
+          updated_at = NOW()
+      `, [
+        `${ghRepo.owner}/${ghRepo.repo}`,
+        wf.name,
+        tier,
+        triggerEvent,
+        JSON.stringify(wf.safe_outputs || {}),
+        JSON.stringify({
+          engine: wf.engine,
+          description: wf.description,
+          filename: wf.filename,
+          tools: wf.tools,
+          mcp_servers: wf.mcp_servers,
+        }),
+        wf.filename,
+      ]);
+    }
+
+    return workflows;
+  }
+
+  /**
+   * Parse gh-aw frontmatter from a Markdown workflow file.
+   * Returns the frontmatter fields or null if not a valid gh-aw file.
+   */
+  _parseGhAwFrontmatter(content) {
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch) return null;
+
+    const frontmatter = this._parseYaml(fmMatch[1]);
+    if (!frontmatter || !frontmatter.on) return null;
+
+    return {
+      on: frontmatter.on,
+      description: frontmatter.description,
+      engine: frontmatter.engine,
+      tools: frontmatter.tools,
+      permissions: frontmatter.permissions,
+      safe_outputs: frontmatter['safe-outputs'],
+      mcp_servers: frontmatter['mcp-servers'],
+      timeout: frontmatter['timeout-minutes'],
+      network: frontmatter.network,
+    };
+  }
+
+  /**
+   * Extract primary trigger event from gh-aw `on:` config.
+   */
+  _extractGhAwTrigger(on) {
+    if (typeof on === 'string') return on;
+    if (typeof on !== 'object') return 'unknown';
+
+    // Check for repository_dispatch (gitswarm-specific triggers)
+    if (on.repository_dispatch?.types?.[0]) {
+      return on.repository_dispatch.types[0];
+    }
+
+    // Use the first native trigger
+    const triggers = Object.keys(on);
+    if (triggers.length === 0) return 'unknown';
+
+    const first = triggers[0];
+    const config = on[first];
+
+    // Include action type if specified (e.g., issues.opened)
+    if (config?.types?.[0]) {
+      return `${first}.${config.types[0]}`;
+    }
+
+    return first;
   }
 
   async _recordSyncError(repoId, error) {

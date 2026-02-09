@@ -534,23 +534,44 @@ The initial implementation is in place:
 **Templates** (`templates/`):
 - `.gitswarm/config.yml` — Repo configuration template
 - `.gitswarm/plugins.yml` — Plugin configuration template with Tier 1-3 examples
-- `.github/workflows/gitswarm-issue-triage.yml` — Issue triage workflow
-- `.github/workflows/gitswarm-pr-risk.yml` — PR risk assessment workflow
-- `.github/workflows/gitswarm-consensus-merge.yml` — Consensus-based merge workflow
 
-#### Phase 2: AI Plugins (NEXT)
+#### Phase 2: gh-aw Integration (IMPLEMENTED)
 
-- Build AI engine detection (which agents are installed on the repo)
-- Enhance workflow templates with Claude/Codex/Copilot integration
-- Add plugin execution dashboard
-- Support multi-engine fallback (from agentbook pattern)
+Migrated from hand-written YAML workflow templates to [GitHub Agentic Workflows](https://github.com/github/gh-aw) (gh-aw) Markdown format. gh-aw compiles natural-language Markdown into GitHub Actions YAML, with built-in sandboxing, safe outputs, and multi-engine support.
 
-#### Phase 3: Governance Delegation
+**gh-aw Workflow Templates** (`templates/.github/workflows/*.md`):
+- `gitswarm-issue-triage.md` — AI-powered issue classification, labeling, and duplicate detection
+- `gitswarm-pr-risk.md` — PR risk assessment by path, size, and sensitivity
+- `gitswarm-consensus-merge.md` — Merge PRs on gitswarm community consensus
+- `gitswarm-daily-digest.md` — Scheduled daily activity summary
+- `gitswarm-fix-pr.md` — Slash command `/fix` to auto-repair CI failures
+
+**GitSwarm MCP Server** (`src/mcp-server/`):
+- `@gitswarm/mcp-server` npm package exposing gitswarm data via Model Context Protocol
+- Tools: `get_repo_config`, `get_consensus_status`, `get_agent_karma`, `list_active_streams`, `get_stream_status`, `search_issues`, `search_streams`, `get_repo_activity`, `get_stage_info`, `report_execution`
+- gh-aw workflows declare `mcp-servers: gitswarm:` in frontmatter to access these tools
+- Enables AI agents running inside workflows to query gitswarm state directly
+
+**Plugin Engine `ghaw` Execution Model**:
+- Config sync detects `gitswarm-*.md` files in `.github/workflows/` and registers them as plugins
+- Native GitHub triggers (issues, PRs) fire directly — no dispatch from gitswarm server needed
+- GitSwarm-only triggers (consensus, council) still dispatched via `repository_dispatch`
+- Two-layer safe outputs: gh-aw enforces at the Actions level, gitswarm enforces at the server level
+
+**Key advantages over Phase 1 YAML templates:**
+- AI agent does the reasoning (not bash heuristics)
+- Engine-portable: same Markdown prompt works with Claude, Copilot, or Codex
+- gh-aw handles sandboxing, network isolation, and safe output enforcement
+- MCP server gives workflows access to gitswarm data (consensus, karma, streams)
+- Slash command support (`/fix`) not possible with pure repository_dispatch
+
+#### Phase 3: Governance Delegation (NEXT)
 
 - Council proposal auto-execution at repo level
 - Karma-weighted auto-merge for safe paths
 - Cross-repo policy enforcement
 - Standalone mode (no gitswarm server required)
+- `manual-approval:` gates for Tier 3 actions via gh-aw environment protection
 
 #### Phase 4: Ecosystem
 
@@ -558,6 +579,7 @@ The initial implementation is in place:
 - Community plugin submissions and review process
 - Plugin versioning and update mechanism
 - Plugin composition (output of one plugin triggers another)
+- Shared gh-aw workflow library (like githubnext/agentics)
 
 ---
 
@@ -565,11 +587,15 @@ The initial implementation is in place:
 
 1. **Config source of truth**: When `.gitswarm/config.yml` and gitswarm database disagree, which wins? Proposed: repo-side config wins, database is cache. But what about settings only configurable via the web app?
 
-2. **Karma in standalone mode**: Without the gitswarm server, where does karma live? Options: `.gitswarm/state/` in the repo, GitHub Actions artifacts, or a lightweight sidecar service.
+2. **Karma in standalone mode**: Without the gitswarm server, where does karma live? The MCP server currently calls the gitswarm API, which requires a running server. Options for truly standalone: `repo-memory:` in gh-aw, GitHub Actions cache, or a lightweight sidecar.
 
-3. **Plugin trust for Tier 3**: Governance delegation plugins can merge PRs and modify branches. How much trust do we extend to automated governance? Should there always be a human confirmation step for Tier 3 actions?
+3. **Plugin trust for Tier 3**: Governance delegation plugins can merge PRs and modify branches. gh-aw's `manual-approval:` gates (environment protection) provide a natural solution — Tier 3 workflows could require environment approval before executing. Should this be mandatory?
 
 4. **Multi-repo coordination**: If an org has 50 repos all with gitswarm plugins, how do org-wide policies compose with repo-level configs? Proposed: org-level `.gitswarm/` in a dedicated config repo, with repo-level overrides.
+
+5. **gh-aw adoption curve**: gh-aw is a research demonstrator, not a product. Should we maintain a fallback path (compiled YAML) for repos that can't or won't install the `gh` CLI extension? The `.lock.yml` files gh-aw generates are standard Actions YAML, so they could be committed directly.
+
+6. **MCP server distribution**: The `@gitswarm/mcp-server` needs to be published to npm for `npx` to work in workflows. Until then, the server could be vendored as a GitHub Action or referenced via a git URL.
 
 5. **Event ordering**: If multiple plugins trigger on the same event, what's the execution order? Proposed: priority field in plugin config, with built-in plugins executing before community/custom.
 

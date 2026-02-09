@@ -142,6 +142,10 @@ export class PluginEngine {
         result = await this._dispatchToGitHubActions(plugin, trigger, payload, context);
         break;
 
+      case 'ghaw':
+        result = await this._handleGhAwWorkflow(plugin, trigger, payload, context);
+        break;
+
       case 'webhook':
         result = await this._dispatchToWebhook(plugin, trigger, payload, context);
         break;
@@ -383,6 +387,117 @@ export class PluginEngine {
         actionsTaken: [{ action: 'webhook_dispatch', url: webhookUrl, status: response.status }],
       };
     } catch (err) {
+      return { status: 'dispatch_failed', reason: err.message };
+    }
+  }
+
+  /**
+   * Handle a gh-aw workflow plugin.
+   *
+   * gh-aw workflows that listen on native GitHub events (issues.opened,
+   * pull_request.opened) execute directly via GitHub Actions — they don't
+   * need us to dispatch. We just record the execution for tracking.
+   *
+   * gh-aw workflows that listen on repository_dispatch (gitswarm-specific
+   * events like consensus_reached) DO need us to dispatch, since GitHub
+   * won't fire repository_dispatch on its own for these events.
+   */
+  async _handleGhAwWorkflow(plugin, trigger, payload, context) {
+    const isGitSwarmTrigger = trigger.startsWith('gitswarm.');
+    const isDispatchTrigger = trigger.startsWith('gitswarm.plugin.');
+
+    if (!isGitSwarmTrigger) {
+      // Native GitHub event — the gh-aw workflow fires on its own via
+      // GitHub Actions. We just record that it was triggered for audit.
+      return {
+        status: 'ghaw_native',
+        actionsTaken: [{
+          action: 'ghaw_native_trigger',
+          workflow: plugin.dispatch_target,
+          note: 'Workflow triggered directly by GitHub Actions, no dispatch needed',
+        }],
+      };
+    }
+
+    // GitSwarm-specific event — we need to dispatch via repository_dispatch
+    // so the gh-aw workflow's `repository_dispatch` trigger fires.
+    // This reuses the standard dispatch path but uses the gh-aw event type.
+    const repoId = plugin.repo_id;
+
+    const repo = await this.db.query(`
+      SELECT r.github_full_name, o.github_installation_id
+      FROM gitswarm_repos r
+      JOIN gitswarm_orgs o ON r.org_id = o.id
+      WHERE r.id = $1
+    `, [repoId]);
+
+    if (repo.rows.length === 0) {
+      return { status: 'error', reason: 'repo_not_found' };
+    }
+
+    const { github_full_name, github_installation_id } = repo.rows[0];
+    if (!github_installation_id) {
+      return { status: 'error', reason: 'no_installation' };
+    }
+
+    const [owner, repoName] = github_full_name.split('/');
+
+    let token;
+    try {
+      token = await githubApp.getInstallationToken(github_installation_id);
+    } catch (err) {
+      return { status: 'error', reason: `token_failed: ${err.message}` };
+    }
+
+    const ghRepo = new GitHubRepo(token, owner, repoName);
+
+    // Use the repository_dispatch type from the plugin config
+    // (e.g., 'gitswarm.plugin.consensus-merge')
+    const eventType = isDispatchTrigger ? trigger : `gitswarm.plugin.${plugin.name}`;
+
+    const execResult = await this.db.query(`
+      INSERT INTO gitswarm_plugin_executions (
+        repo_id, plugin_id, trigger_event, trigger_payload, status, started_at
+      ) VALUES ($1, $2, $3, $4, 'dispatched', NOW())
+      RETURNING id
+    `, [repoId, plugin.id, trigger, JSON.stringify(this._sanitizePayload(payload))]);
+
+    const executionId = execResult.rows[0].id;
+
+    const clientPayload = {
+      gitswarm: {
+        execution_id: executionId,
+        plugin_name: plugin.name,
+        plugin_tier: plugin.tier,
+        trigger,
+      },
+      event: this._sanitizePayload(payload),
+    };
+
+    try {
+      await ghRepo.request(
+        'POST',
+        `/repos/${owner}/${repoName}/dispatches`,
+        { event_type: eventType, client_payload: clientPayload }
+      );
+
+      return {
+        status: 'dispatched',
+        dispatchId: executionId,
+        eventType,
+        actionsTaken: [{
+          action: 'ghaw_dispatch',
+          event_type: eventType,
+          workflow: plugin.dispatch_target,
+        }],
+      };
+    } catch (err) {
+      await this.db.query(`
+        UPDATE gitswarm_plugin_executions
+        SET status = 'failed', error_message = $2, completed_at = NOW()
+        WHERE id = $1
+      `, [executionId, err.message]);
+
       return { status: 'dispatch_failed', reason: err.message };
     }
   }
