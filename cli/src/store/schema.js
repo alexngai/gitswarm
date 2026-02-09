@@ -322,8 +322,22 @@ CREATE INDEX IF NOT EXISTS idx_claims_stream ON task_claims(stream_id);
 INSERT INTO schema_version (version) VALUES (2);
 `;
 
+// Migration V3: sync_queue for offline Mode B event queuing
+const migrationV3 = `
+-- ── sync_queue: offline event queue for Mode B ──────────────────
+CREATE TABLE IF NOT EXISTS sync_queue (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+INSERT INTO schema_version (version) VALUES (3);
+`;
+
 /** All migrations in order. */
 export const migrations = [
   { version: 1, sql: schemaV1 },
   { version: 2, sql: migrationV2 },
+  { version: 3, sql: migrationV3 },
 ];

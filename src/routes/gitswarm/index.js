@@ -8,6 +8,8 @@ import { packageRoutes } from './packages.js';
 import { councilRoutes } from './council.js';
 import { bountyRoutes } from './bounties.js';
 import { streamRoutes } from './streams.js';
+import { fileRoutes } from './files.js';
+import { getBackendForRepo } from '../../services/backend-factory.js';
 
 const permissionService = new GitSwarmPermissionService();
 
@@ -21,6 +23,7 @@ export async function gitswarmRoutes(app, options = {}) {
   await app.register(councilRoutes, { activityService });
   await app.register(bountyRoutes, { activityService });
   await app.register(streamRoutes, { activityService });
+  await app.register(fileRoutes, { activityService });
 
   // Different rate limits for different operation types
   const rateLimitRead = createRateLimiter('gitswarm_read');
@@ -867,7 +870,8 @@ export async function gitswarmRoutes(app, options = {}) {
     }
 
     try {
-      const contents = await gitswarmService.getFileContents(id, path, ref);
+      const backend = await getBackendForRepo(id);
+      const contents = await backend.readFile(id, path, ref);
       return { contents };
     } catch (error) {
       if (error.message.includes('not found')) {
@@ -886,7 +890,6 @@ export async function gitswarmRoutes(app, options = {}) {
   }, async (request, reply) => {
     const { id } = request.params;
     const ref = request.query.ref;
-    const recursive = request.query.recursive !== 'false';
 
     // Check read access
     const canRead = await permissionService.canPerform(request.agent.id, id, 'read');
@@ -898,7 +901,8 @@ export async function gitswarmRoutes(app, options = {}) {
     }
 
     try {
-      const tree = await gitswarmService.getTree(id, ref, recursive);
+      const backend = await getBackendForRepo(id);
+      const tree = await backend.getTree(id, ref);
       return { tree };
     } catch (error) {
       if (error.message.includes('not found')) {
@@ -927,7 +931,8 @@ export async function gitswarmRoutes(app, options = {}) {
     }
 
     try {
-      const branches = await gitswarmService.getBranches(id);
+      const backend = await getBackendForRepo(id);
+      const branches = await backend.getBranches(id);
       return { branches };
     } catch (error) {
       throw error;
@@ -951,7 +956,8 @@ export async function gitswarmRoutes(app, options = {}) {
     }
 
     try {
-      const commits = await gitswarmService.getCommits(id, {
+      const backend = await getBackendForRepo(id);
+      const commits = await backend.getCommits(id, {
         sha,
         path,
         since,
@@ -981,12 +987,13 @@ export async function gitswarmRoutes(app, options = {}) {
     }
 
     try {
-      const pulls = await gitswarmService.getPullRequests(id, {
-        state,
-        sort,
-        direction,
-        per_page: per_page ? parseInt(per_page) : 30
-      });
+      const backend = await getBackendForRepo(id);
+      const pulls = await backend.getPullRequests
+        ? await gitswarmService.getPullRequests(id, {
+            state, sort, direction,
+            per_page: per_page ? parseInt(per_page) : 30
+          })
+        : [];
       return { pulls };
     } catch (error) {
       throw error;
@@ -1009,13 +1016,11 @@ export async function gitswarmRoutes(app, options = {}) {
     }
 
     try {
-      const { repo, cloneUrl } = await gitswarmService.getRepoWithCloneAccess(id);
+      const backend = await getBackendForRepo(id);
+      const result = await backend.getCloneAccess(id);
       return {
-        clone_url: cloneUrl,
-        repo: {
-          github_full_name: repo.github_full_name,
-          default_branch: repo.default_branch
-        }
+        clone_url: result.cloneUrl,
+        message: result.message,
       };
     } catch (error) {
       throw error;
