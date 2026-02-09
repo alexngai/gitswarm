@@ -4,10 +4,7 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:  # Temporarily disabled - was triggering on push/PR to main
 
 env:
   NODE_VERSION: '20'
