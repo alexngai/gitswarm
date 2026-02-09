@@ -143,10 +143,13 @@ export class SyncClient {
 
   /**
    * Report successful merge to server (after CLI does git merge + push).
+   * Posts the merge record and updates stream status.
    */
   async syncMergeCompleted(repoId, streamId, { mergeCommit, targetBranch }) {
-    return this._patch(`/gitswarm/repos/${repoId}/streams/${streamId}`, {
-      status: 'merged',
+    // Record the merge with commit data
+    await this._post(`/gitswarm/repos/${repoId}/streams/${streamId}/merge`, {
+      merge_commit: mergeCommit,
+      target_branch: targetBranch,
     });
   }
 

@@ -11,6 +11,9 @@
 import { authenticate } from '../../middleware/authenticate.js';
 import { createRateLimiter } from '../../middleware/rateLimit.js';
 import { gitCascadeManager } from '../../services/git-cascade-manager.js';
+import { GitSwarmPermissionService } from '../../services/gitswarm-permissions.js';
+
+const permissionService = new GitSwarmPermissionService();
 
 export async function fileRoutes(app, options = {}) {
   const { activityService } = options;
@@ -46,6 +49,12 @@ export async function fileRoutes(app, options = {}) {
     const { repoId } = request.params;
     const { clone_url, buffer_branch } = request.body || {};
 
+    // Only maintainers/owners can initialize server-side repos
+    const perm = await permissionService.canPerform(request.agent.id, repoId, 'merge');
+    if (!perm.allowed) {
+      return reply.status(403).send({ error: 'Forbidden', message: 'Only maintainers can initialize server repos' });
+    }
+
     if (!gitCascadeManager.isAvailable()) {
       return reply.status(503).send({
         error: 'Mode C unavailable',
@@ -75,6 +84,68 @@ export async function fileRoutes(app, options = {}) {
     }
   });
 
+  // ── Mode C stream (workspace) creation ─────────────────────
+
+  // Create a stream and worktree on the server for a stateless agent
+  app.post('/gitswarm/repos/:repoId/server-streams', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          base_branch: { type: 'string' },
+          parent_stream_id: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { repoId } = request.params;
+    const agentId = request.agent.id;
+    const { name, base_branch, parent_stream_id } = request.body || {};
+
+    if (!gitCascadeManager.isAvailable()) {
+      return reply.status(503).send({ error: 'Mode C unavailable' });
+    }
+
+    // Check write permission
+    const perm = await permissionService.canPerform(agentId, repoId, 'write');
+    if (!perm.allowed) {
+      return reply.status(403).send({ error: 'Forbidden', message: 'Insufficient permissions' });
+    }
+
+    try {
+      const result = await gitCascadeManager.createStream(repoId, {
+        agentId,
+        name,
+        baseBranch: base_branch,
+        parentStreamId: parent_stream_id,
+      });
+
+      // Record the stream in governance DB
+      await dbQuery(`
+        INSERT INTO gitswarm_streams (id, repo_id, agent_id, name, branch, source, base_branch, parent_stream_id)
+        VALUES ($1, $2, $3, $4, $5, 'api', $6, $7)
+        ON CONFLICT (id) DO NOTHING
+      `, [result.streamId, repoId, agentId, name || result.streamId,
+          result.branch, base_branch || 'buffer', parent_stream_id]);
+
+      if (activityService) {
+        await activityService.logActivity({
+          agent_id: agentId,
+          event_type: 'stream_created',
+          target_type: 'stream',
+          target_id: result.streamId,
+          metadata: { repo_id: repoId, mode: 'server' },
+        });
+      }
+
+      return reply.status(201).send(result);
+    } catch (err) {
+      return reply.status(500).send({ error: err.message });
+    }
+  });
+
   // ── File operations ─────────────────────────────────────────
 
   // Read file from agent's worktree
@@ -82,15 +153,15 @@ export async function fileRoutes(app, options = {}) {
     preHandler: [authenticate, rateLimitRead],
   }, async (request, reply) => {
     const { streamId } = request.params;
-    const filePath = request.params['*'];
-    const agentId = request.agent.id;
+    const filePath = _validateFilePath(request.params['*']);
+    if (!filePath) return reply.status(400).send({ error: 'Invalid file path' });
 
-    // Resolve repo from stream
-    const repoId = await _resolveRepoForStream(streamId);
-    if (!repoId) return reply.status(404).send({ error: 'Stream not found' });
+    const auth = await _authorizeStreamAccess(streamId, request.agent.id);
+    if (!auth) return reply.status(404).send({ error: 'Stream not found' });
+    if (!auth.allowed) return reply.status(403).send({ error: 'Forbidden' });
 
     try {
-      const content = await gitCascadeManager.readFile(repoId, agentId, filePath);
+      const content = await gitCascadeManager.readFile(auth.repoId, auth.ownerId, filePath);
       if (content === null) {
         return reply.status(404).send({ error: 'File not found' });
       }
@@ -114,15 +185,19 @@ export async function fileRoutes(app, options = {}) {
     },
   }, async (request, reply) => {
     const { streamId } = request.params;
-    const filePath = request.params['*'];
+    const filePath = _validateFilePath(request.params['*']);
+    if (!filePath) return reply.status(400).send({ error: 'Invalid file path' });
     const agentId = request.agent.id;
     const { content } = request.body;
 
-    const repoId = await _resolveRepoForStream(streamId);
-    if (!repoId) return reply.status(404).send({ error: 'Stream not found' });
+    // Only stream owner can write
+    const auth = await _authorizeStreamAccess(streamId, agentId, true);
+    if (!auth) return reply.status(404).send({ error: 'Stream not found' });
+    if (!auth.allowed) return reply.status(403).send({ error: 'Only stream owner can write files' });
+    if (auth.status !== 'active') return reply.status(409).send({ error: 'Stream is not active' });
 
     try {
-      const result = await gitCascadeManager.writeFile(repoId, agentId, filePath, content);
+      const result = await gitCascadeManager.writeFile(auth.repoId, agentId, filePath, content);
 
       if (activityService) {
         await activityService.logActivity({
@@ -145,14 +220,18 @@ export async function fileRoutes(app, options = {}) {
     preHandler: [authenticate, rateLimitWrite],
   }, async (request, reply) => {
     const { streamId } = request.params;
-    const filePath = request.params['*'];
+    const filePath = _validateFilePath(request.params['*']);
+    if (!filePath) return reply.status(400).send({ error: 'Invalid file path' });
     const agentId = request.agent.id;
 
-    const repoId = await _resolveRepoForStream(streamId);
-    if (!repoId) return reply.status(404).send({ error: 'Stream not found' });
+    // Only stream owner can delete
+    const auth = await _authorizeStreamAccess(streamId, agentId, true);
+    if (!auth) return reply.status(404).send({ error: 'Stream not found' });
+    if (!auth.allowed) return reply.status(403).send({ error: 'Only stream owner can delete files' });
+    if (auth.status !== 'active') return reply.status(409).send({ error: 'Stream is not active' });
 
     try {
-      const result = await gitCascadeManager.deleteFile(repoId, agentId, filePath);
+      const result = await gitCascadeManager.deleteFile(auth.repoId, agentId, filePath);
       return result;
     } catch (err) {
       return reply.status(500).send({ error: err.message });
@@ -164,14 +243,14 @@ export async function fileRoutes(app, options = {}) {
     preHandler: [authenticate, rateLimitRead],
   }, async (request, reply) => {
     const { streamId } = request.params;
-    const agentId = request.agent.id;
-    const dir = request.query.path || '.';
+    const dir = _validateFilePath(request.query.path || '.') || '.';
 
-    const repoId = await _resolveRepoForStream(streamId);
-    if (!repoId) return reply.status(404).send({ error: 'Stream not found' });
+    const auth = await _authorizeStreamAccess(streamId, request.agent.id);
+    if (!auth) return reply.status(404).send({ error: 'Stream not found' });
+    if (!auth.allowed) return reply.status(403).send({ error: 'Forbidden' });
 
     try {
-      const files = await gitCascadeManager.listFiles(repoId, agentId, dir);
+      const files = await gitCascadeManager.listFiles(auth.repoId, auth.ownerId, dir);
       return { stream_id: streamId, path: dir, entries: files };
     } catch (err) {
       return reply.status(500).send({ error: err.message });
@@ -197,11 +276,14 @@ export async function fileRoutes(app, options = {}) {
     const agentId = request.agent.id;
     const { message } = request.body;
 
-    const repoId = await _resolveRepoForStream(streamId);
-    if (!repoId) return reply.status(404).send({ error: 'Stream not found' });
+    // Only stream owner can commit
+    const auth = await _authorizeStreamAccess(streamId, agentId, true);
+    if (!auth) return reply.status(404).send({ error: 'Stream not found' });
+    if (!auth.allowed) return reply.status(403).send({ error: 'Only stream owner can commit' });
+    if (auth.status !== 'active') return reply.status(409).send({ error: 'Stream is not active' });
 
     try {
-      const result = await gitCascadeManager.commitChanges(repoId, agentId, {
+      const result = await gitCascadeManager.commitChanges(auth.repoId, agentId, {
         message,
         streamId,
       });
@@ -229,8 +311,11 @@ export async function fileRoutes(app, options = {}) {
   }, async (request, reply) => {
     const { streamId } = request.params;
 
-    const repoId = await _resolveRepoForStream(streamId);
-    if (!repoId) return reply.status(404).send({ error: 'Stream not found' });
+    // Stream owner or maintainer can merge
+    const auth = await _authorizeStreamAccess(streamId, request.agent.id);
+    if (!auth) return reply.status(404).send({ error: 'Stream not found' });
+    if (!auth.allowed) return reply.status(403).send({ error: 'Forbidden' });
+    const repoId = auth.repoId;
 
     try {
       const result = await gitCascadeManager.mergeToBuffer(repoId, streamId);
@@ -392,6 +477,16 @@ export async function fileRoutes(app, options = {}) {
             UPDATE gitswarm_streams SET status = 'reverted', updated_at = NOW()
             WHERE id = $1
           `, [breaking_stream_id]);
+
+          // Also update git-cascade tracker if available
+          try {
+            const ctx = await gitCascadeManager.getTracker(repoId);
+            if (ctx?.tracker) {
+              ctx.tracker.updateStream(breaking_stream_id, { status: 'reverted' });
+            }
+          } catch {
+            // Non-critical: cascade state will reconcile on next operation
+          }
         }
       }
 
@@ -440,6 +535,7 @@ export async function fileRoutes(app, options = {}) {
 
 // ── Helpers ──────────────────────────────────────────────────
 
+import { join, resolve, normalize } from 'path';
 import { query as dbQuery } from '../../config/database.js';
 
 async function _resolveRepoForStream(streamId) {
@@ -447,4 +543,56 @@ async function _resolveRepoForStream(streamId) {
     SELECT repo_id FROM gitswarm_streams WHERE id = $1
   `, [streamId]);
   return result.rows[0]?.repo_id || null;
+}
+
+/**
+ * Verify agent owns or has maintainer access to the stream.
+ * Returns { allowed, repoId, agentId: streamOwner } or null if stream not found.
+ */
+async function _authorizeStreamAccess(streamId, requestAgentId, requireOwner = false) {
+  const result = await dbQuery(`
+    SELECT s.repo_id, s.agent_id, s.status
+    FROM gitswarm_streams s
+    WHERE s.id = $1
+  `, [streamId]);
+
+  if (result.rows.length === 0) return null;
+
+  const { repo_id, agent_id, status } = result.rows[0];
+
+  // Stream owner always has access
+  if (agent_id === requestAgentId) {
+    return { allowed: true, repoId: repo_id, ownerId: agent_id, status };
+  }
+
+  // For read operations, check repo read access
+  if (!requireOwner) {
+    const perm = await permissionService.canPerform(requestAgentId, repo_id, 'read');
+    if (perm.allowed) {
+      return { allowed: true, repoId: repo_id, ownerId: agent_id, status };
+    }
+  }
+
+  return { allowed: false, repoId: repo_id, ownerId: agent_id, status };
+}
+
+/**
+ * Validate a file path to prevent directory traversal attacks.
+ * Returns the sanitized path or null if invalid.
+ */
+function _validateFilePath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+
+  // Normalize and check for traversal
+  const normalized = normalize(filePath);
+  if (normalized.startsWith('..') || normalized.startsWith('/') || normalized.includes('..')) {
+    return null;
+  }
+
+  // Block access to .git internals
+  if (normalized === '.git' || normalized.startsWith('.git/') || normalized.startsWith('.git\\')) {
+    return null;
+  }
+
+  return normalized;
 }

@@ -78,9 +78,18 @@ export class Federation {
     cfg.server = { url: serverUrl, agentId };
     writeFileSync(join(this.swarmDir, CONFIG_FILE), JSON.stringify(cfg, null, 2));
 
-    // Test connectivity
+    // Test connectivity and flush any queued events
     const online = await this.sync.ping();
-    return { connected: online, serverUrl };
+    let flushed = 0;
+    if (online) {
+      try {
+        const result = await this.sync.flushQueue();
+        flushed = result.flushed;
+      } catch {
+        // Non-fatal: queue will be flushed on next connection
+      }
+    }
+    return { connected: online, serverUrl, flushed };
   }
 
   /**
@@ -360,7 +369,13 @@ export class Federation {
           taskId,
         });
       } catch {
-        // Server unreachable — operations continue locally
+        // Server unreachable — queue for later sync
+        this.sync._queueEvent({ type: 'stream_created', data: {
+          repoId: repo.id, streamId, name: streamName,
+          branch: tracker.getStreamBranchName(streamId),
+          baseBranch: repo.buffer_branch || 'buffer',
+          parentStreamId: dependsOn,
+        }});
       }
     }
 
@@ -484,7 +499,11 @@ export class Federation {
           message,
         });
       } catch {
-        // Server unreachable — operations continue locally
+        // Server unreachable — queue for later sync
+        const repo2 = await this.repo();
+        this.sync._queueEvent({ type: 'commit', data: {
+          repoId: repo2.id, streamId, commitHash: commit, changeId, message,
+        }});
       }
     }
 
@@ -504,8 +523,10 @@ export class Federation {
     const stream = tracker.getStream(streamId);
     if (!stream) throw new Error(`Stream not found: ${streamId}`);
 
-    // Auto-populate review blocks from commits
-    tracker.autoPopulateStack(streamId);
+    // Auto-populate review blocks from commits (if git-cascade supports it)
+    try { tracker.autoPopulateStack(streamId); } catch {
+      // Method may not be available in this git-cascade version
+    }
 
     // Update stream metadata to indicate review status
     tracker.updateStream(streamId, {
@@ -525,11 +546,18 @@ export class Federation {
         const repo = await this.repo();
         await this.sync.syncSubmitForReview(repo.id, streamId);
       } catch {
-        // Server unreachable
+        const repo = await this.repo();
+        this.sync._queueEvent({ type: 'submit_review', data: {
+          repoId: repo.id, streamId,
+        }});
       }
     }
 
-    return { streamId, reviewBlocks: tracker.getStack(streamId) };
+    let reviewBlocks = [];
+    try { reviewBlocks = tracker.getStack(streamId); } catch {
+      // Method may not be available in this git-cascade version
+    }
+    return { streamId, reviewBlocks };
   }
 
   /**
@@ -571,6 +599,21 @@ export class Federation {
       metadata: { verdict, reviewBlockId },
     });
 
+    // Mode B: report review to server
+    if (this.sync) {
+      try {
+        const repo = await this.repo();
+        await this.sync.syncReview(repo.id, streamId, {
+          verdict, feedback, tested: opts.tested || false,
+        });
+      } catch {
+        // Server unreachable — queued for later
+        this.sync._queueEvent({ type: 'review', data: {
+          repoId: (await this.repo()).id, streamId, verdict, feedback,
+        }});
+      }
+    }
+
     return result.rows[0];
   }
 
@@ -587,7 +630,7 @@ export class Federation {
    * Get review blocks for a stream.
    */
   getReviewBlocks(streamId) {
-    return this._ensureTracker().getStack(streamId);
+    try { return this._ensureTracker().getStack(streamId); } catch { return []; }
   }
 
   /**
@@ -632,8 +675,18 @@ export class Federation {
     }
 
     if (mode === 'review' || mode === 'gated') {
-      // Check consensus
-      const consensus = await this.permissions.checkConsensus(streamId, repo.id);
+      // Check consensus — use server as authority when connected (Mode B)
+      let consensus;
+      if (this.sync) {
+        try {
+          consensus = await this.sync.checkConsensus(repo.id, streamId);
+        } catch {
+          // Server unreachable — fall back to local consensus
+          consensus = await this.permissions.checkConsensus(streamId, repo.id);
+        }
+      } else {
+        consensus = await this.permissions.checkConsensus(streamId, repo.id);
+      }
       if (!consensus.reached) {
         throw new Error(`Consensus not reached: ${consensus.reason}`);
       }
@@ -674,7 +727,10 @@ export class Federation {
           targetBranch: bufferBranch,
         });
       } catch {
-        // Server unreachable
+        this.sync._queueEvent({ type: 'merge', data: {
+          repoId: repo.id, streamId,
+          mergeCommit: mergeResult.newHead, targetBranch: bufferBranch,
+        }});
       }
     }
 
@@ -788,6 +844,20 @@ export class Federation {
         metadata: { tag: tagName, promoted },
       });
 
+      // Mode B: report green stabilization to server
+      if (this.sync) {
+        try {
+          const bufferCommit = _gitSafe(this.repoPath, `git rev-parse "${bufferBranch}"`) || '';
+          await this.sync.syncStabilization(repo.id, {
+            result: 'green', tag: tagName, bufferCommit,
+          });
+        } catch {
+          this.sync._queueEvent({ type: 'stabilize', data: {
+            repoId: repo.id, result: 'green', tag: tagName,
+          }});
+        }
+      }
+
       return { success: true, status: 'green', tag: tagName, promoted };
     }
 
@@ -836,6 +906,22 @@ export class Federation {
       metadata: { reverted: result.reverted },
     });
 
+    // Mode B: report red stabilization to server
+    if (this.sync) {
+      try {
+        const bufferCommit = _gitSafe(this.repoPath, `git rev-parse "${bufferBranch}"`) || '';
+        await this.sync.syncStabilization(repo.id, {
+          result: 'red', bufferCommit,
+          breakingStreamId: result.reverted?.streamId,
+        });
+      } catch {
+        this.sync._queueEvent({ type: 'stabilize', data: {
+          repoId: repo.id, result: 'red',
+          breakingStreamId: result.reverted?.streamId,
+        }});
+      }
+    }
+
     return result;
   }
 
@@ -869,6 +955,21 @@ export class Federation {
         target_id: repo.id,
         metadata: { source, target: promoteTarget },
       });
+
+      // Mode B: report promotion to server
+      if (this.sync) {
+        try {
+          const fromCommit = _gitSafe(this.repoPath, `git rev-parse "${source}"`) || '';
+          const toCommit = _gitSafe(this.repoPath, `git rev-parse "${promoteTarget}"`) || '';
+          await this.sync.syncPromotion(repo.id, {
+            fromCommit, toCommit, triggeredBy: opts.tag ? 'auto' : 'manual',
+          });
+        } catch {
+          this.sync._queueEvent({ type: 'promote', data: {
+            repoId: repo.id, triggeredBy: opts.tag ? 'auto' : 'manual',
+          }});
+        }
+      }
 
       return { success: true, from: source, to: promoteTarget };
     } catch (err) {

@@ -1,7 +1,10 @@
 import { query } from '../config/database.js';
 import { githubApp } from '../services/github.js';
 
-export async function webhookRoutes(app) {
+let _activityService = null;
+
+export async function webhookRoutes(app, options = {}) {
+  _activityService = options.activityService || null;
   // GitHub webhook handler
   app.post('/webhooks/github', {
     config: {
@@ -245,6 +248,16 @@ async function handleExternalPullRequest(payload) {
     ]);
 
     console.log(`Stream ${streamId} created for PR #${pull_request.number} on ${repo.github_full_name}`);
+
+    if (_activityService) {
+      await _activityService.logActivity({
+        agent_id: agentId,
+        event_type: 'stream_created',
+        target_type: 'stream',
+        target_id: streamId,
+        metadata: { repo_id: repo.id, source: 'github_pr', pr_number: pull_request.number },
+      });
+    }
   } else if (action === 'closed') {
     const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
     const newStatus = pull_request.merged ? 'merged' : 'abandoned';
@@ -263,6 +276,25 @@ async function handleExternalPullRequest(payload) {
 
       // Award karma
       await query(`UPDATE agents SET karma = karma + 25 WHERE id = $1`, [agentId]);
+
+      if (_activityService) {
+        await _activityService.logActivity({
+          agent_id: agentId,
+          event_type: 'stream_merged',
+          target_type: 'stream',
+          target_id: streamId,
+          metadata: { repo_id: repo.id, merge_commit: pull_request.merge_commit_sha },
+        });
+      }
+    } else if (_activityService) {
+      // PR closed without merge (abandoned)
+      await _activityService.logActivity({
+        agent_id: agentId,
+        event_type: 'stream_abandoned',
+        target_type: 'stream',
+        target_id: streamId,
+        metadata: { repo_id: repo.id },
+      });
     }
   } else if (action === 'synchronize') {
     // New commits pushed — record them
@@ -429,6 +461,16 @@ async function writeReviewToStream(repository, pull_request, review, reviewerMap
     if (!isHuman) {
       await updateReviewerStats(reviewerId, verdict);
     }
+  }
+
+  if (_activityService && reviewerId) {
+    await _activityService.logActivity({
+      agent_id: reviewerId,
+      event_type: 'review_submitted',
+      target_type: 'stream',
+      target_id: streamId,
+      metadata: { verdict, is_human: isHuman },
+    });
   }
 
   console.log(`Review written to stream ${streamId}: ${review.user.login} ${verdict}`);

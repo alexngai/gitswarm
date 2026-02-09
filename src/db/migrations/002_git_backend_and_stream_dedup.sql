@@ -19,3 +19,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_streams_repo_pr_dedup
 CREATE INDEX IF NOT EXISTS idx_streams_repo_branch
   ON gitswarm_streams (repo_id, branch)
   WHERE status = 'active';
+
+-- Fix legacy patch_reviews schema: webhook code uses 'feedback' (TEXT)
+-- but original schema had 'comments' (JSONB). Also add github_review_id.
+ALTER TABLE patch_reviews
+  ADD COLUMN IF NOT EXISTS feedback TEXT;
+
+ALTER TABLE patch_reviews
+  ADD COLUMN IF NOT EXISTS github_review_id BIGINT;
+
+-- Backfill: copy comments JSONB into feedback TEXT for existing rows
+UPDATE patch_reviews SET feedback = comments::TEXT
+  WHERE feedback IS NULL AND comments IS NOT NULL AND comments != '{}';
+
+-- Add reviewed_at if missing (original schema only had created_at)
+ALTER TABLE patch_reviews
+  ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ DEFAULT NOW();

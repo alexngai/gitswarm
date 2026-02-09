@@ -116,7 +116,7 @@ app.register(bountyRoutes, { prefix: apiPrefix, activityService });
 app.register(syncRoutes, { prefix: apiPrefix, activityService });
 
 // Webhooks (no auth required, verified by signature)
-app.register(webhookRoutes, { prefix: apiPrefix });
+app.register(webhookRoutes, { prefix: apiPrefix, activityService });
 
 // Dashboard routes (for human UI)
 app.register(dashboardRoutes, { prefix: apiPrefix, db, activityService });
