@@ -25,6 +25,7 @@ import { TaskService } from './core/tasks.js';
 import { CouncilService } from './core/council.js';
 import { StageService } from './core/stages.js';
 import { ActivityService } from './core/activity.js';
+import { SyncClient } from './sync-client.js';
 
 const GITSWARM_DIR = '.gitswarm';
 const DB_FILE = 'federation.db';
@@ -49,6 +50,53 @@ export class Federation {
 
     // git-cascade tracker — initialized lazily via _ensureTracker()
     this.tracker = null;
+
+    // Mode B sync client — initialized via connectServer()
+    this.sync = null;
+  }
+
+  /**
+   * Connect to a remote web server for Mode B (server-coordinated) operation.
+   * When connected, local operations are reported to the server and the server
+   * becomes the authority for consensus and reviews.
+   *
+   * @param {object} opts
+   * @param {string} opts.serverUrl - Base URL (e.g. http://localhost:3000/api/v1)
+   * @param {string} opts.apiKey    - Agent API key
+   * @param {string} opts.agentId   - Agent UUID
+   */
+  async connectServer({ serverUrl, apiKey, agentId }) {
+    this.sync = new SyncClient({
+      serverUrl,
+      apiKey,
+      agentId,
+      store: this.store,
+    });
+
+    // Persist server config
+    const cfg = this.config();
+    cfg.server = { url: serverUrl, agentId };
+    writeFileSync(join(this.swarmDir, CONFIG_FILE), JSON.stringify(cfg, null, 2));
+
+    // Test connectivity
+    const online = await this.sync.ping();
+    return { connected: online, serverUrl };
+  }
+
+  /**
+   * Restore server connection from saved config (if present).
+   * Called during open() if server config exists.
+   */
+  _restoreSyncFromConfig(apiKey) {
+    const cfg = this.config();
+    if (cfg.server?.url && apiKey) {
+      this.sync = new SyncClient({
+        serverUrl: cfg.server.url,
+        apiKey,
+        agentId: cfg.server.agentId,
+        store: this.store,
+      });
+    }
   }
 
   /**
@@ -299,6 +347,23 @@ export class Federation {
       metadata: { dependsOn, taskId },
     });
 
+    // Mode B: report stream creation to server
+    if (this.sync) {
+      try {
+        const branchName = tracker.getStreamBranchName(streamId);
+        await this.sync.syncStreamCreated(repo.id, {
+          streamId,
+          name: streamName,
+          branch: branchName,
+          baseBranch: repo.buffer_branch || 'buffer',
+          parentStreamId: dependsOn,
+          taskId,
+        });
+      } catch {
+        // Server unreachable — operations continue locally
+      }
+    }
+
     return { streamId, path: worktree.path || worktreePath };
   }
 
@@ -409,6 +474,20 @@ export class Federation {
       metadata: { commit, changeId, merged: result.merged },
     });
 
+    // Mode B: report commit to server
+    if (this.sync) {
+      try {
+        const repo2 = await this.repo();
+        await this.sync.syncCommit(repo2.id, streamId, {
+          commitHash: commit,
+          changeId,
+          message,
+        });
+      } catch {
+        // Server unreachable — operations continue locally
+      }
+    }
+
     return result;
   }
 
@@ -439,6 +518,16 @@ export class Federation {
       target_type: 'stream',
       target_id: streamId,
     });
+
+    // Mode B: report review submission to server
+    if (this.sync) {
+      try {
+        const repo = await this.repo();
+        await this.sync.syncSubmitForReview(repo.id, streamId);
+      } catch {
+        // Server unreachable
+      }
+    }
 
     return { streamId, reviewBlocks: tracker.getStack(streamId) };
   }
@@ -576,6 +665,18 @@ export class Federation {
       target_id: streamId,
       metadata: { bufferBranch, mergeResult },
     });
+
+    // Mode B: report merge to server
+    if (this.sync) {
+      try {
+        await this.sync.syncMergeCompleted(repo.id, streamId, {
+          mergeCommit: mergeResult.newHead,
+          targetBranch: bufferBranch,
+        });
+      } catch {
+        // Server unreachable
+      }
+    }
 
     return { streamId, mergeResult };
   }

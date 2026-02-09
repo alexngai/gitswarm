@@ -218,6 +218,91 @@ export async function streamRoutes(app, options = {}) {
     return { stream: result.rows[0] };
   });
 
+  // Delete (abandon) a stream
+  app.delete('/gitswarm/repos/:repoId/streams/:streamId', {
+    preHandler: [authenticate, rateLimitWrite],
+  }, async (request, reply) => {
+    const { repoId, streamId } = request.params;
+    const agentId = request.agent.id;
+    const { reason } = request.query;
+
+    // Verify stream exists and belongs to agent (or agent is maintainer)
+    const stream = await query(`
+      SELECT id, agent_id, status FROM gitswarm_streams
+      WHERE id = $1 AND repo_id = $2
+    `, [streamId, repoId]);
+
+    if (stream.rows.length === 0) {
+      return reply.status(404).send({ error: 'Stream not found' });
+    }
+
+    if (stream.rows[0].status === 'merged') {
+      return reply.status(409).send({ error: 'Cannot abandon a merged stream' });
+    }
+
+    // Only stream owner or maintainer can abandon
+    if (stream.rows[0].agent_id !== agentId) {
+      const perm = await permissionService.canPerform(agentId, repoId, 'merge');
+      if (!perm.allowed) {
+        return reply.status(403).send({ error: 'Only stream owner or maintainer can abandon' });
+      }
+    }
+
+    await query(`
+      UPDATE gitswarm_streams SET status = 'abandoned', updated_at = NOW()
+      WHERE id = $1
+    `, [streamId]);
+
+    if (activityService) {
+      await activityService.logActivity({
+        agent_id: agentId,
+        event_type: 'stream_abandoned',
+        target_type: 'stream',
+        target_id: streamId,
+        metadata: { repo_id: repoId, reason },
+      });
+    }
+
+    return { success: true, stream_id: streamId, status: 'abandoned' };
+  });
+
+  // Get diff for a stream (commits in stream not yet in base branch)
+  app.get('/gitswarm/repos/:repoId/streams/:streamId/diff', {
+    preHandler: [authenticate, rateLimitRead],
+  }, async (request, reply) => {
+    const { repoId, streamId } = request.params;
+
+    const stream = await query(`
+      SELECT s.*, r.buffer_branch
+      FROM gitswarm_streams s
+      JOIN gitswarm_repos r ON s.repo_id = r.id
+      WHERE s.id = $1 AND s.repo_id = $2
+    `, [streamId, repoId]);
+
+    if (stream.rows.length === 0) {
+      return reply.status(404).send({ error: 'Stream not found' });
+    }
+
+    const { buffer_branch, branch } = stream.rows[0];
+
+    // Get commits in this stream
+    const commits = await query(`
+      SELECT sc.commit_hash, sc.change_id, sc.message, sc.created_at, a.name as agent_name
+      FROM gitswarm_stream_commits sc
+      LEFT JOIN agents a ON sc.agent_id = a.id
+      WHERE sc.stream_id = $1
+      ORDER BY sc.created_at ASC
+    `, [streamId]);
+
+    return {
+      stream_id: streamId,
+      branch: branch,
+      base: buffer_branch,
+      commits: commits.rows,
+      commit_count: commits.rows.length,
+    };
+  });
+
   // ============================================================
   // Stream Commits
   // ============================================================
@@ -638,5 +723,42 @@ export async function streamRoutes(app, options = {}) {
     `, [repoId, limit, offset]);
 
     return { merges: result.rows };
+  });
+
+  // ============================================================
+  // Stream Activity Feed
+  // ============================================================
+
+  // Get stream lifecycle activity for a repo (WebSocket-compatible format)
+  app.get('/gitswarm/repos/:repoId/stream-activity', {
+    preHandler: [authenticate, rateLimitRead],
+  }, async (request) => {
+    const { repoId } = request.params;
+    const limit = Math.min(parseInt(request.query.limit) || 50, 100);
+    const offset = parseInt(request.query.offset) || 0;
+
+    if (activityService?.getStreamActivity) {
+      const events = await activityService.getStreamActivity(repoId, { limit, offset });
+      return { events };
+    }
+
+    // Fallback: query activity_log directly filtered by stream event types
+    const streamTypes = [
+      'stream_created', 'workspace_created', 'commit',
+      'submit_for_review', 'review_submitted', 'stream_merged',
+      'stream_abandoned', 'stabilization', 'promote',
+    ];
+
+    const result = await query(`
+      SELECT al.*, a.name as agent_name
+      FROM activity_log al
+      LEFT JOIN agents a ON al.agent_id = a.id
+      WHERE al.metadata->>'repo_id' = $1
+        AND al.event_type = ANY($2)
+      ORDER BY al.created_at DESC
+      LIMIT $3 OFFSET $4
+    `, [repoId, streamTypes, limit, offset]);
+
+    return { events: result.rows };
   });
 }
