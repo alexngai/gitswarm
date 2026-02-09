@@ -316,6 +316,9 @@ export class GitCascadeManager {
 
   /**
    * Merge a stream to buffer (server-side git merge).
+   *
+   * On conflict, returns structured conflict info instead of throwing,
+   * so agents can resolve via the /resolve endpoint.
    */
   async mergeToBuffer(repoId, streamId) {
     const ctx = await this.getTracker(repoId);
@@ -337,8 +340,16 @@ export class GitCascadeManager {
         { cwd: repoPath, encoding: 'utf-8' }
       );
     } catch (err) {
+      // Detect which files conflict before aborting
+      const conflicts = this._detectConflicts(repoPath, bufferBranch, streamBranch);
       execSync('git merge --abort', { cwd: repoPath, encoding: 'utf-8' });
-      throw new Error(`Merge conflict: ${err.message}`);
+
+      const error = new Error('merge_conflict');
+      error.conflicts = conflicts;
+      error.streamId = streamId;
+      error.bufferBranch = bufferBranch;
+      error.streamBranch = streamBranch;
+      throw error;
     }
 
     tracker.updateStream(streamId, { status: 'merged' });
@@ -348,49 +359,116 @@ export class GitCascadeManager {
   }
 
   /**
-   * Run stabilization (tests) on buffer.
+   * Detect conflicting files during a merge and extract both versions.
+   * Called while the merge is still in progress (before --abort).
    */
-  async stabilize(repoId) {
+  _detectConflicts(repoPath, bufferBranch, streamBranch) {
+    try {
+      const output = execSync(
+        'git diff --name-only --diff-filter=U',
+        { cwd: repoPath, encoding: 'utf-8' }
+      );
+
+      const conflictingFiles = output.trim().split('\n').filter(Boolean);
+
+      return conflictingFiles.map(filePath => {
+        let ours = '', theirs = '', base = '';
+        try {
+          ours = execSync(`git show ":2:${filePath}"`, { cwd: repoPath, encoding: 'utf-8' });
+        } catch { /* file may not exist in ours */ }
+        try {
+          theirs = execSync(`git show ":3:${filePath}"`, { cwd: repoPath, encoding: 'utf-8' });
+        } catch { /* file may not exist in theirs */ }
+        try {
+          base = execSync(`git show ":1:${filePath}"`, { cwd: repoPath, encoding: 'utf-8' });
+        } catch { /* file may be new */ }
+
+        return { path: filePath, ours, theirs, base };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Resolve a merge conflict by applying resolved file contents,
+   * then completing the merge.
+   *
+   * @param {string} repoId
+   * @param {string} streamId
+   * @param {Array<{path: string, content: string}>} resolutions
+   * @returns {{ mergeCommit: string, bufferBranch: string }}
+   */
+  async resolveConflict(repoId, streamId, resolutions) {
+    const ctx = await this.getTracker(repoId);
+    if (!ctx) throw new Error(`Repo ${repoId} not initialized for Mode C`);
+
+    const { tracker, repoPath } = ctx;
+
+    const repo = await query(`
+      SELECT buffer_branch FROM gitswarm_repos WHERE id = $1
+    `, [repoId]);
+    const bufferBranch = repo.rows[0]?.buffer_branch || 'buffer';
+    const streamBranch = tracker.getStreamBranchName(streamId);
+
+    // Start the merge again
+    execSync(`git checkout "${bufferBranch}"`, { cwd: repoPath, encoding: 'utf-8' });
+    try {
+      execSync(
+        `git merge "${streamBranch}" --no-ff -m "Merge ${streamBranch} into ${bufferBranch}"`,
+        { cwd: repoPath, encoding: 'utf-8' }
+      );
+      // If merge succeeds (race condition: conflict was already resolved), we're done
+    } catch {
+      // Expected: merge has conflicts. Apply resolutions.
+      for (const { path: filePath, content } of resolutions) {
+        const fullPath = join(repoPath, filePath);
+        writeFileSync(fullPath, content);
+        execSync(`git add "${filePath}"`, { cwd: repoPath, encoding: 'utf-8' });
+      }
+
+      // Complete the merge
+      execSync(
+        `git commit --no-edit`,
+        { cwd: repoPath, encoding: 'utf-8' }
+      );
+    }
+
+    tracker.updateStream(streamId, { status: 'merged' });
+    const mergeCommit = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf-8' }).trim();
+
+    return { mergeCommit, bufferBranch };
+  }
+
+  /**
+   * Get the current buffer state for a repo.
+   *
+   * Stabilization runs are the responsibility of external agents, not the
+   * server. Agents clone/pull the buffer branch, run tests locally, and
+   * report results via POST /repos/:id/server-stabilize (or the Mode B
+   * equivalent POST /repos/:id/stabilize).
+   *
+   * This helper returns the current buffer commit so agents know what
+   * they are stabilizing against.
+   */
+  async getBufferState(repoId) {
     const ctx = await this.getTracker(repoId);
     if (!ctx) throw new Error(`Repo ${repoId} not initialized for Mode C`);
 
     const { repoPath } = ctx;
 
     const repo = await query(`
-      SELECT stabilize_command, buffer_branch FROM gitswarm_repos WHERE id = $1
+      SELECT buffer_branch FROM gitswarm_repos WHERE id = $1
     `, [repoId]);
 
-    if (!repo.rows[0]?.stabilize_command) {
-      throw new Error('No stabilize_command configured');
-    }
+    const bufferBranch = repo.rows[0]?.buffer_branch || 'buffer';
 
-    const { stabilize_command, buffer_branch } = repo.rows[0];
-    const bufferBranch = buffer_branch || 'buffer';
+    const bufferCommit = execSync(
+      `git rev-parse "${bufferBranch}"`,
+      { cwd: repoPath, encoding: 'utf-8' }
+    ).trim();
 
-    // Checkout buffer
-    execSync(`git checkout "${bufferBranch}"`, { cwd: repoPath, encoding: 'utf-8' });
-
-    let passed = false;
-    let output = '';
-    try {
-      output = execSync(stabilize_command, {
-        cwd: repoPath,
-        encoding: 'utf-8',
-        timeout: 300000,
-        env: { ...process.env, GIT_BRANCH: bufferBranch },
-      });
-      passed = true;
-    } catch (err) {
-      output = err.stdout || err.message;
-    }
-
-    const bufferCommit = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf-8' }).trim();
-
-    return {
-      result: passed ? 'green' : 'red',
-      bufferCommit,
-      output: output.slice(0, 10000), // truncate
-    };
+    return { bufferBranch, bufferCommit, repoPath };
   }
 
   /**

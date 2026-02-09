@@ -160,7 +160,16 @@ export class SyncClient {
   // ── Stabilization & Promotion ────────────────────────────────
 
   /**
+   * Get current buffer state (commit hash) from server.
+   * Agents use this to know what to stabilize against.
+   */
+  async getBufferState(repoId) {
+    return this._get(`/gitswarm/repos/${repoId}/buffer-state`);
+  }
+
+  /**
    * Report stabilization result.
+   * Stabilization runs are performed by external agents, not the server.
    */
   async syncStabilization(repoId, { result, tag, bufferCommit, breakingStreamId, details }) {
     return this._post(`/gitswarm/repos/${repoId}/stabilize`, {

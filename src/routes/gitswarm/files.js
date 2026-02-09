@@ -247,20 +247,165 @@ export async function fileRoutes(app, options = {}) {
 
       return { success: true, ...result };
     } catch (err) {
+      // Return structured conflict info instead of generic error
+      if (err.message === 'merge_conflict' && err.conflicts) {
+        return reply.status(409).send({
+          error: 'merge_conflict',
+          stream_id: streamId,
+          conflicts: err.conflicts.map(c => ({
+            path: c.path,
+            ours: c.ours,
+            theirs: c.theirs,
+            base: c.base,
+          })),
+          resolution_url: `/api/v1/gitswarm/streams/${streamId}/resolve`,
+        });
+      }
       return reply.status(409).send({ error: err.message });
     }
   });
 
-  // ── Server-side stabilize ───────────────────────────────────
+  // ── Conflict resolution ─────────────────────────────────────
 
-  app.post('/gitswarm/repos/:repoId/server-stabilize', {
+  // Resolve merge conflicts by providing resolved file contents
+  app.post('/gitswarm/streams/:streamId/resolve', {
     preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['resolutions'],
+        properties: {
+          resolutions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['path', 'content'],
+              properties: {
+                path: { type: 'string' },
+                content: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { streamId } = request.params;
+    const { resolutions } = request.body;
+
+    const repoId = await _resolveRepoForStream(streamId);
+    if (!repoId) return reply.status(404).send({ error: 'Stream not found' });
+
+    try {
+      const result = await gitCascadeManager.resolveConflict(repoId, streamId, resolutions);
+
+      if (activityService) {
+        await activityService.logActivity({
+          agent_id: request.agent.id,
+          event_type: 'stream_merged',
+          target_type: 'stream',
+          target_id: streamId,
+          metadata: {
+            merge_commit: result.mergeCommit,
+            conflict_resolved: true,
+            resolved_files: resolutions.map(r => r.path),
+          },
+        });
+      }
+
+      return { success: true, ...result };
+    } catch (err) {
+      return reply.status(500).send({ error: err.message });
+    }
+  });
+
+  // ── Server-side stabilize ───────────────────────────────────
+  // Stabilization runs are performed by external agents, not the server.
+  // Agents pull the buffer branch, run tests, and report results here.
+
+  // Get current buffer state (so agents know what to stabilize against)
+  app.get('/gitswarm/repos/:repoId/buffer-state', {
+    preHandler: [authenticate, rateLimitRead],
   }, async (request, reply) => {
     const { repoId } = request.params;
 
+    if (!gitCascadeManager.isAvailable()) {
+      return reply.status(503).send({ error: 'Mode C unavailable' });
+    }
+
     try {
-      const result = await gitCascadeManager.stabilize(repoId);
-      return result;
+      const state = await gitCascadeManager.getBufferState(repoId);
+      return {
+        buffer_branch: state.bufferBranch,
+        buffer_commit: state.bufferCommit,
+      };
+    } catch (err) {
+      return reply.status(500).send({ error: err.message });
+    }
+  });
+
+  // Report stabilization result from an external agent run
+  app.post('/gitswarm/repos/:repoId/server-stabilize', {
+    preHandler: [authenticate, rateLimitWrite],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['result', 'buffer_commit'],
+        properties: {
+          result: { type: 'string', enum: ['green', 'red'] },
+          buffer_commit: { type: 'string' },
+          breaking_stream_id: { type: 'string' },
+          output: { type: 'string' },
+          details: { type: 'object' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { repoId } = request.params;
+    const agentId = request.agent.id;
+    const {
+      result: stabResult,
+      buffer_commit,
+      breaking_stream_id,
+      output,
+      details = {},
+    } = request.body;
+
+    try {
+      // Record stabilization in governance DB
+      const insertResult = await dbQuery(`
+        INSERT INTO gitswarm_stabilizations (
+          repo_id, result, buffer_commit, breaking_stream_id, details
+        ) VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+      `, [repoId, stabResult, buffer_commit, breaking_stream_id,
+          JSON.stringify({ ...details, output: output?.slice(0, 10000) })]);
+
+      // If red and auto_revert_on_red, mark the breaking stream
+      if (stabResult === 'red' && breaking_stream_id) {
+        const repo = await dbQuery(`
+          SELECT auto_revert_on_red FROM gitswarm_repos WHERE id = $1
+        `, [repoId]);
+
+        if (repo.rows[0]?.auto_revert_on_red) {
+          await dbQuery(`
+            UPDATE gitswarm_streams SET status = 'reverted', updated_at = NOW()
+            WHERE id = $1
+          `, [breaking_stream_id]);
+        }
+      }
+
+      if (activityService) {
+        await activityService.logActivity({
+          agent_id: agentId,
+          event_type: 'stabilization',
+          target_type: 'repo',
+          target_id: repoId,
+          metadata: { result: stabResult, buffer_commit, breaking_stream_id },
+        });
+      }
+
+      return reply.status(201).send({ stabilization: insertResult.rows[0] });
     } catch (err) {
       return reply.status(500).send({ error: err.message });
     }

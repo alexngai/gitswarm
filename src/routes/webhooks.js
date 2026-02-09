@@ -315,7 +315,9 @@ async function handlePullRequestReviewEvent(payload) {
     `, [repository.id, pull_request.number]);
 
     if (gitswarmPatch.rows.length === 0) {
-      console.log(`Review on untracked PR: ${prUrl}`);
+      // No legacy patch — check if there's a stream for this PR
+      // and write the review directly to stream_reviews
+      await writeReviewToStream(repository, pull_request, review, reviewerMapping);
       return;
     }
     patch = gitswarmPatch.rows[0];
@@ -372,6 +374,64 @@ async function handlePullRequestReviewEvent(payload) {
   }
 
   console.log(`Review synced: ${review.user.login} ${verdict} on patch ${patch.id}`);
+}
+
+// Write a review directly to gitswarm_stream_reviews when no legacy patch exists
+async function writeReviewToStream(repository, pull_request, review, reviewerMapping) {
+  const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
+
+  // Verify stream exists
+  const streamResult = await query(
+    `SELECT id, repo_id FROM gitswarm_streams WHERE id = $1`,
+    [streamId]
+  );
+
+  if (streamResult.rows.length === 0) {
+    // Stream doesn't exist yet — create it on the fly (PR was opened before we tracked it)
+    const repoResult = await query(
+      `SELECT id FROM gitswarm_repos WHERE github_repo_id = $1 AND status = 'active'`,
+      [repository.id]
+    );
+    if (repoResult.rows.length === 0) {
+      console.log(`Review on untracked PR (no repo): ${pull_request.html_url}`);
+      return;
+    }
+
+    const mapping = await ensureGitHubUserMapping(pull_request.user);
+    await query(`
+      INSERT INTO gitswarm_streams (id, repo_id, agent_id, name, branch, source, github_pr_number, github_pr_url, base_branch)
+      VALUES ($1, $2, $3, $4, $5, 'github_pr', $6, $7, $8)
+      ON CONFLICT (id) DO NOTHING
+    `, [
+      streamId, repoResult.rows[0].id, mapping?.agent_id,
+      pull_request.title, pull_request.head.ref,
+      pull_request.number, pull_request.html_url, pull_request.base.ref,
+    ]);
+  }
+
+  const verdictMap = {
+    'approved': 'approve',
+    'changes_requested': 'request_changes',
+    'commented': 'comment',
+  };
+  const verdict = verdictMap[review.state.toLowerCase()] || 'comment';
+  const isHuman = !reviewerMapping?.agent_id;
+  const reviewerId = reviewerMapping?.agent_id || await getHumanReviewerPlaceholder(review.user);
+
+  if (reviewerId) {
+    await query(`
+      INSERT INTO gitswarm_stream_reviews (stream_id, reviewer_id, verdict, feedback, is_human)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (stream_id, reviewer_id) DO UPDATE SET
+        verdict = $3, feedback = $4, reviewed_at = NOW()
+    `, [streamId, reviewerId, verdict, review.body, isHuman]);
+
+    if (!isHuman) {
+      await updateReviewerStats(reviewerId, verdict);
+    }
+  }
+
+  console.log(`Review written to stream ${streamId}: ${review.user.login} ${verdict}`);
 }
 
 // Store human review from GitHub
