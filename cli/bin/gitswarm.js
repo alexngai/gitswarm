@@ -4,19 +4,28 @@
  * gitswarm — standalone CLI for local multi-agent federation coordination.
  *
  * Usage:
- *   gitswarm init [--name <name>] [--model solo|guild|open]
+ *   gitswarm init [--name <name>] [--model solo|guild|open] [--mode swarm|review|gated]
  *   gitswarm agent register <name> [--desc <description>]
  *   gitswarm agent list
  *   gitswarm agent info <name|id>
+ *   gitswarm workspace create --as <agent> [--name <n>] [--task <id>] [--fork <stream>]
+ *   gitswarm workspace list
+ *   gitswarm workspace destroy <agent> [--abandon]
+ *   gitswarm commit --as <agent> -m <message>
+ *   gitswarm stream list [--status <s>]
+ *   gitswarm stream info <stream-id>
+ *   gitswarm stream diff <stream-id>
+ *   gitswarm review submit <stream-id> approve|request_changes --as <agent> [--feedback <f>]
+ *   gitswarm review list <stream-id>
+ *   gitswarm review check <stream-id>
+ *   gitswarm merge <stream-id> --as <agent>
+ *   gitswarm stabilize
+ *   gitswarm promote [--tag <t>]
  *   gitswarm task create <title> [--desc <d>] [--priority <p>] [--as <agent>]
  *   gitswarm task list [--status <s>]
  *   gitswarm task claim <id> --as <agent>
  *   gitswarm task submit <claim-id> --as <agent> [--notes <n>]
  *   gitswarm task review <claim-id> approve|reject --as <agent> [--notes <n>]
- *   gitswarm patch create <title> --branch <b> --as <agent>
- *   gitswarm patch list [--status <s>]
- *   gitswarm review submit <patch-id> approve|request_changes --as <agent> [--feedback <f>]
- *   gitswarm review check <patch-id>
  *   gitswarm council create [--min-karma <n>] [--quorum <n>]
  *   gitswarm council propose <type> <title> --as <agent>
  *   gitswarm council vote <proposal-id> for|against --as <agent>
@@ -37,9 +46,11 @@ function parseArgs(argv) {
   const flags = {};
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i].startsWith('--')) {
+    if (args[i] === '-m' && i + 1 < args.length) {
+      // Special handling for -m <message>
+      flags.m = args[++i];
+    } else if (args[i].startsWith('--')) {
       const key = args[i].slice(2);
-      // Flags that are boolean (no value)
       if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
         flags[key] = true;
       } else {
@@ -73,6 +84,17 @@ function short(id) {
   return id ? id.slice(0, 8) : '—';
 }
 
+function timeAgo(ts) {
+  if (!ts) return '—';
+  const ms = typeof ts === 'number' ? Date.now() - ts : Date.now() - new Date(ts).getTime();
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 // ── Commands ───────────────────────────────────────────────
 
 const commands = {};
@@ -83,19 +105,25 @@ commands.init = (_fed, { flags }) => {
   try {
     const { config } = Federation.init(cwd, {
       name: flags.name,
+      merge_mode: flags.mode,
       ownership_model: flags.model,
       agent_access: flags.access,
       consensus_threshold: flags.threshold ? parseFloat(flags.threshold) : undefined,
       min_reviews: flags['min-reviews'] ? parseInt(flags['min-reviews']) : undefined,
+      buffer_branch: flags['buffer-branch'],
+      promote_target: flags['promote-target'],
+      stabilize_command: flags['stabilize-command'],
     });
     console.log(`Initialised gitswarm federation: ${config.name}`);
-    console.log(`  model: ${config.ownership_model}`);
-    console.log(`  access: ${config.agent_access}`);
+    console.log(`  mode:      ${config.merge_mode}`);
+    console.log(`  model:     ${config.ownership_model}`);
+    console.log(`  access:    ${config.agent_access}`);
     console.log(`  consensus: ${config.consensus_threshold}`);
-    console.log(`  store: .gitswarm/federation.db`);
+    console.log(`  store:     .gitswarm/federation.db`);
     console.log('\nNext steps:');
-    console.log('  gitswarm agent register <name>   Register an agent');
-    console.log('  gitswarm task create <title>      Create a task');
+    console.log('  gitswarm agent register <name>       Register an agent');
+    console.log('  gitswarm workspace create --as <a>   Create an isolated workspace');
+    console.log('  gitswarm task create <title>          Create a task');
   } catch (e) {
     console.error(`Error: ${e.message}`);
     process.exit(1);
@@ -146,6 +174,209 @@ commands.agent = async (fed, { positional, flags }) => {
   process.exit(1);
 };
 
+// --- workspace ---
+commands.workspace = async (fed, { positional, flags }) => {
+  const sub = positional[0];
+
+  if (sub === 'create') {
+    if (!flags.as) {
+      console.error('Usage: gitswarm workspace create --as <agent> [--name <n>] [--task <id>] [--fork <stream>]');
+      process.exit(1);
+    }
+    const agent = await fed.resolveAgent(flags.as);
+    const taskId = flags.task ? await resolveId(fed, 'tasks', flags.task) : undefined;
+    const ws = await fed.createWorkspace({
+      agentId: agent.id,
+      name: flags.name,
+      taskId,
+      dependsOn: flags.fork,
+    });
+    console.log(`Workspace created for ${agent.name}`);
+    console.log(`  stream: ${ws.streamId}`);
+    console.log(`  path:   ${ws.path}`);
+    return;
+  }
+
+  if (sub === 'list') {
+    const workspaces = await fed.listWorkspaces();
+    table(workspaces, [
+      { label: 'AGENT',   get: r => r.agentName },
+      { label: 'STREAM',  get: r => short(r.streamId) },
+      { label: 'NAME',    get: r => r.streamName || '—' },
+      { label: 'STATUS',  get: r => r.streamStatus || '—' },
+      { label: 'ACTIVE',  get: r => timeAgo(r.lastActive) },
+      { label: 'PATH',    get: r => r.path },
+    ]);
+    return;
+  }
+
+  if (sub === 'destroy') {
+    const agentRef = positional[1];
+    if (!agentRef) { console.error('Usage: gitswarm workspace destroy <agent> [--abandon]'); process.exit(1); }
+    const agent = await fed.resolveAgent(agentRef);
+    await fed.destroyWorkspace(agent.id, { abandonStream: !!flags.abandon });
+    console.log(`Workspace destroyed for ${agent.name}`);
+    return;
+  }
+
+  console.error('Usage: gitswarm workspace <create|list|destroy>');
+  process.exit(1);
+};
+
+// --- commit ---
+commands.commit = async (fed, { flags }) => {
+  if (!flags.as || !flags.m) {
+    console.error('Usage: gitswarm commit --as <agent> -m <message>');
+    process.exit(1);
+  }
+  const agent = await fed.resolveAgent(flags.as);
+  const result = await fed.commit({
+    agentId: agent.id,
+    message: flags.m,
+    streamId: flags.stream,
+  });
+  console.log(`Committed: ${result.commit?.slice(0, 8)}`);
+  console.log(`  Change-Id: ${result.changeId}`);
+  if (result.merged) console.log(`  Auto-merged to buffer (swarm mode)`);
+  if (result.conflicts) console.log(`  Merge conflicts: ${result.conflicts.length} files`);
+  if (result.mergeError) console.log(`  Merge error: ${result.mergeError}`);
+};
+
+// --- stream ---
+commands.stream = async (fed, { positional, flags }) => {
+  const sub = positional[0];
+
+  if (sub === 'list') {
+    const streams = fed._ensureTracker().listStreams({
+      status: flags.status || undefined,
+    });
+    table(streams, [
+      { label: 'ID',      get: r => short(r.id) },
+      { label: 'NAME',    get: r => r.name },
+      { label: 'AGENT',   get: r => short(r.agentId) },
+      { label: 'STATUS',  get: r => r.status },
+      { label: 'PARENT',  get: r => r.parentStream ? short(r.parentStream) : '—' },
+      { label: 'UPDATED', get: r => timeAgo(r.updatedAt) },
+    ]);
+    return;
+  }
+
+  if (sub === 'info') {
+    const streamId = positional[1];
+    if (!streamId) { console.error('Usage: gitswarm stream info <stream-id>'); process.exit(1); }
+    const info = fed.getStreamInfo(streamId);
+    if (!info) { console.error(`Stream not found: ${streamId}`); process.exit(1); }
+    const { stream, changes, operations, dependencies, children } = info;
+    console.log(`Stream: ${stream.name}`);
+    console.log(`  id:     ${stream.id}`);
+    console.log(`  agent:  ${stream.agentId}`);
+    console.log(`  status: ${stream.status}`);
+    console.log(`  base:   ${stream.baseCommit?.slice(0, 8) || '—'}`);
+    console.log(`  parent: ${stream.parentStream || '—'}`);
+    console.log(`  changes:    ${changes.length}`);
+    console.log(`  operations: ${operations.length}`);
+    console.log(`  deps:       ${dependencies.length}`);
+    console.log(`  children:   ${children.length}`);
+    return;
+  }
+
+  if (sub === 'diff') {
+    const streamId = positional[1];
+    if (!streamId) { console.error('Usage: gitswarm stream diff <stream-id>'); process.exit(1); }
+    const diff = flags.full ? fed.getStreamDiffFull(streamId) : fed.getStreamDiff(streamId);
+    console.log(diff || '(no changes)');
+    return;
+  }
+
+  console.error('Usage: gitswarm stream <list|info|diff>');
+  process.exit(1);
+};
+
+// --- review (stream-based) ---
+commands.review = async (fed, { positional, flags }) => {
+  const sub = positional[0];
+
+  if (sub === 'submit') {
+    const streamId = positional[1];
+    const verdict = positional[2];
+    if (!streamId || !verdict || !flags.as) {
+      console.error('Usage: gitswarm review submit <stream-id> approve|request_changes --as <agent> [--feedback <f>]');
+      process.exit(1);
+    }
+    const agent = await fed.resolveAgent(flags.as);
+    await fed.submitReview(streamId, agent.id, verdict, flags.feedback || '', {
+      isHuman: !!flags.human,
+    });
+    console.log(`Review submitted: ${verdict}`);
+    return;
+  }
+
+  if (sub === 'list') {
+    const streamId = positional[1];
+    if (!streamId) { console.error('Usage: gitswarm review list <stream-id>'); process.exit(1); }
+    const reviews = await fed.getReviews(streamId);
+    table(reviews, [
+      { label: 'REVIEWER', get: r => r.reviewer_name || short(r.reviewer_id) },
+      { label: 'VERDICT',  get: r => r.verdict },
+      { label: 'HUMAN',    get: r => r.is_human ? 'yes' : 'no' },
+      { label: 'FEEDBACK', get: r => (r.feedback || '').slice(0, 50) },
+      { label: 'DATE',     get: r => r.reviewed_at?.slice(0, 10) },
+    ]);
+    return;
+  }
+
+  if (sub === 'check') {
+    const streamId = positional[1];
+    if (!streamId) { console.error('Usage: gitswarm review check <stream-id>'); process.exit(1); }
+    const result = await fed.checkConsensus(streamId);
+    console.log(`Consensus: ${result.reached ? 'REACHED' : 'NOT REACHED'}`);
+    console.log(`  reason: ${result.reason}`);
+    if (result.ratio !== undefined) console.log(`  ratio:  ${result.ratio} (threshold: ${result.threshold})`);
+    if (result.approvals !== undefined) console.log(`  approvals: ${result.approvals}  rejections: ${result.rejections}`);
+    return;
+  }
+
+  console.error('Usage: gitswarm review <submit|list|check>');
+  process.exit(1);
+};
+
+// --- merge ---
+commands.merge = async (fed, { positional, flags }) => {
+  const streamId = positional[0];
+  if (!streamId || !flags.as) {
+    console.error('Usage: gitswarm merge <stream-id> --as <agent>');
+    process.exit(1);
+  }
+  const agent = await fed.resolveAgent(flags.as);
+  const result = await fed.mergeToBuffer(streamId, agent.id);
+  console.log(`Merge queued: ${short(result.entryId)}`);
+  if (result.queueResult) {
+    console.log(`  processed: ${result.queueResult.processed || 0}`);
+    console.log(`  merged: ${result.queueResult.merged || 0}`);
+  }
+};
+
+// --- stabilize ---
+commands.stabilize = async (fed) => {
+  const result = await fed.stabilize();
+  if (result.success) {
+    console.log(`Stabilization: GREEN`);
+    console.log(`  tag: ${result.tag}`);
+    if (result.promoted) console.log(`  promoted to main`);
+  } else {
+    console.log(`Stabilization: RED`);
+    if (result.output) console.log(`  output: ${result.output.slice(0, 200)}`);
+    if (result.reverted) console.log(`  reverted stream: ${result.reverted.streamId}`);
+    if (result.revertError) console.log(`  revert error: ${result.revertError}`);
+  }
+};
+
+// --- promote ---
+commands.promote = async (fed, { flags }) => {
+  const result = await fed.promote({ tag: flags.tag });
+  console.log(`Promoted: ${result.from} → ${result.to}`);
+};
+
 // --- task ---
 commands.task = async (fed, { positional, flags }) => {
   const repo = await fed.repo();
@@ -185,8 +416,9 @@ commands.task = async (fed, { positional, flags }) => {
     if (!taskId || !flags.as) { console.error('Usage: gitswarm task claim <id> --as <agent>'); process.exit(1); }
     const agent = await fed.resolveAgent(flags.as);
     const fullId = await resolveId(fed, 'tasks', taskId);
-    const claim = await fed.tasks.claim(fullId, agent.id);
+    const claim = await fed.tasks.claim(fullId, agent.id, flags.stream);
     console.log(`Task claimed: ${short(claim.id)}`);
+    if (claim.stream_id) console.log(`  stream: ${claim.stream_id}`);
     return;
   }
 
@@ -195,7 +427,10 @@ commands.task = async (fed, { positional, flags }) => {
     if (!claimId || !flags.as) { console.error('Usage: gitswarm task submit <claim-id> --as <agent>'); process.exit(1); }
     const agent = await fed.resolveAgent(flags.as);
     const fullId = await resolveId(fed, 'task_claims', claimId);
-    const result = await fed.tasks.submit(fullId, agent.id, { notes: flags.notes || '' });
+    const result = await fed.tasks.submit(fullId, agent.id, {
+      stream_id: flags.stream,
+      notes: flags.notes || '',
+    });
     console.log(`Submission recorded: ${short(result.id)}`);
     return;
   }
@@ -215,96 +450,6 @@ commands.task = async (fed, { positional, flags }) => {
   }
 
   console.error('Usage: gitswarm task <create|list|claim|submit|review>');
-  process.exit(1);
-};
-
-// --- patch ---
-commands.patch = async (fed, { positional, flags }) => {
-  const repo = await fed.repo();
-  if (!repo) { console.error('No repo found.'); process.exit(1); }
-  const sub = positional[0];
-
-  if (sub === 'create') {
-    const title = positional.slice(1).join(' ') || flags.title;
-    if (!title || !flags.as) {
-      console.error('Usage: gitswarm patch create <title> --as <agent> [--branch <b>]');
-      process.exit(1);
-    }
-    const agent = await fed.resolveAgent(flags.as);
-    const branch = flags.branch || fed.git.currentBranch();
-    const patch = await fed.createPatch(repo.id, agent.id, {
-      title,
-      description: flags.desc || '',
-      source_branch: branch,
-      target_branch: flags.target || 'main',
-    });
-    console.log(`Patch created: ${short(patch.id)}  ${patch.title}`);
-    console.log(`  branch: ${patch.source_branch} → ${patch.target_branch}`);
-    return;
-  }
-
-  if (sub === 'list') {
-    const patches = await fed.listPatches(repo.id, flags.status);
-    table(patches, [
-      { label: 'ID',      get: r => short(r.id) },
-      { label: 'STATUS',  get: r => r.status },
-      { label: 'TITLE',   get: r => r.title },
-      { label: 'BRANCH',  get: r => `${r.source_branch} → ${r.target_branch}` },
-      { label: 'AUTHOR',  get: r => r.author_name || '—' },
-    ]);
-    return;
-  }
-
-  console.error('Usage: gitswarm patch <create|list>');
-  process.exit(1);
-};
-
-// --- review ---
-commands.review = async (fed, { positional, flags }) => {
-  const sub = positional[0];
-
-  if (sub === 'submit') {
-    const patchId = positional[1];
-    const verdict = positional[2];
-    if (!patchId || !verdict || !flags.as) {
-      console.error('Usage: gitswarm review submit <patch-id> approve|request_changes --as <agent>');
-      process.exit(1);
-    }
-    const agent = await fed.resolveAgent(flags.as);
-    const fullId = await resolveId(fed, 'patches', patchId);
-    const review = await fed.submitReview(fullId, agent.id, verdict, flags.feedback || '');
-    console.log(`Review submitted: ${verdict}`);
-    return;
-  }
-
-  if (sub === 'list') {
-    const patchId = positional[1];
-    if (!patchId) { console.error('Usage: gitswarm review list <patch-id>'); process.exit(1); }
-    const fullId = await resolveId(fed, 'patches', patchId);
-    const reviews = await fed.getReviews(fullId);
-    table(reviews, [
-      { label: 'REVIEWER', get: r => r.reviewer_name || short(r.reviewer_id) },
-      { label: 'VERDICT',  get: r => r.verdict },
-      { label: 'FEEDBACK', get: r => (r.feedback || '').slice(0, 50) },
-      { label: 'DATE',     get: r => r.reviewed_at?.slice(0, 10) },
-    ]);
-    return;
-  }
-
-  if (sub === 'check') {
-    const patchId = positional[1];
-    if (!patchId) { console.error('Usage: gitswarm review check <patch-id>'); process.exit(1); }
-    const repo = await fed.repo();
-    const fullId = await resolveId(fed, 'patches', patchId);
-    const result = await fed.permissions.checkConsensus(fullId, repo.id);
-    console.log(`Consensus: ${result.reached ? 'REACHED' : 'NOT REACHED'}`);
-    console.log(`  reason: ${result.reason}`);
-    if (result.ratio !== undefined) console.log(`  ratio:  ${result.ratio} (threshold: ${result.threshold})`);
-    if (result.approvals !== undefined) console.log(`  approvals: ${result.approvals}  rejections: ${result.rejections}`);
-    return;
-  }
-
-  console.error('Usage: gitswarm review <submit|list|check>');
   process.exit(1);
 };
 
@@ -363,14 +508,13 @@ commands.council = async (fed, { positional, flags }) => {
     const type = positional[1];
     const title = positional.slice(2).join(' ') || flags.title;
     if (!type || !title || !flags.as) {
-      console.error('Usage: gitswarm council propose <type> <title> --as <agent> [--target <agent>] [--access-level <level>]');
+      console.error('Usage: gitswarm council propose <type> <title> --as <agent> [--target <agent>]');
       process.exit(1);
     }
     const council = await fed.council.getCouncil(repo.id);
     if (!council) { console.error('No council.'); process.exit(1); }
     const agent = await fed.resolveAgent(flags.as);
 
-    // Build action_data from flags
     const action_data = {};
     if (flags.target) {
       const target = await fed.resolveAgent(flags.target);
@@ -378,6 +522,9 @@ commands.council = async (fed, { positional, flags }) => {
     }
     if (flags.role) action_data.role = flags.role;
     if (flags['access-level']) action_data.access_level = flags['access-level'];
+    if (flags.stream) action_data.stream_id = flags.stream;
+    if (flags.priority) action_data.priority = parseInt(flags.priority);
+    if (flags.tag) action_data.tag = flags.tag;
 
     const proposal = await fed.council.createProposal(council.id, agent.id, {
       title,
@@ -432,35 +579,45 @@ commands.status = async (fed) => {
 
   console.log(`Federation: ${config.name || '(unnamed)'}`);
   console.log(`  path:   ${fed.repoPath}`);
+  console.log(`  mode:   ${repo?.merge_mode || config.merge_mode || 'review'}`);
   console.log(`  model:  ${repo?.ownership_model || config.ownership_model}`);
   console.log(`  access: ${repo?.agent_access || config.agent_access}`);
   console.log(`  stage:  ${repo?.stage || 'seed'}`);
   console.log(`  agents: ${agents.length}`);
 
   if (repo) {
+    console.log(`  buffer: ${repo.buffer_branch || 'buffer'} → ${repo.promote_target || 'main'}`);
+
     const { metrics } = await fed.stages.getMetrics(repo.id);
     console.log(`  contributors: ${metrics.contributor_count}`);
-    console.log(`  patches:      ${metrics.patch_count}`);
+    console.log(`  streams:      ${metrics.patch_count}`);
     console.log(`  maintainers:  ${metrics.maintainer_count}`);
     console.log(`  council:      ${metrics.has_council ? 'yes' : 'no'}`);
 
-    // Stage eligibility
     const elig = await fed.stages.checkEligibility(repo.id);
     if (elig.next_stage) {
       console.log(`\n  Next stage: ${elig.next_stage} (${elig.eligible ? 'ELIGIBLE' : 'not yet'})`);
       if (elig.unmet && elig.unmet.length > 0) {
         for (const u of elig.unmet) {
-          console.log(`    ✗ ${u.requirement}: ${u.current}/${u.required}`);
+          console.log(`    - ${u.requirement}: ${u.current}/${u.required}`);
         }
       }
     }
   }
 
-  // Git info
-  if (fed.git.isRepo()) {
-    console.log(`\nGit:`);
-    try { console.log(`  branch: ${fed.git.currentBranch()}`); } catch { /* empty repo */ }
-    try { console.log(`  dirty:  ${fed.git.isDirty() ? 'yes' : 'no'}`); } catch { /* empty repo */ }
+  // Streams summary
+  try {
+    const activeStreams = fed.listActiveStreams();
+    const workspaces = await fed.listWorkspaces();
+    console.log(`\nStreams: ${activeStreams.length} active`);
+    console.log(`Workspaces: ${workspaces.length} active`);
+
+    const queue = fed.tracker.getMergeQueue({ status: 'pending' });
+    if (queue.length > 0) {
+      console.log(`Merge queue: ${queue.length} pending`);
+    }
+  } catch {
+    // Tracker may not be available
   }
 };
 
@@ -488,7 +645,6 @@ commands.config = async (fed, { positional }) => {
     console.log(config[positional[0]] ?? '(not set)');
     return;
   }
-  // set
   const { writeFileSync: write } = await import('fs');
   const { join: joinPath } = await import('path');
   config[positional[0]] = positional[1];
@@ -498,11 +654,10 @@ commands.config = async (fed, { positional }) => {
 
 // ── ID resolution helper ───────────────────────────────────
 
-async function resolveId(fed, table, prefix) {
-  // Allow short IDs (prefix match)
+async function resolveId(fed, tableName, prefix) {
   if (prefix.length >= 32) return prefix;
   const r = await fed.store.query(
-    `SELECT id FROM ${table} WHERE id LIKE ?`, [`${prefix}%`]
+    `SELECT id FROM ${tableName} WHERE id LIKE ?`, [`${prefix}%`]
   );
   if (r.rows.length === 0) throw new Error(`No match for ID prefix: ${prefix}`);
   if (r.rows.length > 1) throw new Error(`Ambiguous ID prefix: ${prefix} (${r.rows.length} matches)`);
@@ -523,9 +678,14 @@ Usage:
 Commands:
   init                   Initialise a federation in the current repo
   agent                  Manage agents (register, list, info)
+  workspace              Manage agent workspaces (create, list, destroy)
+  commit                 Commit from an agent's workspace
+  stream                 Inspect streams (list, info, diff)
+  review                 Stream reviews (submit, list, check consensus)
+  merge                  Merge a stream to buffer
+  stabilize              Run tests and tag green/revert red
+  promote                Promote buffer to main
   task                   Task distribution (create, list, claim, submit, review)
-  patch                  Code patches (create, list)
-  review                 Patch reviews (submit, list, check consensus)
   council                Governance (create, status, propose, vote, add-member)
   status                 Show federation status
   log                    View activity log
@@ -536,12 +696,14 @@ Options:
   --help                 Show this help
 
 Examples:
-  gitswarm init --name my-project --model guild
+  gitswarm init --name my-project --mode review --model guild
   gitswarm agent register architect --desc "System architect agent"
-  gitswarm task create "Implement auth module" --priority high --as architect
-  gitswarm task claim a1b2c3d4 --as coder
-  gitswarm review submit f0e1d2c3 approve --as reviewer --feedback "LGTM"
-  gitswarm council create --quorum 2
+  gitswarm workspace create --as coder --name "feature/auth"
+  gitswarm commit --as coder -m "Add auth module"
+  gitswarm review submit abc123 approve --as reviewer --feedback "LGTM"
+  gitswarm merge abc123 --as reviewer
+  gitswarm stabilize
+  gitswarm promote
   gitswarm status`);
     process.exit(0);
   }

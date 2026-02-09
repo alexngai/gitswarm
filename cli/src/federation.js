@@ -67,6 +67,23 @@ export class Federation {
   }
 
   /**
+   * Find the stream ID for the buffer branch.
+   * The buffer branch is tracked as a stream via trackExistingBranch during init.
+   */
+  _findBufferStreamId(bufferBranch = 'buffer') {
+    const tracker = this._ensureTracker();
+    const streams = tracker.listStreams({});
+    for (const s of streams) {
+      if (s.existingBranch === bufferBranch) return s.id;
+      try {
+        const branch = tracker.getStreamBranchName(s.id);
+        if (branch === bufferBranch) return s.id;
+      } catch { /* ignore */ }
+    }
+    return null;
+  }
+
+  /**
    * Open an existing federation at the given repo path.
    * Looks for `.gitswarm/federation.db` up the directory tree.
    */
@@ -140,10 +157,11 @@ export class Federation {
           _git(repoPath, `git branch "${bufferBranch}"`);
         }
         // Track the buffer branch in git-cascade
-        fed.tracker.trackExistingBranch({
-          branchName: bufferBranch,
-          agentId: 'federation',
+        fed.tracker.createStream({
           name: `buffer:${bufferBranch}`,
+          agentId: 'federation',
+          existingBranch: bufferBranch,
+          createBranch: false,
         });
       }
     } catch {
@@ -367,33 +385,17 @@ export class Federation {
 
     // Mode-specific post-commit behavior
     if (repo?.merge_mode === 'swarm') {
-      // Auto-merge to buffer
+      // Auto-merge to buffer (bypasses consensus)
       try {
         const bufferBranch = repo.buffer_branch || 'buffer';
-        const mergeResult = tracker.mergeStream({
-          streamId,
-          targetBranch: bufferBranch,
-          agentId,
-          strategy: 'merge',
-        });
+        const streamBranch = tracker.getStreamBranchName(streamId);
 
-        if (mergeResult.success) {
-          result.merged = true;
-          result.mergeCommit = mergeResult.mergeCommit;
+        _git(this.repoPath, `git checkout "${bufferBranch}"`);
+        _git(this.repoPath, `git merge "${streamBranch}" --no-ff -m "Merge ${streamBranch} into ${bufferBranch}"`);
+        result.merged = true;
 
-          // Cascade rebase to keep other streams up to date
-          const activeStreams = tracker.listStreams({ status: 'active' });
-          for (const s of activeStreams) {
-            if (s.id === streamId) continue;
-            try {
-              tracker.syncWithParent(s.id, s.agentId, s.id, 'abort');
-            } catch {
-              // Conflict — stream will be marked, agent resolves later
-            }
-          }
-        } else if (mergeResult.conflicts) {
-          result.conflicts = mergeResult.conflicts;
-        }
+        // Mark stream as merged in git-cascade
+        tracker.updateStream(streamId, { status: 'merged' });
       } catch (err) {
         result.mergeError = err.message;
       }
@@ -548,29 +550,21 @@ export class Federation {
       }
     }
 
-    // Compute merge priority from linked task
-    let priority = 50; // default: medium
-    const claim = await this.tasks.getClaimByStream(streamId);
-    if (claim) {
-      const priorityMap = { critical: 0, high: 25, medium: 50, low: 75 };
-      priority = priorityMap[claim.priority] ?? 50;
+    // Merge stream branch into buffer via git
+    const streamBranch = tracker.getStreamBranchName(streamId);
+
+    _git(this.repoPath, `git checkout "${bufferBranch}"`);
+    try {
+      _git(this.repoPath, `git merge "${streamBranch}" --no-ff -m "Merge ${streamBranch} into ${bufferBranch}"`);
+    } catch (err) {
+      // Abort merge on conflict and report
+      _gitSafe(this.repoPath, 'git merge --abort');
+      throw new Error(`Merge failed: ${err.message}`);
     }
 
-    // Add to merge queue and process
-    const entryId = tracker.addToMergeQueue({
-      streamId,
-      targetBranch: bufferBranch,
-      priority,
-      agentId,
-    });
-
-    tracker.markMergeQueueReady(entryId);
-
-    const queueResult = tracker.processMergeQueue({
-      targetBranch: bufferBranch,
-      worktree: this.repoPath,
-      agentId,
-    });
+    // Mark stream as merged in git-cascade
+    tracker.updateStream(streamId, { status: 'merged' });
+    const mergeResult = { success: true, newHead: _git(this.repoPath, 'git rev-parse HEAD') };
 
     // Update stage metrics after merge
     await this.stages.updateMetrics(repo.id, tracker);
@@ -580,10 +574,10 @@ export class Federation {
       event_type: 'stream_merged',
       target_type: 'stream',
       target_id: streamId,
-      metadata: { bufferBranch, priority, queueResult },
+      metadata: { bufferBranch, mergeResult },
     });
 
-    return { streamId, entryId, queueResult };
+    return { streamId, mergeResult };
   }
 
   // ── Stream inspection ──────────────────────────────────────
