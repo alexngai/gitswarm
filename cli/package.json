@@ -25,7 +25,8 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "better-sqlite3": "^11.7.0"
+    "better-sqlite3": "^11.7.0",
+    "git-cascade": "file:/tmp/git-cascade"
   },
   "devDependencies": {
     "vitest": "^1.2.0"

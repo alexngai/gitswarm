@@ -122,8 +122,14 @@ export class PermissionService {
     return { allowed: true, reason: 'no_branch_rule', permissions };
   }
 
-  /** Check whether consensus is reached for merging a patch. */
-  async checkConsensus(patchId, repoId) {
+  /**
+   * Check whether consensus is reached for merging a stream.
+   *
+   * Reviews are keyed by stream_id (v2 schema). The consensus algorithm
+   * remains identical: solo (owner must approve), guild (maintainer majority),
+   * open (karma-weighted community vote).
+   */
+  async checkConsensus(streamId, repoId) {
     const repo = await this.query(
       `SELECT consensus_threshold, min_reviews, ownership_model, human_review_weight
        FROM repos WHERE id = ?`,
@@ -139,8 +145,8 @@ export class PermissionService {
        FROM patch_reviews pr
        LEFT JOIN agents a ON pr.reviewer_id = a.id
        LEFT JOIN maintainers m ON m.repo_id = ? AND m.agent_id = pr.reviewer_id
-       WHERE pr.patch_id = ?`,
-      [repoId, patchId]
+       WHERE pr.stream_id = ?`,
+      [repoId, streamId]
     );
 
     const approvals  = reviews.rows.filter(r => r.verdict === 'approve');

@@ -78,8 +78,8 @@ export class TaskService {
     return r.rows[0] || null;
   }
 
-  /** Claim a task. */
-  async claim(taskId, agentId) {
+  /** Claim a task, optionally linking it to a git-cascade stream. */
+  async claim(taskId, agentId, streamId = null) {
     const task = await this.get(taskId);
     if (!task) throw new Error('Task not found');
     if (task.status !== 'open') throw new Error(`Cannot claim task with status: ${task.status}`);
@@ -91,8 +91,8 @@ export class TaskService {
     if (existing.rows.length > 0) throw new Error('You have already claimed this task');
 
     const result = await this.query(
-      `INSERT INTO task_claims (task_id, agent_id) VALUES (?, ?) RETURNING *`,
-      [taskId, agentId]
+      `INSERT INTO task_claims (task_id, agent_id, stream_id) VALUES (?, ?, ?) RETURNING *`,
+      [taskId, agentId, streamId]
     );
 
     await this.query(
@@ -105,7 +105,7 @@ export class TaskService {
 
   /** Submit work for a claimed task. */
   async submit(claimId, agentId, data) {
-    const { patch_id = null, notes = '' } = data;
+    const { stream_id = null, notes = '' } = data;
     const claim = await this.query(
       `SELECT * FROM task_claims WHERE id = ? AND agent_id = ?`, [claimId, agentId]
     );
@@ -113,9 +113,9 @@ export class TaskService {
     if (claim.rows[0].status !== 'active') throw new Error('Claim is not active');
 
     const result = await this.query(
-      `UPDATE task_claims SET status = 'submitted', patch_id = ?, submission_notes = ?, submitted_at = datetime('now')
+      `UPDATE task_claims SET status = 'submitted', stream_id = COALESCE(?, stream_id), submission_notes = ?, submitted_at = datetime('now')
        WHERE id = ? RETURNING *`,
-      [patch_id, notes, claimId]
+      [stream_id, notes, claimId]
     );
 
     await this.query(
@@ -190,5 +190,25 @@ export class TaskService {
       );
     }
     return { success: true };
+  }
+
+  /** Look up a claim by its linked stream. */
+  async getClaimByStream(streamId) {
+    const r = await this.query(
+      `SELECT c.*, t.title as task_title, t.priority, t.repo_id
+       FROM task_claims c
+       JOIN tasks t ON c.task_id = t.id
+       WHERE c.stream_id = ? AND c.status IN ('active', 'submitted')`,
+      [streamId]
+    );
+    return r.rows[0] || null;
+  }
+
+  /** Link an existing claim to a stream (when workspace is created after claim). */
+  async linkClaimToStream(claimId, streamId) {
+    await this.query(
+      `UPDATE task_claims SET stream_id = ? WHERE id = ?`,
+      [streamId, claimId]
+    );
   }
 }

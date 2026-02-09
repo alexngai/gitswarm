@@ -4,8 +4,13 @@
  * This mirrors the subset of the PostgreSQL schema required for local
  * multi-agent coordination.  The full web app schema adds GitHub-specific
  * tables, OAuth, WebSocket tracking, etc. that are not needed locally.
+ *
+ * v1: Base schema (agents, repos, patches, tasks, council, stages, activity)
+ * v2: git-cascade integration (stream_id refs, merge_mode, buffer fields, drop patches table)
  */
-export const schema = `
+
+/** v1 schema — initial tables. */
+export const schemaV1 = `
 -- ────────────────────────────────────────────────────────────────
 -- Core: agents
 -- ────────────────────────────────────────────────────────────────
@@ -83,7 +88,7 @@ CREATE TABLE IF NOT EXISTS branch_rules (
 );
 
 -- ────────────────────────────────────────────────────────────────
--- Patches & reviews (coordination)
+-- Patches & reviews (coordination) — v1 only, replaced by streams in v2
 -- ────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS patches (
@@ -258,3 +263,67 @@ CREATE INDEX IF NOT EXISTS idx_votes_proposal     ON council_votes(proposal_id);
 CREATE INDEX IF NOT EXISTS idx_activity_agent     ON activity_log(agent_id);
 CREATE INDEX IF NOT EXISTS idx_activity_type      ON activity_log(event_type);
 `;
+
+/**
+ * v2 migration — git-cascade integration.
+ *
+ * - Adds merge_mode and buffer fields to repos
+ * - Adds stream_id to patch_reviews (replacing patch_id as primary ref)
+ * - Adds stream_id to task_claims (replacing patch_id)
+ * - Drops patches table (streams replace patches)
+ */
+export const migrationV2 = `
+-- ── Schema version tracking ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS schema_version (
+  version INTEGER PRIMARY KEY,
+  applied_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ── Repos: add merge_mode and buffer fields ─────────────────────
+ALTER TABLE repos ADD COLUMN merge_mode TEXT DEFAULT 'review'
+  CHECK (merge_mode IN ('swarm','review','gated'));
+
+ALTER TABLE repos ADD COLUMN buffer_branch TEXT DEFAULT 'buffer';
+ALTER TABLE repos ADD COLUMN promote_target TEXT DEFAULT 'main';
+ALTER TABLE repos ADD COLUMN auto_promote_on_green INTEGER DEFAULT 0;
+ALTER TABLE repos ADD COLUMN auto_revert_on_red INTEGER DEFAULT 1;
+ALTER TABLE repos ADD COLUMN stabilize_command TEXT;
+
+-- ── patch_reviews: add stream_id, review_block_id ───────────────
+-- SQLite doesn't support DROP CONSTRAINT, so we recreate the table.
+CREATE TABLE IF NOT EXISTS patch_reviews_v2 (
+  id              TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  stream_id       TEXT,
+  review_block_id TEXT,
+  patch_id        TEXT,
+  reviewer_id     TEXT NOT NULL REFERENCES agents(id),
+  verdict         TEXT CHECK (verdict IN ('approve','request_changes','comment')),
+  feedback        TEXT,
+  tested          INTEGER DEFAULT 0,
+  is_human        INTEGER DEFAULT 0,
+  reviewed_at     TEXT DEFAULT (datetime('now')),
+  UNIQUE(stream_id, reviewer_id)
+);
+
+INSERT OR IGNORE INTO patch_reviews_v2 (id, patch_id, reviewer_id, verdict, feedback, tested, is_human, reviewed_at)
+  SELECT id, patch_id, reviewer_id, verdict, feedback, tested, is_human, reviewed_at FROM patch_reviews;
+
+DROP TABLE IF EXISTS patch_reviews;
+ALTER TABLE patch_reviews_v2 RENAME TO patch_reviews;
+
+-- ── task_claims: add stream_id ──────────────────────────────────
+ALTER TABLE task_claims ADD COLUMN stream_id TEXT;
+
+-- ── Indexes for new columns ─────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_reviews_stream ON patch_reviews(stream_id);
+CREATE INDEX IF NOT EXISTS idx_claims_stream ON task_claims(stream_id);
+
+-- ── Record migration ────────────────────────────────────────────
+INSERT INTO schema_version (version) VALUES (2);
+`;
+
+/** All migrations in order. */
+export const migrations = [
+  { version: 1, sql: schemaV1 },
+  { version: 2, sql: migrationV2 },
+];

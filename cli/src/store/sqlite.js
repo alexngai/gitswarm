@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-import { schema } from './schema.js';
+import { schemaV1, migrations } from './schema.js';
 
 /**
  * SQLite store with a PostgreSQL-compatible query interface.
@@ -20,9 +20,20 @@ export class SqliteStore {
     this.db.pragma('foreign_keys = ON');
   }
 
-  /** Run the full schema migration (idempotent). */
+  /**
+   * Run versioned migrations.
+   *
+   * Checks schema_version table (creates it if needed) and applies
+   * any migrations that haven't been run yet.  For fresh databases
+   * this runs all migrations in order.
+   */
   migrate() {
-    this.db.exec(schema);
+    const currentVersion = this._getCurrentVersion();
+
+    for (const { version, sql } of migrations) {
+      if (version <= currentVersion) continue;
+      this.db.exec(sql);
+    }
   }
 
   /**
@@ -62,6 +73,22 @@ export class SqliteStore {
   }
 
   // ── internal helpers ──────────────────────────────────────────
+
+  /**
+   * Get the current schema version from the database.
+   * Returns 0 if schema_version table doesn't exist yet.
+   */
+  _getCurrentVersion() {
+    try {
+      const row = this.db
+        .prepare(`SELECT MAX(version) as v FROM schema_version`)
+        .get();
+      return row?.v || 0;
+    } catch {
+      // Table doesn't exist yet — fresh database
+      return 0;
+    }
+  }
 
   /**
    * Translate PostgreSQL dialect to SQLite dialect:

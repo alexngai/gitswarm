@@ -2,10 +2,15 @@
  * Council governance for local federation.
  *
  * Proposals, voting, and council lifecycle — all database-agnostic.
+ *
+ * v2 adds git-cascade proposal types: merge_stream, revert_stream,
+ * reorder_queue, promote. These delegate to Federation for execution.
  */
 export class CouncilService {
   constructor(store) {
     this.query = store.query.bind(store);
+    // Set by Federation after construction so council can delegate git ops
+    this.federation = null;
   }
 
   // ── Council lifecycle ────────────────────────────────────
@@ -122,7 +127,10 @@ export class CouncilService {
     const council = await this.query(`SELECT * FROM repo_councils WHERE id = ?`, [councilId]);
     if (council.rows.length === 0) throw new Error('Council not found');
 
-    const critical = ['change_ownership', 'change_settings', 'remove_maintainer'];
+    const critical = [
+      'change_ownership', 'change_settings', 'remove_maintainer',
+      'revert_stream', 'promote'
+    ];
     const quorum = critical.includes(proposal_type)
       ? council.rows[0].critical_quorum
       : council.rows[0].standard_quorum;
@@ -300,6 +308,97 @@ export class CouncilService {
 
       case 'change_settings':
         // Generic repo settings update via action_data.settings
+        if (data.settings) {
+          for (const [key, value] of Object.entries(data.settings)) {
+            const safeKeys = ['merge_mode', 'ownership_model', 'consensus_threshold',
+              'min_reviews', 'agent_access', 'min_karma', 'auto_promote_on_green',
+              'auto_revert_on_red', 'stabilize_command'];
+            if (safeKeys.includes(key)) {
+              await this.query(`UPDATE repos SET ${key} = ? WHERE id = ?`, [value, repoId]);
+            }
+          }
+          result = { executed: true, action: 'change_settings', settings: data.settings };
+        }
+        break;
+
+      // ── git-cascade proposal types ─────────────────────
+
+      case 'merge_stream':
+        if (this.federation) {
+          try {
+            const mergeResult = await this.federation.mergeToBuffer(data.stream_id, data.agent_id || 'council');
+            result = { executed: true, action: 'merge_stream', stream_id: data.stream_id, mergeResult };
+          } catch (err) {
+            result = { executed: false, action: 'merge_stream', error: err.message };
+          }
+        } else {
+          result = { executed: false, reason: 'no_federation_ref' };
+        }
+        break;
+
+      case 'revert_stream':
+        if (this.federation && this.federation.tracker) {
+          try {
+            // Find the merge operation for this stream and roll it back
+            const ops = this.federation.tracker.getOperations({ streamId: data.stream_id });
+            const mergeOp = ops.find(op => op.opType === 'merge');
+            if (mergeOp) {
+              this.federation.tracker.rollbackToOperation({
+                operationId: mergeOp.id,
+                streamId: data.stream_id,
+                agentId: 'council',
+                worktree: this.federation.repoPath
+              });
+              result = { executed: true, action: 'revert_stream', stream_id: data.stream_id };
+            } else {
+              result = { executed: false, reason: 'no_merge_operation_found' };
+            }
+          } catch (err) {
+            result = { executed: false, action: 'revert_stream', error: err.message };
+          }
+        } else {
+          result = { executed: false, reason: 'no_federation_ref' };
+        }
+        break;
+
+      case 'reorder_queue':
+        if (this.federation && this.federation.tracker) {
+          try {
+            // Update merge queue priority for a stream
+            const entries = this.federation.tracker.getMergeQueue({ status: 'pending' });
+            const entry = entries.find(e => e.streamId === data.stream_id);
+            if (entry) {
+              // Remove and re-add with new priority
+              this.federation.tracker.cancelMergeQueueEntry(entry.id);
+              this.federation.tracker.addToMergeQueue({
+                streamId: data.stream_id,
+                targetBranch: entry.targetBranch,
+                priority: data.priority || 0,
+                agentId: 'council'
+              });
+              result = { executed: true, action: 'reorder_queue', stream_id: data.stream_id, priority: data.priority };
+            } else {
+              result = { executed: false, reason: 'stream_not_in_queue' };
+            }
+          } catch (err) {
+            result = { executed: false, action: 'reorder_queue', error: err.message };
+          }
+        } else {
+          result = { executed: false, reason: 'no_federation_ref' };
+        }
+        break;
+
+      case 'promote':
+        if (this.federation) {
+          try {
+            const promoteResult = await this.federation.promote({ tag: data.tag });
+            result = { executed: true, action: 'promote', ...promoteResult };
+          } catch (err) {
+            result = { executed: false, action: 'promote', error: err.message };
+          }
+        } else {
+          result = { executed: false, reason: 'no_federation_ref' };
+        }
         break;
     }
 

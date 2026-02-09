@@ -2,6 +2,9 @@
  * Repository lifecycle stage progression.
  *
  * seed → growth → established → mature
+ *
+ * In v2, metrics are derived from git-cascade streams (merged stream count,
+ * unique agent authors) rather than the deprecated patches table.
  */
 export class StageService {
   constructor(store) {
@@ -77,20 +80,53 @@ export class StageService {
     return { success: true, previous_stage: elig.current_stage, new_stage: elig.next_stage, metrics: elig.metrics };
   }
 
-  async updateMetrics(repoId) {
-    const contributors = await this.query(
-      `SELECT COUNT(DISTINCT author_id) as c FROM patches WHERE repo_id = ? AND status = 'merged'`,
-      [repoId]
-    );
-    const patches = await this.query(
-      `SELECT COUNT(*) as c FROM patches WHERE repo_id = ? AND status = 'merged'`,
-      [repoId]
-    );
+  /**
+   * Update repo metrics from git-cascade streams.
+   *
+   * Counts merged streams (gc_streams where status = 'merged') and unique
+   * agent authors. Falls back to counting from the patches table if
+   * gc_streams doesn't exist yet (pre-v2 databases).
+   */
+  async updateMetrics(repoId, tracker = null) {
+    let contributorCount = 0;
+    let streamCount = 0;
+
+    if (tracker) {
+      // Use git-cascade streams for metrics
+      try {
+        const allStreams = tracker.listStreams({ status: 'merged' });
+        streamCount = allStreams.length;
+        const uniqueAgents = new Set(allStreams.map(s => s.agentId));
+        contributorCount = uniqueAgents.size;
+      } catch {
+        // git-cascade tables may not exist yet
+        contributorCount = 0;
+        streamCount = 0;
+      }
+    } else {
+      // Fallback: count from patches table (v1 compat)
+      try {
+        const contributors = await this.query(
+          `SELECT COUNT(DISTINCT author_id) as c FROM patches WHERE repo_id = ? AND status = 'merged'`,
+          [repoId]
+        );
+        const patches = await this.query(
+          `SELECT COUNT(*) as c FROM patches WHERE repo_id = ? AND status = 'merged'`,
+          [repoId]
+        );
+        contributorCount = parseInt(contributors.rows[0].c);
+        streamCount = parseInt(patches.rows[0].c);
+      } catch {
+        contributorCount = 0;
+        streamCount = 0;
+      }
+    }
+
     await this.query(
       `UPDATE repos SET contributor_count = ?, patch_count = ?, updated_at = datetime('now') WHERE id = ?`,
-      [parseInt(contributors.rows[0].c), parseInt(patches.rows[0].c), repoId]
+      [contributorCount, streamCount, repoId]
     );
-    return { contributor_count: parseInt(contributors.rows[0].c), patch_count: parseInt(patches.rows[0].c) };
+    return { contributor_count: contributorCount, patch_count: streamCount };
   }
 
   async getHistory(repoId) {
