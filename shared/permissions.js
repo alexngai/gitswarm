@@ -192,7 +192,7 @@ export class PermissionService {
 
     const approvals  = reviews.rows.filter(r => r.verdict === 'approve');
     const rejections = reviews.rows.filter(r =>
-      r.verdict === 'reject' || r.verdict === 'request_changes'
+      r.verdict === 'request_changes'
     );
 
     // Check minimum reviews

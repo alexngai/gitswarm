@@ -8,6 +8,7 @@ import { query } from '../../config/database.js';
 import { authenticate } from '../../middleware/authenticate.js';
 import { createRateLimiter } from '../../middleware/rateLimit.js';
 import { GitSwarmPermissionService } from '../../services/gitswarm-permissions.js';
+import { normalizeKeys } from '../../../shared/field-normalize.js';
 
 const permissionService = new GitSwarmPermissionService();
 
@@ -238,7 +239,12 @@ export async function syncRoutes(app, options = {}) {
 
 // ── Event Processors ──────────────────────────────────────────
 
-async function processSyncEvent(type, data, agentId, { activityService, pluginEngine }) {
+async function processSyncEvent(type, rawData, agentId, { activityService, pluginEngine }) {
+  // Normalize all field names to snake_case at the boundary.
+  // This eliminates scattered fallback patterns (e.g., data.baseBranch || data.base_branch)
+  // throughout individual event handlers.
+  const data = normalizeKeys(rawData);
+
   switch (type) {
     case 'stream_created':
       await query(`
@@ -248,22 +254,22 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
           name = COALESCE(EXCLUDED.name, gitswarm_streams.name),
           branch = COALESCE(EXCLUDED.branch, gitswarm_streams.branch),
           updated_at = NOW()
-      `, [data.streamId || data.id, data.repoId, data.agent_id || agentId,
-          data.name, data.branch, data.baseBranch || data.base_branch, data.parentStreamId || data.parent_stream_id]);
+      `, [data.stream_id || data.id, data.repo_id, data.agent_id || agentId,
+          data.name, data.branch, data.base_branch, data.parent_stream_id]);
       break;
 
     case 'commit':
       await query(`
         INSERT INTO gitswarm_stream_commits (stream_id, agent_id, commit_hash, change_id, message)
         VALUES ($1, $2, $3, $4, $5)
-      `, [data.streamId, agentId, data.commitHash || data.commit_hash, data.changeId || data.change_id, data.message]);
+      `, [data.stream_id, agentId, data.commit_hash, data.change_id, data.message]);
       break;
 
     case 'submit_review':
       await query(`
         UPDATE gitswarm_streams SET status = 'in_review', review_status = 'in_review', updated_at = NOW()
         WHERE id = $1
-      `, [data.streamId]);
+      `, [data.stream_id]);
       break;
 
     case 'review':
@@ -272,7 +278,7 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
         VALUES ($1, $2, $3, $4, false, $5)
         ON CONFLICT (stream_id, reviewer_id) DO UPDATE SET
           verdict = $3, feedback = $4, tested = $5, reviewed_at = NOW()
-      `, [data.streamId, agentId, data.verdict, data.feedback, data.tested || false]);
+      `, [data.stream_id, agentId, data.verdict, data.feedback, data.tested || false]);
       break;
 
     case 'merge':
@@ -280,32 +286,31 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
       await query(`
         INSERT INTO gitswarm_merges (repo_id, stream_id, agent_id, merge_commit, target_branch)
         VALUES ($1, $2, $3, $4, $5)
-      `, [data.repoId, data.streamId, agentId,
-          data.mergeCommit || data.merge_commit, data.targetBranch || data.target_branch]);
+      `, [data.repo_id, data.stream_id, agentId, data.merge_commit, data.target_branch]);
       await query(`
         UPDATE gitswarm_streams SET status = 'merged', review_status = 'approved', updated_at = NOW()
         WHERE id = $1
-      `, [data.streamId]);
+      `, [data.stream_id]);
       break;
 
     case 'stream_abandoned':
       await query(`
         UPDATE gitswarm_streams SET status = 'abandoned', updated_at = NOW()
         WHERE id = $1
-      `, [data.streamId]);
+      `, [data.stream_id]);
       break;
 
     case 'stabilize': {
       await query(`
         INSERT INTO gitswarm_stabilizations (repo_id, result, tag, buffer_commit, breaking_stream_id, details)
         VALUES ($1, $2, $3, $4, $5, $6)
-      `, [data.repoId, data.result, data.tag, data.bufferCommit || data.buffer_commit,
-          data.breakingStreamId || data.breaking_stream_id, JSON.stringify(data.details || {})]);
+      `, [data.repo_id, data.result, data.tag, data.buffer_commit,
+          data.breaking_stream_id, JSON.stringify(data.details || {})]);
 
       // Fire plugin engine for stabilization events
       if (pluginEngine) {
         const eventType = data.result === 'green' ? 'stabilization_passed' : 'stabilization_failed';
-        pluginEngine.processGitswarmEvent(data.repoId, eventType, data)
+        pluginEngine.processGitswarmEvent(data.repo_id, eventType, data)
           .catch(err => console.error(`Plugin event ${eventType} failed:`, err.message));
       }
       break;
@@ -315,8 +320,7 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
       await query(`
         INSERT INTO gitswarm_promotions (repo_id, from_commit, to_commit, triggered_by, agent_id)
         VALUES ($1, $2, $3, $4, $5)
-      `, [data.repoId, data.fromCommit || data.from_commit,
-          data.toCommit || data.to_commit, data.triggeredBy || data.triggered_by || 'manual', agentId]);
+      `, [data.repo_id, data.from_commit, data.to_commit, data.triggered_by || 'manual', agentId]);
       break;
 
     case 'council_proposal':
@@ -327,7 +331,7 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
           $2, $3, $4, $5, $6
         )
         ON CONFLICT DO NOTHING
-      `, [data.repoId, data.proposal?.title, data.proposal?.description,
+      `, [data.repo_id, data.proposal?.title, data.proposal?.description,
           data.proposal?.proposal_type, data.proposal?.proposed_by || agentId,
           JSON.stringify(data.proposal?.action_data || {})]);
       break;
@@ -337,18 +341,18 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
         INSERT INTO gitswarm_council_votes (proposal_id, agent_id, vote, comment)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (proposal_id, agent_id) DO UPDATE SET vote = $3, comment = $4
-      `, [data.proposalId, data.agent_id || agentId, data.vote, data.comment]);
+      `, [data.proposal_id, data.agent_id || agentId, data.vote, data.comment]);
       break;
 
     case 'stage_progression':
       await query(`
         INSERT INTO gitswarm_stage_history (repo_id, from_stage, to_stage, contributor_count, patch_count, maintainer_count)
         VALUES ($1, $2, $3, $4, $5, $6)
-      `, [data.repoId, data.fromStage || data.from_stage, data.toStage || data.to_stage,
+      `, [data.repo_id, data.from_stage, data.to_stage,
           data.metrics?.contributor_count, data.metrics?.patch_count, data.metrics?.maintainer_count]);
       await query(`
         UPDATE gitswarm_repos SET stage = $2, updated_at = NOW() WHERE id = $1
-      `, [data.repoId, data.toStage || data.to_stage]);
+      `, [data.repo_id, data.to_stage]);
       break;
 
     case 'task_claim':
@@ -356,14 +360,14 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
         INSERT INTO gitswarm_task_claims (task_id, agent_id, stream_id, status)
         VALUES ($1, $2, $3, 'active')
         ON CONFLICT (task_id, agent_id) DO NOTHING
-      `, [data.taskId || data.task_id, agentId, data.streamId || data.stream_id || null]);
+      `, [data.task_id, agentId, data.stream_id || null]);
       break;
 
     case 'task_submission':
       await query(`
         UPDATE gitswarm_task_claims SET status = 'submitted', submission_notes = $2, submitted_at = NOW()
         WHERE task_id = $1 AND agent_id = $3
-      `, [data.taskId || data.task_id, data.notes || data.submission_notes, agentId]);
+      `, [data.task_id, data.notes || data.submission_notes, agentId]);
       break;
 
     default:
@@ -376,7 +380,7 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
       agent_id: agentId,
       event_type: `sync_${type}`,
       target_type: 'sync',
-      target_id: data.streamId || data.repoId || '',
+      target_id: data.stream_id || data.repo_id || '',
       metadata: { source: 'cli_sync', event_type: type },
     }).catch(() => {});
   }
