@@ -21,9 +21,9 @@ export async function gitswarmRoutes(app, options = {}) {
   // Register sub-routes
   await app.register(installRoutes, { activityService });
   await app.register(packageRoutes, { activityService });
-  await app.register(councilRoutes, { activityService });
+  await app.register(councilRoutes, { activityService, pluginEngine });
   await app.register(bountyRoutes, { activityService });
-  await app.register(streamRoutes, { activityService });
+  await app.register(streamRoutes, { activityService, pluginEngine });
   await app.register(fileRoutes, { activityService });
   await app.register(pluginRoutes, { activityService, pluginEngine, configSyncService });
 

@@ -1133,7 +1133,11 @@ export class PluginEngine {
       : conclusion === 'cancelled' ? 'cancelled'
       : 'failed';
 
-    const result = await this.db.query(`
+    // Step 1: Try exact match on workflow_file (most precise).
+    // workflow_run.name from the webhook maps to the YAML `name:` field,
+    // while workflow_file stores the filename (e.g., gitswarm-issue-triage.yml).
+    // Also try matching the workflow path which GitHub sometimes sends.
+    let result = await this.db.query(`
       UPDATE gitswarm_plugin_executions SET
         status = $3,
         completed_at = NOW()
@@ -1141,14 +1145,45 @@ export class PluginEngine {
         SELECT e.id FROM gitswarm_plugin_executions e
         JOIN gitswarm_repo_plugins p ON e.plugin_id = p.id
         WHERE e.repo_id = $1 AND e.status = 'dispatched'
-          AND (p.workflow_file ILIKE $2 OR p.dispatch_target ILIKE $2)
+          AND p.workflow_file IS NOT NULL
+          AND p.workflow_file = $2
           AND e.started_at > NOW() - INTERVAL '30 minutes'
         ORDER BY e.started_at DESC LIMIT 1
       )
       RETURNING id
-    `, [repoId, `%${workflowName}%`, status]);
+    `, [repoId, workflowName, status]);
 
-    return result.rows[0]?.id || null;
+    if (result.rows.length > 0) return result.rows[0].id;
+
+    // Step 2: Fall back to dispatch_target match for plugins without workflow_file.
+    // Normalize names: "GitSwarm Issue Triage" → "issue-triage",
+    // then match against dispatch_target "gitswarm.plugin.issue-triage".
+    const normalized = workflowName
+      .replace(/^gitswarm\s*/i, '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '-');
+
+    if (normalized) {
+      result = await this.db.query(`
+        UPDATE gitswarm_plugin_executions SET
+          status = $3,
+          completed_at = NOW()
+        WHERE id = (
+          SELECT e.id FROM gitswarm_plugin_executions e
+          JOIN gitswarm_repo_plugins p ON e.plugin_id = p.id
+          WHERE e.repo_id = $1 AND e.status = 'dispatched'
+            AND p.dispatch_target = $2
+            AND e.started_at > NOW() - INTERVAL '30 minutes'
+          ORDER BY e.started_at DESC LIMIT 1
+        )
+        RETURNING id
+      `, [repoId, `gitswarm.plugin.${normalized}`, status]);
+
+      if (result.rows.length > 0) return result.rows[0].id;
+    }
+
+    return null;
   }
 
   /**

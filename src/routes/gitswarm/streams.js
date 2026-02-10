@@ -8,10 +8,19 @@ const permissionService = new GitSwarmPermissionService();
 const stageService = new StageProgressionService();
 
 export async function streamRoutes(app, options = {}) {
-  const { activityService } = options;
+  const { activityService, pluginEngine } = options;
 
   const rateLimitRead = createRateLimiter('gitswarm_read');
   const rateLimitWrite = createRateLimiter('gitswarm_write');
+
+  /**
+   * Emit a gitswarm event through the plugin engine (fire-and-forget).
+   */
+  function emitGitswarmEvent(repoId, eventType, payload) {
+    if (!pluginEngine) return;
+    pluginEngine.processGitswarmEvent(repoId, eventType, payload)
+      .catch(err => console.error(`Gitswarm event ${eventType} failed:`, err.message));
+  }
 
   // ============================================================
   // Stream CRUD
@@ -595,6 +604,22 @@ export async function streamRoutes(app, options = {}) {
         target_type: 'repo',
         target_id: repoId,
         metadata: { result: stabResult, tag, breaking_stream_id },
+      });
+    }
+
+    // Emit gitswarm stabilization events
+    const eventPayload = {
+      tag,
+      buffer_commit,
+      details,
+    };
+
+    if (stabResult === 'green') {
+      emitGitswarmEvent(repoId, 'stabilization_passed', eventPayload);
+    } else if (stabResult === 'red') {
+      emitGitswarmEvent(repoId, 'stabilization_failed', {
+        ...eventPayload,
+        breaking_stream_id,
       });
     }
 

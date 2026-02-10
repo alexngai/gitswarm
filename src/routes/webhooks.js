@@ -1220,12 +1220,23 @@ async function checkAndEmitConsensus(repoId, streamId, prNumber, branchName) {
         });
       }
     } else if (rejections > 0 && rejections >= total * (1 - threshold)) {
-      emitGitswarmEvent(repoId, 'consensus_blocked', {
-        stream_id: streamId,
-        pr_number: prNumber,
-        stream_name: branchName,
-        consensus: { achieved: ratio, approvals, rejections, threshold },
-      });
+      // Guard: only emit consensus_blocked once per stream per hour
+      const blockedAlreadyEmitted = await query(`
+        SELECT id FROM gitswarm_plugin_executions
+        WHERE repo_id = $1 AND trigger_event = 'gitswarm.consensus_blocked'
+          AND trigger_payload::text LIKE $2
+          AND created_at > NOW() - INTERVAL '1 hour'
+        LIMIT 1
+      `, [repoId, `%${streamId}%`]);
+
+      if (blockedAlreadyEmitted.rows.length === 0) {
+        emitGitswarmEvent(repoId, 'consensus_blocked', {
+          stream_id: streamId,
+          pr_number: prNumber,
+          stream_name: branchName,
+          consensus: { achieved: ratio, approvals, rejections, threshold },
+        });
+      }
     }
   } catch (err) {
     console.error('checkAndEmitConsensus failed:', err.message);
