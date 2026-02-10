@@ -26,6 +26,8 @@ import { CouncilService } from './core/council.js';
 import { StageService } from './core/stages.js';
 import { ActivityService } from './core/activity.js';
 import { SyncClient } from './sync-client.js';
+import { generateId } from '../../shared/ids.js';
+import { BUILTIN_PLUGINS } from './plugins/builtins.js';
 
 const GITSWARM_DIR = '.gitswarm';
 const DB_FILE = 'federation.db';
@@ -82,6 +84,39 @@ export class Federation {
     const online = await this.sync.ping();
     let flushed = 0;
     if (online) {
+      // Mark repo as server-authoritative for consensus (split-brain prevention)
+      const repo = await this.repo();
+      if (repo && repo.consensus_authority !== 'server') {
+        await this.store.query(
+          `UPDATE repos SET consensus_authority = 'server' WHERE id = ?`,
+          [repo.id]
+        );
+      }
+
+      // Register repo with server if not already registered
+      if (repo && !repo.org_id) {
+        try {
+          const result = await this.sync.registerRepo({
+            name: repo.name,
+            description: repo.description,
+            ownershipModel: repo.ownership_model,
+            mergeMode: repo.merge_mode,
+            consensusThreshold: repo.consensus_threshold,
+            minReviews: repo.min_reviews,
+            bufferBranch: repo.buffer_branch,
+            promoteTarget: repo.promote_target,
+          });
+          if (result?.org_id) {
+            await this.store.query(
+              `UPDATE repos SET org_id = ? WHERE id = ?`,
+              [result.org_id, repo.id]
+            );
+          }
+        } catch {
+          // Non-fatal: repo registration can be retried
+        }
+      }
+
       try {
         const result = await this.sync.flushQueue();
         flushed = result.flushed;
@@ -348,6 +383,19 @@ export class Federation {
       }
     }
 
+    // Dual-write: record stream in policy-level streams table
+    const branchForStream = tracker.getStreamBranchName(streamId);
+    try {
+      await this.store.query(
+        `INSERT OR IGNORE INTO streams (id, repo_id, agent_id, name, branch, base_branch, parent_stream_id, task_id, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'cli')`,
+        [streamId, repo.id, agentId, streamName, branchForStream,
+         repo.buffer_branch || 'buffer', dependsOn || null, taskId || null]
+      );
+    } catch {
+      // streams table may not exist in older schemas — non-fatal
+    }
+
     await this.activity.log({
       agent_id: agentId,
       event_type: 'workspace_created',
@@ -533,6 +581,14 @@ export class Federation {
       metadata: { ...stream.metadata, review_status: 'in_review' },
     });
 
+    // Update policy-level streams table
+    try {
+      await this.store.query(
+        `UPDATE streams SET status = 'in_review', review_status = 'in_review', updated_at = datetime('now') WHERE id = ?`,
+        [streamId]
+      );
+    } catch { /* streams table may not exist */ }
+
     await this.activity.log({
       agent_id: agentId,
       event_type: 'submit_for_review',
@@ -677,14 +733,21 @@ export class Federation {
     if (mode === 'review' || mode === 'gated') {
       // Check consensus — use server as authority when connected (Mode B)
       let consensus;
-      if (this.sync) {
+      if (repo.consensus_authority === 'server' && this.sync) {
         try {
           consensus = await this.sync.checkConsensus(repo.id, streamId);
         } catch {
-          // Server unreachable — fall back to local consensus
-          consensus = await this.permissions.checkConsensus(streamId, repo.id);
+          // Server unreachable — don't fall back to local consensus.
+          // Queue the merge request instead of risking split-brain.
+          this.sync._queueEvent({ type: 'merge_requested', data: {
+            repoId: repo.id, streamId,
+          }});
+          throw new Error(
+            'Server unavailable for consensus check. Merge queued for when connectivity returns.'
+          );
         }
       } else {
+        // Mode A (local-only) or not yet connected to server
         consensus = await this.permissions.checkConsensus(streamId, repo.id);
       }
       if (!consensus.reached) {
@@ -704,8 +767,14 @@ export class Federation {
       throw new Error(`Merge failed: ${err.message}`);
     }
 
-    // Mark stream as merged in git-cascade
+    // Mark stream as merged in git-cascade and policy table
     tracker.updateStream(streamId, { status: 'merged' });
+    try {
+      await this.store.query(
+        `UPDATE streams SET status = 'merged', review_status = 'approved', updated_at = datetime('now') WHERE id = ?`,
+        [streamId]
+      );
+    } catch { /* streams table may not exist */ }
     const mergeResult = { success: true, newHead: _git(this.repoPath, 'git rev-parse HEAD') };
 
     // Update stage metrics after merge
@@ -827,8 +896,20 @@ export class Federation {
         // Tag creation may fail if buffer doesn't exist
       }
 
+      // Fire builtin plugins for stabilization_passed
       let promoted = false;
-      if (repo.auto_promote_on_green) {
+      try {
+        await this._fireBuiltinPlugins('stabilization_passed', repo, {
+          tag: tagName, bufferBranch, passed: true,
+        });
+        // Check if auto-promote plugin already handled promotion
+        promoted = repo.auto_promote_on_green || false;
+      } catch {
+        // Plugin execution non-fatal
+      }
+
+      // Fallback: promote directly if auto_promote_on_green and plugin didn't run
+      if (repo.auto_promote_on_green && !promoted) {
         try {
           const result = await this.promote({ tag: tagName });
           promoted = result.success;
@@ -863,6 +944,13 @@ export class Federation {
 
     // Red: find breaking merge and optionally revert
     const result = { success: false, status: 'red', output: testOutput.slice(0, 2000) };
+
+    // Fire builtin plugins for stabilization_failed
+    try {
+      await this._fireBuiltinPlugins('stabilization_failed', repo, {
+        bufferBranch, passed: false, output: testOutput.slice(0, 500),
+      });
+    } catch { /* plugin execution non-fatal */ }
 
     if (repo.auto_revert_on_red) {
       try {
@@ -998,6 +1086,112 @@ export class Federation {
     if (status) { sql += ` AND p.status = ?`; params.push(status); }
     sql += ` ORDER BY p.created_at DESC`;
     return (await this.store.query(sql, params)).rows;
+  }
+
+  // ── Council sync helpers ────────────────────────────────────
+
+  /**
+   * Create a council proposal with Mode B sync.
+   */
+  async createProposal(repoId, proposal, agentId) {
+    const result = await this.council.createProposal(repoId, proposal, agentId);
+
+    if (this.sync) {
+      try {
+        await this.sync.syncCouncilProposal(repoId, { ...proposal, id: result?.id, proposed_by: agentId });
+      } catch {
+        this.sync._queueEvent({ type: 'council_proposal', data: {
+          repoId, proposal: { ...proposal, id: result?.id, proposed_by: agentId },
+        }});
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Cast a council vote with Mode B sync.
+   */
+  async castVote(repoId, proposalId, agentId, vote, comment = '') {
+    const result = await this.council.castVote(proposalId, agentId, vote, comment);
+
+    if (this.sync) {
+      try {
+        await this.sync.syncCouncilVote(repoId, proposalId, { agent_id: agentId, vote, comment });
+      } catch {
+        this.sync._queueEvent({ type: 'council_vote', data: {
+          repoId, proposalId, agent_id: agentId, vote, comment,
+        }});
+      }
+    }
+    return result;
+  }
+
+  // ── Stage sync helper ─────────────────────────────────────
+
+  /**
+   * Progress repo stage with Mode B sync.
+   */
+  async progressStage(repoId, fromStage, toStage, metrics = {}) {
+    const result = await this.stages.progressStage(repoId, fromStage, toStage, metrics);
+
+    if (this.sync) {
+      try {
+        await this.sync.syncStageProgression(repoId, { fromStage, toStage, metrics });
+      } catch {
+        this.sync._queueEvent({ type: 'stage_progression', data: {
+          repoId, fromStage, toStage, metrics,
+        }});
+      }
+    }
+    return result;
+  }
+
+  // ── Builtin plugin runner (Tier 1 only) ────────────────────
+
+  /**
+   * Fire builtin plugins for a given trigger event.
+   * Only handles Tier 1 (deterministic automations) locally.
+   * Tier 2 (AI) and Tier 3 (governance) are server-only.
+   */
+  async _fireBuiltinPlugins(trigger, repo, eventData) {
+    for (const [name, plugin] of Object.entries(BUILTIN_PLUGINS)) {
+      if (plugin.trigger === trigger) {
+        try {
+          await plugin.execute(this, repo, eventData);
+        } catch (err) {
+          // Log but don't throw — plugins are non-fatal
+          await this.activity.log({
+            event_type: 'plugin_error',
+            target_type: 'repo',
+            target_id: repo.id,
+            metadata: { plugin: name, trigger, error: err.message },
+          });
+        }
+      }
+    }
+  }
+
+  // ── Server updates polling ─────────────────────────────────
+
+  /**
+   * Poll the server for updates relevant to this agent.
+   * Returns task assignments, access changes, etc.
+   */
+  async pollUpdates() {
+    if (!this.sync) return null;
+    try {
+      const cfg = this.config();
+      const since = cfg._lastPoll || new Date(0).toISOString();
+      const updates = await this.sync.pollUpdates(since);
+
+      // Persist poll timestamp
+      cfg._lastPoll = new Date().toISOString();
+      writeFileSync(join(this.swarmDir, CONFIG_FILE), JSON.stringify(cfg, null, 2));
+
+      return updates;
+    } catch {
+      return null;
+    }
   }
 
   close() {

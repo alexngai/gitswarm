@@ -413,21 +413,21 @@ describe('E2E: stage progression', () => {
     const repo = await federation.repo();
 
     // Seed stage initially
-    const initial = await federation.stages.getMetrics(repo.id);
+    const initial = await federation.stages.getStageMetrics(repo.id);
     expect(initial.current_stage).toBe('seed');
 
     // Check eligibility — should not be eligible yet
-    const elig = await federation.stages.checkEligibility(repo.id);
+    const elig = await federation.stages.checkAdvancementEligibility(repo.id);
     expect(elig.eligible).toBe(false);
     expect(elig.next_stage).toBe('growth');
 
     // Force advance to growth
-    const advance = await federation.stages.advance(repo.id, true);
+    const advance = await federation.stages.advanceStage(repo.id, true);
     expect(advance.success).toBe(true);
     expect(advance.new_stage).toBe('growth');
 
     // Verify history
-    const history = await federation.stages.getHistory(repo.id);
+    const history = await federation.stages.getStageHistory(repo.id);
     expect(history).toHaveLength(1);
     expect(history[0].from_stage).toBe('seed');
     expect(history[0].to_stage).toBe('growth');

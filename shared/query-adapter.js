@@ -38,7 +38,7 @@ export const CLI_TABLES = {
   maintainers: 'maintainers',
   branch_rules: 'branch_rules',
   stream_reviews: 'patch_reviews',
-  streams: 'gc_streams',
+  streams: 'streams',            // policy-level streams table (v4+)
   stream_commits: 'gc_changes',
   stage_history: 'stage_history',
   repo_councils: 'repo_councils',
@@ -52,13 +52,26 @@ export const CLI_TABLES = {
 /**
  * Create a SQLite query adapter that converts $N params to ? placeholders.
  *
+ * PostgreSQL $N placeholders reference params by index ($1 = params[0]),
+ * but they can appear in any order in the SQL. SQLite ? placeholders bind
+ * sequentially, so we must reorder params to match appearance order.
+ *
  * @param {object} store - Object with .query(sql, params) method
  * @returns {function} Async query function compatible with shared services
  */
 export function createSqliteAdapter(store) {
   return async function query(sql, params = []) {
-    const sqliteSQL = sql.replace(/\$\d+/g, '?');
-    return store.query(sqliteSQL, params);
+    // Collect $N placeholders in order of appearance
+    const indices = [];
+    const sqliteSQL = sql.replace(/\$(\d+)/g, (_, n) => {
+      indices.push(parseInt(n, 10) - 1); // $1 → index 0
+      return '?';
+    });
+    // Reorder params to match appearance order
+    const reordered = indices.length > 0
+      ? indices.map(i => params[i])
+      : params;
+    return store.query(sqliteSQL, reordered);
   };
 }
 

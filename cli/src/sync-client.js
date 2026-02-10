@@ -223,6 +223,78 @@ export class SyncClient {
     return this._get(path);
   }
 
+  // ── Repo Registration (Mode B first-connect) ───────────────
+
+  /**
+   * Register a CLI repo with the server.
+   * Server creates a personal org if needed and assigns the repo to it.
+   */
+  async registerRepo(repo) {
+    return this._post('/gitswarm/repos/register', {
+      name: repo.name,
+      description: repo.description,
+      ownership_model: repo.ownershipModel,
+      merge_mode: repo.mergeMode,
+      consensus_threshold: repo.consensusThreshold,
+      min_reviews: repo.minReviews,
+      buffer_branch: repo.bufferBranch,
+      promote_target: repo.promoteTarget,
+    });
+  }
+
+  /**
+   * Fetch server config for a repo (server-owned settings).
+   */
+  async getRepoConfig(repoId) {
+    return this._get(`/gitswarm/repos/${repoId}/config`);
+  }
+
+  // ── Council Sync ──────────────────────────────────────────
+
+  async syncCouncilProposal(repoId, proposal) {
+    return this._post(`/gitswarm/repos/${repoId}/council/proposals`, proposal);
+  }
+
+  async syncCouncilVote(repoId, proposalId, vote) {
+    return this._post(`/gitswarm/repos/${repoId}/council/proposals/${proposalId}/votes`, vote);
+  }
+
+  // ── Stage Sync ────────────────────────────────────────────
+
+  async syncStageProgression(repoId, { fromStage, toStage, metrics }) {
+    return this._post(`/gitswarm/repos/${repoId}/stage`, {
+      from_stage: fromStage,
+      to_stage: toStage,
+      metrics,
+    });
+  }
+
+  // ── Task Sync ─────────────────────────────────────────────
+
+  async syncTaskSubmission(taskId, { streamId, notes }) {
+    return this._post(`/gitswarm/tasks/${taskId}/submit`, {
+      agent_id: this.agentId,
+      stream_id: streamId,
+      submission_notes: notes,
+    });
+  }
+
+  // ── Plugin Queries ────────────────────────────────────────
+
+  async getPluginExecutions(repoId, { limit = 10 } = {}) {
+    return this._get(`/gitswarm/repos/${repoId}/plugins/executions?limit=${limit}`);
+  }
+
+  // ── Server Updates Polling ────────────────────────────────
+
+  /**
+   * Poll for updates relevant to this agent since a given timestamp.
+   * Returns task assignments, access changes, council proposals, etc.
+   */
+  async pollUpdates(since) {
+    return this._get(`/gitswarm/updates?since=${encodeURIComponent(since)}&agent_id=${this.agentId}`);
+  }
+
   // ── Bulk Sync (Offline Recovery) ─────────────────────────────
 
   /**
@@ -243,34 +315,81 @@ export class SyncClient {
   }
 
   /**
-   * Flush queued events to server.
-   * Called when connectivity is restored.
+   * Flush queued events to server using the batch sync endpoint.
+   * Falls back to individual dispatch if batch endpoint is unavailable.
    */
   async flushQueue() {
-    if (!this.store) return { flushed: 0 };
+    if (!this.store) return { flushed: 0, remaining: 0 };
 
     let events;
     try {
       events = await this.store.query(
-        `SELECT * FROM sync_queue ORDER BY created_at ASC`
+        `SELECT * FROM sync_queue ORDER BY id ASC LIMIT 100`
       );
     } catch {
-      return { flushed: 0 };
+      return { flushed: 0, remaining: 0 };
     }
 
+    if (!events.rows.length) return { flushed: 0, remaining: 0 };
+
+    // Try batch endpoint first
+    try {
+      const batch = events.rows.map(e => ({
+        seq: e.id,
+        type: e.event_type,
+        data: JSON.parse(e.payload),
+        created_at: e.created_at,
+      }));
+
+      const response = await this._post('/gitswarm/sync/batch', { events: batch });
+
+      // Delete successfully processed events
+      let flushed = 0;
+      for (const r of (response.results || [])) {
+        if (r.status === 'ok' || r.status === 'duplicate') {
+          try {
+            await this.store.query('DELETE FROM sync_queue WHERE id = ?', [r.seq]);
+          } catch { /* ignore */ }
+          flushed++;
+        } else {
+          break; // Stop at first error to preserve ordering
+        }
+      }
+
+      const remaining = await this.store.query('SELECT COUNT(*) as count FROM sync_queue');
+      return { flushed, remaining: remaining.rows[0]?.count || 0 };
+    } catch (err) {
+      // Batch endpoint unavailable — fall back to individual dispatch
+      if (err.status === 404) {
+        return this._flushQueueIndividual(events.rows);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Fallback: flush queue by dispatching events individually.
+   */
+  async _flushQueueIndividual(events) {
     let flushed = 0;
-    for (const event of events.rows) {
+    for (const event of events) {
       try {
         const data = JSON.parse(event.payload);
         await this._dispatchQueuedEvent(event.event_type, data);
         await this.store.query(`DELETE FROM sync_queue WHERE id = ?`, [event.id]);
         flushed++;
       } catch {
+        // Update attempt count
+        try {
+          await this.store.query(
+            `UPDATE sync_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?`,
+            [String(arguments[0]?.message || 'unknown'), event.id]
+          );
+        } catch { /* ignore */ }
         break; // Stop on first failure (preserve ordering)
       }
     }
-
-    return { flushed, remaining: events.rows.length - flushed };
+    return { flushed, remaining: events.length - flushed };
   }
 
   async _dispatchQueuedEvent(type, data) {
@@ -285,10 +404,22 @@ export class SyncClient {
         return this.syncReview(data.repoId, data.streamId, data);
       case 'merge':
         return this.syncMergeCompleted(data.repoId, data.streamId, data);
+      case 'merge_requested':
+        return this.requestMerge(data.repoId, data.streamId);
       case 'stabilize':
         return this.syncStabilization(data.repoId, data);
       case 'promote':
         return this.syncPromotion(data.repoId, data);
+      case 'stream_abandoned':
+        return this.syncStreamAbandoned(data.repoId, data.streamId, data.reason);
+      case 'council_proposal':
+        return this.syncCouncilProposal(data.repoId, data.proposal);
+      case 'council_vote':
+        return this.syncCouncilVote(data.repoId, data.proposalId, data);
+      case 'stage_progression':
+        return this.syncStageProgression(data.repoId, data);
+      case 'task_submission':
+        return this.syncTaskSubmission(data.taskId, data);
       default:
         throw new Error(`Unknown queued event type: ${type}`);
     }

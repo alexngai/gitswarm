@@ -322,7 +322,7 @@ describe('Merge to buffer', () => {
     const { federation, author, repo, ws } = await setupMergeable();
     await federation.mergeToBuffer(ws.streamId, author.id);
 
-    const metrics = await federation.stages.getMetrics(repo.id);
+    const metrics = await federation.stages.getStageMetrics(repo.id);
     expect(metrics.metrics).toBeDefined();
     federation.close();
   });

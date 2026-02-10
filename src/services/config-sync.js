@@ -136,16 +136,18 @@ export class ConfigSyncService {
 
   /**
    * Apply repo-level settings from .gitswarm/config.yml to gitswarm_repos.
+   *
+   * Only syncs repo-owned fields. Server-owned fields (agent_access, min_karma,
+   * ownership_model, is_private, stage, require_human_approval, human_can_force_merge)
+   * are managed via the API and are NOT overwritten by config.yml.
    */
   async _syncRepoSettings(repoId, config) {
+    // Repo-owned fields only — server-owned fields are excluded.
     const settingsMap = {
       merge_mode: config.merge_mode,
-      ownership_model: config.ownership_model,
       consensus_threshold: config.consensus_threshold,
       min_reviews: config.min_reviews,
       human_review_weight: config.human_review_weight,
-      agent_access: config.agent_access,
-      min_karma: config.min_karma,
       buffer_branch: config.buffer_branch,
       promote_target: config.promote_target,
       auto_promote_on_green: config.auto_promote_on_green,

@@ -10,6 +10,7 @@ import { bountyRoutes } from './bounties.js';
 import { streamRoutes } from './streams.js';
 import { fileRoutes } from './files.js';
 import { pluginRoutes } from './plugins.js';
+import { syncRoutes } from './sync.js';
 import { getBackendForRepo } from '../../services/backend-factory.js';
 
 const permissionService = new GitSwarmPermissionService();
@@ -26,6 +27,7 @@ export async function gitswarmRoutes(app, options = {}) {
   await app.register(streamRoutes, { activityService, pluginEngine });
   await app.register(fileRoutes, { activityService });
   await app.register(pluginRoutes, { activityService, pluginEngine, configSyncService });
+  await app.register(syncRoutes, { activityService, pluginEngine });
 
   // Different rate limits for different operation types
   const rateLimitRead = createRateLimiter('gitswarm_read');
@@ -527,6 +529,31 @@ export async function gitswarmRoutes(app, options = {}) {
         error: 'Forbidden',
         message: 'Only repository admins can update settings'
       });
+    }
+
+    // Config source-of-truth split: when a repo has .gitswarm/config.yml,
+    // repo-owned fields can only be changed via that file (pushed to the repo).
+    // Server-owned fields can still be changed via this API.
+    const REPO_OWNED_FIELDS = [
+      'merge_mode', 'buffer_branch', 'promote_target',
+      'auto_promote_on_green', 'auto_revert_on_red', 'stabilize_command',
+      'consensus_threshold', 'min_reviews', 'human_review_weight',
+    ];
+
+    const configCheck = await query(
+      `SELECT config_sha FROM gitswarm_repo_config WHERE repo_id = $1`, [id]
+    );
+    const hasConfigFile = configCheck.rows.length > 0 && configCheck.rows[0].config_sha;
+
+    if (hasConfigFile) {
+      const conflicting = REPO_OWNED_FIELDS.filter(f => request.body[f] !== undefined);
+      if (conflicting.length > 0) {
+        return reply.status(409).send({
+          error: 'conflict',
+          message: 'These fields are managed by .gitswarm/config.yml. Update the file and push.',
+          fields: conflicting,
+        });
+      }
     }
 
     const allowedFields = [
@@ -1736,7 +1763,7 @@ export async function gitswarmRoutes(app, options = {}) {
 
     const patchId = patchResult.rows[0].patch_id;
 
-    // Insert or update review
+    // Insert or update review (legacy patch_reviews)
     await query(`
       INSERT INTO patch_reviews (patch_id, reviewer_id, verdict, feedback, tested)
       VALUES ($1, $2, $3, $4, $5)
@@ -1746,6 +1773,20 @@ export async function gitswarmRoutes(app, options = {}) {
         tested = $5,
         reviewed_at = NOW()
     `, [patchId, request.agent.id, verdict, body, tested]);
+
+    // Bridge: also write to gitswarm_stream_reviews if this PR is linked to a stream.
+    // This ensures PR reviews count toward stream consensus.
+    const linkedStream = await query(`
+      SELECT id FROM gitswarm_streams WHERE github_pr_number = $1 AND repo_id = $2
+    `, [parseInt(prNumber), id]);
+    if (linkedStream.rows.length > 0) {
+      await query(`
+        INSERT INTO gitswarm_stream_reviews (stream_id, reviewer_id, verdict, feedback, is_human, tested)
+        VALUES ($1, $2, $3, $4, false, $5)
+        ON CONFLICT (stream_id, reviewer_id) DO UPDATE SET
+          verdict = $3, feedback = $4, tested = $5, reviewed_at = NOW()
+      `, [linkedStream.rows[0].id, request.agent.id, verdict, body, tested]).catch(() => {});
+    }
 
     // Update reviewer stats
     await query(`

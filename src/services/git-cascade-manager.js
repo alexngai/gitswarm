@@ -41,10 +41,17 @@ try {
 const DEFAULT_REPOS_DIR = process.env.GITSWARM_REPOS_DIR || '/var/lib/gitswarm/repos';
 
 export class GitCascadeManager {
-  constructor(reposDir = DEFAULT_REPOS_DIR) {
+  /**
+   * @param {string} reposDir - Filesystem path for repo clones
+   * @param {object} pgQuery - PostgreSQL query function (optional, for reading repo settings)
+   */
+  constructor(reposDir = DEFAULT_REPOS_DIR, pgQuery = null) {
     this.reposDir = reposDir;
     this.trackers = new Map(); // repoId -> { tracker, db, repoPath }
     this.available = !!(MultiAgentRepoTracker && Database);
+    // PostgreSQL query function — used to read repo settings instead of
+    // duplicating them in the SQLite sidecar (prevents dual-DB drift).
+    this.pgQuery = pgQuery || query;
   }
 
   /**
@@ -141,8 +148,8 @@ export class GitCascadeManager {
       return null;
     }
 
-    // Re-initialize from existing files
-    const repo = await query(`
+    // Re-initialize from existing files — always read from PostgreSQL
+    const repo = await this.pgQuery(`
       SELECT buffer_branch, clone_url FROM gitswarm_repos WHERE id = $1
     `, [repoId]);
 
@@ -326,7 +333,7 @@ export class GitCascadeManager {
 
     const { tracker, repoPath } = ctx;
 
-    const repo = await query(`
+    const repo = await this.pgQuery(`
       SELECT buffer_branch FROM gitswarm_repos WHERE id = $1
     `, [repoId]);
     const bufferBranch = repo.rows[0]?.buffer_branch || 'buffer';
@@ -405,7 +412,7 @@ export class GitCascadeManager {
 
     const { tracker, repoPath } = ctx;
 
-    const repo = await query(`
+    const repo = await this.pgQuery(`
       SELECT buffer_branch FROM gitswarm_repos WHERE id = $1
     `, [repoId]);
     const bufferBranch = repo.rows[0]?.buffer_branch || 'buffer';
@@ -480,7 +487,7 @@ export class GitCascadeManager {
 
     const { repoPath } = ctx;
 
-    const repo = await query(`
+    const repo = await this.pgQuery(`
       SELECT buffer_branch, promote_target FROM gitswarm_repos WHERE id = $1
     `, [repoId]);
 

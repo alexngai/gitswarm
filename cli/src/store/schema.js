@@ -335,9 +335,235 @@ CREATE TABLE IF NOT EXISTS sync_queue (
 INSERT INTO schema_version (version) VALUES (3);
 `;
 
+/**
+ * Migration V4: Cross-level integration fixes.
+ *
+ * 1. ID format standardization — convert 32-char hex IDs to 36-char UUIDs
+ * 2. Add policy-level streams table (git-cascade owns gc_streams for git
+ *    mechanics; this table owns policy metadata for shared services)
+ * 3. Add org_id to repos for Mode B server sync
+ * 4. Add consensus_authority to repos for split-brain prevention
+ * 5. Add tracking columns to sync_queue for batch sync reliability
+ */
+const migrationV4 = `
+-- ── 1. ID format: convert 32-char hex to UUID with dashes ──────
+-- Helper approach: update each table that uses hex IDs.
+-- SQLite UPDATE with substr() inserts dashes into 32-char hex strings.
+-- IDs that are already 36 chars (or any other length) are left unchanged.
+
+UPDATE agents SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE repos SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE repo_access SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE repo_access SET repo_id =
+  substr(repo_id,1,8)||'-'||substr(repo_id,9,4)||'-'||substr(repo_id,13,4)||'-'||
+  substr(repo_id,17,4)||'-'||substr(repo_id,21,12)
+WHERE length(repo_id) = 32;
+
+UPDATE repo_access SET agent_id =
+  substr(agent_id,1,8)||'-'||substr(agent_id,9,4)||'-'||substr(agent_id,13,4)||'-'||
+  substr(agent_id,17,4)||'-'||substr(agent_id,21,12)
+WHERE length(agent_id) = 32;
+
+UPDATE maintainers SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE maintainers SET repo_id =
+  substr(repo_id,1,8)||'-'||substr(repo_id,9,4)||'-'||substr(repo_id,13,4)||'-'||
+  substr(repo_id,17,4)||'-'||substr(repo_id,21,12)
+WHERE length(repo_id) = 32;
+
+UPDATE maintainers SET agent_id =
+  substr(agent_id,1,8)||'-'||substr(agent_id,9,4)||'-'||substr(agent_id,13,4)||'-'||
+  substr(agent_id,17,4)||'-'||substr(agent_id,21,12)
+WHERE length(agent_id) = 32;
+
+UPDATE branch_rules SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE branch_rules SET repo_id =
+  substr(repo_id,1,8)||'-'||substr(repo_id,9,4)||'-'||substr(repo_id,13,4)||'-'||
+  substr(repo_id,17,4)||'-'||substr(repo_id,21,12)
+WHERE length(repo_id) = 32;
+
+UPDATE patch_reviews SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE patch_reviews SET reviewer_id =
+  substr(reviewer_id,1,8)||'-'||substr(reviewer_id,9,4)||'-'||substr(reviewer_id,13,4)||'-'||
+  substr(reviewer_id,17,4)||'-'||substr(reviewer_id,21,12)
+WHERE length(reviewer_id) = 32;
+
+UPDATE tasks SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE tasks SET repo_id =
+  substr(repo_id,1,8)||'-'||substr(repo_id,9,4)||'-'||substr(repo_id,13,4)||'-'||
+  substr(repo_id,17,4)||'-'||substr(repo_id,21,12)
+WHERE length(repo_id) = 32;
+
+UPDATE task_claims SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE task_claims SET task_id =
+  substr(task_id,1,8)||'-'||substr(task_id,9,4)||'-'||substr(task_id,13,4)||'-'||
+  substr(task_id,17,4)||'-'||substr(task_id,21,12)
+WHERE length(task_id) = 32;
+
+UPDATE task_claims SET agent_id =
+  substr(agent_id,1,8)||'-'||substr(agent_id,9,4)||'-'||substr(agent_id,13,4)||'-'||
+  substr(agent_id,17,4)||'-'||substr(agent_id,21,12)
+WHERE length(agent_id) = 32;
+
+UPDATE repo_councils SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE repo_councils SET repo_id =
+  substr(repo_id,1,8)||'-'||substr(repo_id,9,4)||'-'||substr(repo_id,13,4)||'-'||
+  substr(repo_id,17,4)||'-'||substr(repo_id,21,12)
+WHERE length(repo_id) = 32;
+
+UPDATE council_members SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE council_members SET council_id =
+  substr(council_id,1,8)||'-'||substr(council_id,9,4)||'-'||substr(council_id,13,4)||'-'||
+  substr(council_id,17,4)||'-'||substr(council_id,21,12)
+WHERE length(council_id) = 32;
+
+UPDATE council_members SET agent_id =
+  substr(agent_id,1,8)||'-'||substr(agent_id,9,4)||'-'||substr(agent_id,13,4)||'-'||
+  substr(agent_id,17,4)||'-'||substr(agent_id,21,12)
+WHERE length(agent_id) = 32;
+
+UPDATE council_proposals SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE council_proposals SET council_id =
+  substr(council_id,1,8)||'-'||substr(council_id,9,4)||'-'||substr(council_id,13,4)||'-'||
+  substr(council_id,17,4)||'-'||substr(council_id,21,12)
+WHERE length(council_id) = 32;
+
+UPDATE council_proposals SET proposed_by =
+  substr(proposed_by,1,8)||'-'||substr(proposed_by,9,4)||'-'||substr(proposed_by,13,4)||'-'||
+  substr(proposed_by,17,4)||'-'||substr(proposed_by,21,12)
+WHERE length(proposed_by) = 32;
+
+UPDATE council_votes SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE council_votes SET proposal_id =
+  substr(proposal_id,1,8)||'-'||substr(proposal_id,9,4)||'-'||substr(proposal_id,13,4)||'-'||
+  substr(proposal_id,17,4)||'-'||substr(proposal_id,21,12)
+WHERE length(proposal_id) = 32;
+
+UPDATE council_votes SET agent_id =
+  substr(agent_id,1,8)||'-'||substr(agent_id,9,4)||'-'||substr(agent_id,13,4)||'-'||
+  substr(agent_id,17,4)||'-'||substr(agent_id,21,12)
+WHERE length(agent_id) = 32;
+
+UPDATE stage_history SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+UPDATE stage_history SET repo_id =
+  substr(repo_id,1,8)||'-'||substr(repo_id,9,4)||'-'||substr(repo_id,13,4)||'-'||
+  substr(repo_id,17,4)||'-'||substr(repo_id,21,12)
+WHERE length(repo_id) = 32;
+
+UPDATE activity_log SET id =
+  substr(id,1,8)||'-'||substr(id,9,4)||'-'||substr(id,13,4)||'-'||
+  substr(id,17,4)||'-'||substr(id,21,12)
+WHERE length(id) = 32;
+
+-- ── 2. Policy-level streams table ──────────────────────────────
+-- git-cascade owns gc_streams for git mechanics (branch, worktree, merge queue).
+-- This table owns policy metadata that shared services (permissions, consensus) need.
+CREATE TABLE IF NOT EXISTS streams (
+  id               TEXT PRIMARY KEY,
+  repo_id          TEXT NOT NULL REFERENCES repos(id),
+  agent_id         TEXT NOT NULL REFERENCES agents(id),
+  name             TEXT NOT NULL,
+  branch           TEXT,
+  base_branch      TEXT DEFAULT 'main',
+  parent_stream_id TEXT,
+  task_id          TEXT,
+  status           TEXT DEFAULT 'active'
+    CHECK (status IN ('active','in_review','merged','abandoned','reverted')),
+  source           TEXT DEFAULT 'cli',
+  review_status    TEXT DEFAULT 'pending'
+    CHECK (review_status IN ('pending','in_review','approved','changes_requested')),
+  metadata         TEXT DEFAULT '{}',
+  created_at       TEXT DEFAULT (datetime('now')),
+  updated_at       TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_streams_repo ON streams(repo_id);
+CREATE INDEX IF NOT EXISTS idx_streams_agent ON streams(agent_id);
+CREATE INDEX IF NOT EXISTS idx_streams_status ON streams(status);
+
+-- Ensure gc_streams exists before backfill (git-cascade normally creates it;
+-- this no-op skeleton lets the INSERT below work on fresh databases).
+CREATE TABLE IF NOT EXISTS gc_streams (
+  id TEXT PRIMARY KEY, repoId TEXT, agentId TEXT, name TEXT,
+  branch TEXT, status TEXT, createdAt TEXT
+);
+
+-- Backfill from gc_streams if it has data
+INSERT OR IGNORE INTO streams (id, repo_id, agent_id, name, branch, status, created_at)
+  SELECT s.id, s.repoId, s.agentId, s.name, s.branch, s.status, s.createdAt
+  FROM gc_streams s
+  WHERE s.repoId IS NOT NULL AND s.agentId IS NOT NULL;
+
+-- ── 3. Repos: add org_id for Mode B server sync ────────────────
+ALTER TABLE repos ADD COLUMN org_id TEXT;
+
+-- ── 4. Repos: add consensus_authority for split-brain prevention ─
+ALTER TABLE repos ADD COLUMN consensus_authority TEXT DEFAULT 'local'
+  CHECK (consensus_authority IN ('local','server'));
+
+-- ── 5. sync_queue: add tracking columns for batch sync ──────────
+ALTER TABLE sync_queue ADD COLUMN attempts INTEGER DEFAULT 0;
+ALTER TABLE sync_queue ADD COLUMN last_error TEXT;
+
+-- ── Record migration ────────────────────────────────────────────
+INSERT INTO schema_version (version) VALUES (4);
+`;
+
 /** All migrations in order. */
 export const migrations = [
   { version: 1, sql: schemaV1 },
   { version: 2, sql: migrationV2 },
   { version: 3, sql: migrationV3 },
+  { version: 4, sql: migrationV4 },
 ];

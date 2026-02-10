@@ -16,7 +16,7 @@ describe('SqliteStore', () => {
   it('runs versioned migrations', () => {
     const store = createTestStore();
     const version = store.db.prepare('SELECT MAX(version) as v FROM schema_version').get();
-    expect(version.v).toBe(2);
+    expect(version.v).toBe(4);
     store.close();
   });
 
@@ -24,7 +24,7 @@ describe('SqliteStore', () => {
     const store = createTestStore();
     store.migrate(); // second call
     const version = store.db.prepare('SELECT MAX(version) as v FROM schema_version').get();
-    expect(version.v).toBe(2);
+    expect(version.v).toBe(4);
     store.close();
   });
 
@@ -213,20 +213,20 @@ describe('StageService', () => {
   });
 
   it('gets metrics for a repo', async () => {
-    const m = await stages.getMetrics('repo-1');
+    const m = await stages.getStageMetrics('repo-1');
     expect(m.current_stage).toBe('seed');
     expect(m.metrics.maintainer_count).toBe(2);
   });
 
   it('checks eligibility and reports unmet', async () => {
-    const e = await stages.checkEligibility('repo-1');
+    const e = await stages.checkAdvancementEligibility('repo-1');
     expect(e.eligible).toBe(false);
     expect(e.next_stage).toBe('growth');
-    expect(e.unmet.length).toBeGreaterThan(0);
+    expect(e.unmet_requirements.length).toBeGreaterThan(0);
   });
 
   it('advances stage when forced', async () => {
-    const r = await stages.advance('repo-1', true);
+    const r = await stages.advanceStage('repo-1', true);
     expect(r.success).toBe(true);
     expect(r.new_stage).toBe('growth');
   });
