@@ -830,23 +830,13 @@ export class PluginEngine {
    * Add labels to an issue or PR via GitHub API.
    */
   async _addLabels(repoId, payload, labels) {
-    const repo = await this.db.query(`
-      SELECT r.github_full_name, o.github_installation_id
-      FROM gitswarm_repos r
-      JOIN gitswarm_orgs o ON r.org_id = o.id
-      WHERE r.id = $1
-    `, [repoId]);
-
-    if (repo.rows.length === 0) return;
-
-    const { github_full_name, github_installation_id } = repo.rows[0];
-    const [owner, repoName] = github_full_name.split('/');
-    const token = await githubApp.getInstallationToken(github_installation_id);
-    const ghRepo = new GitHubRepo(token, owner, repoName);
+    const client = await this._getGitHubRepoClient(repoId);
+    if (!client) return;
 
     const issueNumber = payload.issue?.number || payload.pull_request?.number;
     if (!issueNumber) return;
 
+    const { ghRepo, owner, repoName } = client;
     await ghRepo.request(
       'POST',
       `/repos/${owner}/${repoName}/issues/${issueNumber}/labels`,
@@ -858,23 +848,13 @@ export class PluginEngine {
    * Add a comment to an issue or PR.
    */
   async _addComment(repoId, payload, body) {
-    const repo = await this.db.query(`
-      SELECT r.github_full_name, o.github_installation_id
-      FROM gitswarm_repos r
-      JOIN gitswarm_orgs o ON r.org_id = o.id
-      WHERE r.id = $1
-    `, [repoId]);
-
-    if (repo.rows.length === 0) return;
-
-    const { github_full_name, github_installation_id } = repo.rows[0];
-    const [owner, repoName] = github_full_name.split('/');
-    const token = await githubApp.getInstallationToken(github_installation_id);
-    const ghRepo = new GitHubRepo(token, owner, repoName);
+    const client = await this._getGitHubRepoClient(repoId);
+    if (!client) return;
 
     const issueNumber = payload.issue?.number || payload.pull_request?.number;
     if (!issueNumber) return;
 
+    const { ghRepo } = client;
     await ghRepo.addPullRequestComment(issueNumber, body);
   }
 
@@ -1075,9 +1055,6 @@ export class PluginEngine {
 
       if (recent.rows.length === 0) return;
 
-      const limitKey = this.safeOutputs.constructor.prototype.constructor === SafeOutputsEnforcer
-        ? null : null; // We'll look up from the ACTION_COST_MAP import
-
       // Attribute to most recent matching execution
       const exec = recent.rows[0];
       const currentActions = exec.actions_taken || [];
@@ -1093,26 +1070,21 @@ export class PluginEngine {
         WHERE id = $1
       `, [exec.id, JSON.stringify(currentActions)]);
 
-      // Check if over budget
+      // Check if over budget by mapping action names to budget keys
       const pluginLimits = exec.plugin_safe_outputs || {};
-      const context = {
-        pluginId: exec.plugin_id,
-        limits: pluginLimits,
-        usage: {},
-        blocked: [],
-      };
+      const budgetUsage = {};
 
-      // Count actions by type from the recorded list
       for (const act of currentActions) {
-        const key = act.action;
-        context.usage[key] = (context.usage[key] || 0) + 1;
+        const budgetKey = this.safeOutputs.getActionBudgetKey?.(act.action);
+        if (budgetKey) {
+          budgetUsage[budgetKey] = (budgetUsage[budgetKey] || 0) + 1;
+        }
       }
 
       // Log warning if any budget is exceeded
       if (this.activityService) {
-        const summary = this.safeOutputs.getSummary(context);
-        for (const [key, used] of Object.entries(summary.usage)) {
-          const limit = pluginLimits[key];
+        for (const [budgetKey, used] of Object.entries(budgetUsage)) {
+          const limit = pluginLimits[budgetKey];
           if (limit !== undefined && used > limit) {
             this.activityService.logActivity({
               event_type: 'plugin_over_budget',
@@ -1121,7 +1093,7 @@ export class PluginEngine {
               metadata: {
                 repo_id: repoId,
                 action_type: actionType,
-                budget_key: key,
+                budget_key: budgetKey,
                 used,
                 limit,
               },

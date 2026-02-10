@@ -112,6 +112,14 @@ export class SafeOutputsEnforcer {
   }
 
   /**
+   * Look up the budget key for an action name.
+   * Used by the post-hoc audit to map webhook-observed actions to budget keys.
+   */
+  getActionBudgetKey(actionName) {
+    return ACTION_COST_MAP[actionName] || null;
+  }
+
+  /**
    * Periodically clean up stale rate limit records older than 7 days.
    * Called opportunistically during rate limit checks (~2% of the time).
    */

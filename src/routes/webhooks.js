@@ -65,6 +65,17 @@ export async function webhookRoutes(app, options = {}) {
       if (_pluginEngine) {
         _pluginEngine.processWebhookEvent(event, request.body)
           .catch(err => app.log.error({ error: err.message }, 'Plugin engine error'));
+
+        // Post-hoc audit: if this event represents a mutation that could have
+        // been produced by a dispatched AI workflow, attribute it for budget tracking
+        const auditAction = _mapWebhookToAuditAction(event, request.body);
+        if (auditAction) {
+          const auditRepoId = await _resolveRepoIdFromPayload(request.body);
+          if (auditRepoId) {
+            _pluginEngine.auditWorkflowAction(auditRepoId, auditAction, request.body)
+              .catch(err => app.log.error({ error: err.message }, 'Audit action error'));
+          }
+        }
       }
 
       // Check if push touches .gitswarm/ files — trigger config sync
@@ -1190,13 +1201,24 @@ async function checkAndEmitConsensus(repoId, streamId, prNumber, branchName) {
     }
 
     if (ratio >= threshold) {
-      emitGitswarmEvent(repoId, 'consensus_reached', {
-        stream_id: streamId,
-        pr_number: prNumber,
-        stream_name: branchName,
-        consensus: { achieved: ratio, approvals, rejections, threshold },
-        agent: { id: agentId, karma: agentKarma },
-      });
+      // Guard: only emit consensus_reached once per stream per hour
+      const alreadyEmitted = await query(`
+        SELECT id FROM gitswarm_plugin_executions
+        WHERE repo_id = $1 AND trigger_event = 'gitswarm.consensus_reached'
+          AND trigger_payload::text LIKE $2
+          AND created_at > NOW() - INTERVAL '1 hour'
+        LIMIT 1
+      `, [repoId, `%${streamId}%`]);
+
+      if (alreadyEmitted.rows.length === 0) {
+        emitGitswarmEvent(repoId, 'consensus_reached', {
+          stream_id: streamId,
+          pr_number: prNumber,
+          stream_name: branchName,
+          consensus: { achieved: ratio, approvals, rejections, threshold },
+          agent: { id: agentId, karma: agentKarma },
+        });
+      }
     } else if (rejections > 0 && rejections >= total * (1 - threshold)) {
       emitGitswarmEvent(repoId, 'consensus_blocked', {
         stream_id: streamId,
@@ -1207,6 +1229,38 @@ async function checkAndEmitConsensus(repoId, streamId, prNumber, branchName) {
     }
   } catch (err) {
     console.error('checkAndEmitConsensus failed:', err.message);
+  }
+}
+
+/**
+ * Map a webhook event to an audit action name.
+ * Returns null if the event doesn't represent a trackable mutation.
+ */
+function _mapWebhookToAuditAction(event, payload) {
+  const action = payload.action;
+  switch (event) {
+    case 'issues':
+      if (action === 'labeled') return 'add_label';
+      if (action === 'unlabeled') return 'remove_label';
+      if (action === 'closed') return 'close_issue';
+      return null;
+    case 'issue_comment':
+      if (action === 'created') return 'add_comment';
+      return null;
+    case 'pull_request':
+      if (action === 'labeled') return 'add_label';
+      if (action === 'opened') return 'create_pr';
+      if (action === 'closed' && payload.pull_request?.merged) return 'merge_stream';
+      return null;
+    case 'pull_request_review':
+      if (payload.review?.state === 'approved') return 'auto_approve';
+      return null;
+    case 'create':
+      if (payload.ref_type === 'branch') return 'create_branch';
+      if (payload.ref_type === 'tag') return 'tag_release';
+      return null;
+    default:
+      return null;
   }
 }
 

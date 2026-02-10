@@ -381,8 +381,10 @@ export async function pluginRoutes(app, options = {}) {
     if (!authenticated) {
       try {
         await authenticate(request, reply);
+        if (reply.sent) return; // authenticate may have already sent 401
         authenticated = true;
       } catch {
+        if (reply.sent) return;
         return reply.status(401).send({
           error: 'Unauthorized',
           message: 'Valid execution token or Bearer token required',
