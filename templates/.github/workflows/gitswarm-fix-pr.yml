@@ -1,0 +1,76 @@
+name: "GitSwarm: Fix PR"
+
+# Slash command: /fix — analyzes CI failures on a PR and attempts
+# to fix them automatically. Triggered by commenting /fix on a PR.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  contents: write
+  actions: read
+
+jobs:
+  fix-pr:
+    # Only run on PR comments containing /fix
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/fix')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.issue.pull_request.head.ref || github.head_ref }}
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: claude-sonnet-4-5-20250929
+          max_turns: 30
+          prompt: |
+            # GitSwarm PR Fix
+
+            Someone commented `/fix` on a pull request. Your job is to analyze the
+            CI failures and attempt to fix them.
+
+            ## Your tasks
+
+            1. **Identify the PR** from the comment context.
+
+            2. **Check CI status** — find the failing checks/workflow runs.
+               Download the logs to understand what's failing.
+
+            3. **Analyze the failures**:
+               - Is it a test failure? Read the failing test and the code it tests.
+               - Is it a lint/format error? Check the linting configuration.
+               - Is it a build error? Check for missing imports, type errors, etc.
+               - Is it a dependency issue? Check package.json/lock file.
+
+            4. **Attempt a fix**:
+               - You are already on the PR branch
+               - Make the minimum changes needed to fix the CI failure
+               - Run the failing tests/checks locally to verify your fix
+               - Commit and push the fix to the PR branch
+
+            5. **Post a comment** explaining:
+               - What was failing and why
+               - What you changed to fix it
+               - Whether local verification passed
+
+            ## Safety rules
+
+            - Only push to the PR's head branch — never to main, buffer, or other branches
+            - Make minimal changes — fix the CI failure, don't refactor or improve
+            - If you can't identify a clear fix, post a comment with your analysis
+              instead of pushing speculative changes
+            - Don't modify `.github/workflows/` or `.gitswarm/` files
+            - If there are multiple failures, fix them incrementally and verify each
+            - Maximum 1 push and 2 comments
+        env:
+          GITSWARM_API_URL: ${{ secrets.GITSWARM_API_URL }}
+          GITSWARM_API_KEY: ${{ secrets.GITSWARM_API_KEY }}
+          GITSWARM_REPO_ID: ${{ secrets.GITSWARM_REPO_ID }}

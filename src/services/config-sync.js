@@ -122,14 +122,14 @@ export class ConfigSyncService {
       await this._syncPlugins(repoId, pluginsData.plugins);
     }
 
-    // Detect gh-aw workflows (.github/workflows/*.md)
-    const ghawWorkflows = await this._detectGhAwWorkflows(ghRepo, repo.default_branch);
+    // Detect gitswarm workflow templates (.github/workflows/gitswarm-*.yml)
+    const detectedWorkflows = await this._detectWorkflowTemplates(ghRepo, repo.default_branch);
 
     return {
       synced: true,
       plugins_enabled: pluginsEnabled,
       plugins_count: pluginsData?.plugins ? Object.keys(pluginsData.plugins).length : 0,
-      ghaw_workflows: ghawWorkflows.length,
+      workflow_count: detectedWorkflows.length,
     };
   }
 
@@ -362,20 +362,19 @@ export class ConfigSyncService {
   }
 
   /**
-   * Detect gh-aw workflow files (.md in .github/workflows/) and register
-   * them as plugins. gh-aw workflows are self-contained — they define their
-   * own triggers, permissions, safe-outputs, and AI engine. We register
-   * them in the plugin DB for visibility/tracking but they execute directly
-   * via GitHub Actions (no dispatch from our server needed for native triggers).
+   * Detect gitswarm workflow files (.yml in .github/workflows/) and register
+   * them as plugins. These are standard GitHub Actions workflows that use
+   * AI agent actions (e.g., anthropics/claude-code-action) directly.
    *
-   * For gitswarm-only triggers (repository_dispatch types), our plugin engine
-   * still dispatches the event.
+   * We register them in the plugin DB for visibility/tracking. Workflows
+   * with native GitHub triggers (issues, pull_request) execute directly.
+   * Workflows with repository_dispatch triggers need our plugin engine
+   * to dispatch the event.
    */
-  async _detectGhAwWorkflows(ghRepo, branch) {
+  async _detectWorkflowTemplates(ghRepo, branch) {
     const workflows = [];
 
     try {
-      // List .github/workflows/ directory
       const listing = await ghRepo.request(
         'GET',
         `/repos/${ghRepo.owner}/${ghRepo.repo}/contents/.github/workflows?ref=${branch}`
@@ -383,25 +382,27 @@ export class ConfigSyncService {
 
       if (!Array.isArray(listing)) return workflows;
 
-      // Find .md files that are gh-aw workflows
-      const mdFiles = listing.filter(f => f.name.endsWith('.md') && f.name.startsWith('gitswarm-'));
+      // Find .yml files that are gitswarm workflows
+      const ymlFiles = listing.filter(f =>
+        (f.name.endsWith('.yml') || f.name.endsWith('.yaml')) &&
+        f.name.startsWith('gitswarm-')
+      );
 
-      for (const file of mdFiles) {
+      for (const file of ymlFiles) {
         try {
           const content = await ghRepo.getFileContent(`.github/workflows/${file.name}`, branch);
           if (!content) continue;
 
-          const parsed = this._parseGhAwFrontmatter(content.content);
+          const parsed = this._parseWorkflowYaml(content.content);
           if (!parsed) continue;
 
           workflows.push({
             filename: file.name,
-            name: file.name.replace('.md', ''),
+            name: file.name.replace(/\.(yml|yaml)$/, ''),
             ...parsed,
           });
         } catch (err) {
-          // Skip files that can't be parsed
-          console.log(`Skipping gh-aw file ${file.name}: ${err.message}`);
+          console.log(`Skipping workflow file ${file.name}: ${err.message}`);
         }
       }
     } catch (err) {
@@ -409,10 +410,11 @@ export class ConfigSyncService {
       return workflows;
     }
 
-    // Register detected gh-aw workflows as plugins (source = 'ghaw')
+    // Register detected workflows as plugins (source = 'workflow')
     for (const wf of workflows) {
-      const triggerEvent = this._extractGhAwTrigger(wf.on);
-      const tier = wf.engine ? 'ai' : 'automation';
+      const triggerEvent = this._extractWorkflowTrigger(wf.on);
+      const usesAiAction = wf.uses_ai_action;
+      const tier = usesAiAction ? 'ai' : 'automation';
 
       await this.db.query(`
         INSERT INTO gitswarm_repo_plugins (
@@ -421,24 +423,23 @@ export class ConfigSyncService {
           priority, source
         ) VALUES (
           (SELECT id FROM gitswarm_repos WHERE github_full_name = $1 LIMIT 1),
-          $2, true, $3, $4, '{}', '[]', $5, $6, 'ghaw', $7, 0, 'ghaw'
+          $2, true, $3, $4, '{}', '[]', '{}', $5, 'workflow', $6, 0, 'workflow'
         )
         ON CONFLICT (repo_id, name) DO UPDATE SET
-          tier = $3, trigger_event = $4, safe_outputs = $5,
-          config = $6, execution_model = 'ghaw', dispatch_target = $7,
+          tier = $3, trigger_event = $4,
+          config = $5, execution_model = 'workflow', dispatch_target = $6,
           updated_at = NOW()
       `, [
         `${ghRepo.owner}/${ghRepo.repo}`,
         wf.name,
         tier,
         triggerEvent,
-        JSON.stringify(wf.safe_outputs || {}),
         JSON.stringify({
-          engine: wf.engine,
+          workflow_name: wf.workflow_name,
           description: wf.description,
           filename: wf.filename,
-          tools: wf.tools,
-          mcp_servers: wf.mcp_servers,
+          permissions: wf.permissions,
+          uses_ai_action: wf.uses_ai_action,
         }),
         wf.filename,
       ]);
@@ -448,33 +449,32 @@ export class ConfigSyncService {
   }
 
   /**
-   * Parse gh-aw frontmatter from a Markdown workflow file.
-   * Returns the frontmatter fields or null if not a valid gh-aw file.
+   * Parse a GitHub Actions YAML workflow to extract metadata.
+   * Returns relevant fields or null if not a valid workflow.
    */
-  _parseGhAwFrontmatter(content) {
-    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!fmMatch) return null;
+  _parseWorkflowYaml(content) {
+    const parsed = this._parseYaml(content);
+    if (!parsed || !parsed.on) return null;
 
-    const frontmatter = this._parseYaml(fmMatch[1]);
-    if (!frontmatter || !frontmatter.on) return null;
+    // Detect if the workflow uses an AI agent action
+    const contentStr = typeof content === 'string' ? content : '';
+    const usesAiAction = contentStr.includes('anthropics/claude-code-action') ||
+                         contentStr.includes('openai/codex-action') ||
+                         contentStr.includes('github/copilot-');
 
     return {
-      on: frontmatter.on,
-      description: frontmatter.description,
-      engine: frontmatter.engine,
-      tools: frontmatter.tools,
-      permissions: frontmatter.permissions,
-      safe_outputs: frontmatter['safe-outputs'],
-      mcp_servers: frontmatter['mcp-servers'],
-      timeout: frontmatter['timeout-minutes'],
-      network: frontmatter.network,
+      on: parsed.on,
+      workflow_name: parsed.name,
+      description: parsed.name || '',
+      permissions: parsed.permissions,
+      uses_ai_action: usesAiAction,
     };
   }
 
   /**
-   * Extract primary trigger event from gh-aw `on:` config.
+   * Extract primary trigger event from a workflow's `on:` config.
    */
-  _extractGhAwTrigger(on) {
+  _extractWorkflowTrigger(on) {
     if (typeof on === 'string') return on;
     if (typeof on !== 'object') return 'unknown';
 
@@ -484,7 +484,7 @@ export class ConfigSyncService {
     }
 
     // Use the first native trigger
-    const triggers = Object.keys(on);
+    const triggers = Object.keys(on).filter(k => k !== 'workflow_dispatch');
     if (triggers.length === 0) return 'unknown';
 
     const first = triggers[0];

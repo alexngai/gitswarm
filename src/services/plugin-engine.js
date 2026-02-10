@@ -142,8 +142,8 @@ export class PluginEngine {
         result = await this._dispatchToGitHubActions(plugin, trigger, payload, context);
         break;
 
-      case 'ghaw':
-        result = await this._handleGhAwWorkflow(plugin, trigger, payload, context);
+      case 'workflow':
+        result = await this._handleWorkflow(plugin, trigger, payload, context);
         break;
 
       case 'webhook':
@@ -392,27 +392,27 @@ export class PluginEngine {
   }
 
   /**
-   * Handle a gh-aw workflow plugin.
+   * Handle a GitHub Actions workflow plugin.
    *
-   * gh-aw workflows that listen on native GitHub events (issues.opened,
+   * Workflows that listen on native GitHub events (issues.opened,
    * pull_request.opened) execute directly via GitHub Actions — they don't
    * need us to dispatch. We just record the execution for tracking.
    *
-   * gh-aw workflows that listen on repository_dispatch (gitswarm-specific
+   * Workflows that listen on repository_dispatch (gitswarm-specific
    * events like consensus_reached) DO need us to dispatch, since GitHub
    * won't fire repository_dispatch on its own for these events.
    */
-  async _handleGhAwWorkflow(plugin, trigger, payload, context) {
+  async _handleWorkflow(plugin, trigger, payload, context) {
     const isGitSwarmTrigger = trigger.startsWith('gitswarm.');
     const isDispatchTrigger = trigger.startsWith('gitswarm.plugin.');
 
     if (!isGitSwarmTrigger) {
-      // Native GitHub event — the gh-aw workflow fires on its own via
+      // Native GitHub event — the workflow fires on its own via
       // GitHub Actions. We just record that it was triggered for audit.
       return {
-        status: 'ghaw_native',
+        status: 'workflow_native',
         actionsTaken: [{
-          action: 'ghaw_native_trigger',
+          action: 'workflow_native_trigger',
           workflow: plugin.dispatch_target,
           note: 'Workflow triggered directly by GitHub Actions, no dispatch needed',
         }],
@@ -420,8 +420,7 @@ export class PluginEngine {
     }
 
     // GitSwarm-specific event — we need to dispatch via repository_dispatch
-    // so the gh-aw workflow's `repository_dispatch` trigger fires.
-    // This reuses the standard dispatch path but uses the gh-aw event type.
+    // so the workflow's `repository_dispatch` trigger fires.
     const repoId = plugin.repo_id;
 
     const repo = await this.db.query(`
@@ -451,8 +450,6 @@ export class PluginEngine {
 
     const ghRepo = new GitHubRepo(token, owner, repoName);
 
-    // Use the repository_dispatch type from the plugin config
-    // (e.g., 'gitswarm.plugin.consensus-merge')
     const eventType = isDispatchTrigger ? trigger : `gitswarm.plugin.${plugin.name}`;
 
     const execResult = await this.db.query(`
@@ -486,7 +483,7 @@ export class PluginEngine {
         dispatchId: executionId,
         eventType,
         actionsTaken: [{
-          action: 'ghaw_dispatch',
+          action: 'workflow_dispatch',
           event_type: eventType,
           workflow: plugin.dispatch_target,
         }],

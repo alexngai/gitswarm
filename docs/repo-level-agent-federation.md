@@ -535,35 +535,44 @@ The initial implementation is in place:
 - `.gitswarm/config.yml` — Repo configuration template
 - `.gitswarm/plugins.yml` — Plugin configuration template with Tier 1-3 examples
 
-#### Phase 2: gh-aw Integration (IMPLEMENTED)
+#### Phase 2: Direct GitHub Actions with AI Agent Actions (IMPLEMENTED)
 
-Migrated from hand-written YAML workflow templates to [GitHub Agentic Workflows](https://github.com/github/gh-aw) (gh-aw) Markdown format. gh-aw compiles natural-language Markdown into GitHub Actions YAML, with built-in sandboxing, safe outputs, and multi-engine support.
+Migrated from gh-aw Markdown templates to standard GitHub Actions YAML workflows that use AI agent actions directly. This removes the dependency on gh-aw (a research demonstrator) and uses production-ready, standalone GitHub Actions:
 
-**gh-aw Workflow Templates** (`templates/.github/workflows/*.md`):
-- `gitswarm-issue-triage.md` — AI-powered issue classification, labeling, and duplicate detection
-- `gitswarm-pr-risk.md` — PR risk assessment by path, size, and sensitivity
-- `gitswarm-consensus-merge.md` — Merge PRs on gitswarm community consensus
-- `gitswarm-daily-digest.md` — Scheduled daily activity summary
-- `gitswarm-fix-pr.md` — Slash command `/fix` to auto-repair CI failures
+- **`anthropics/claude-code-action@v1`** — Full standalone action with built-in GitHub MCP server (reads/writes PRs, issues, files), native commit/push support, and MCP server auto-detection via `.mcp.json`
+- **`openai/codex-action@v1`** — Standalone action for OpenAI Codex (needs composition for GitHub operations)
+
+**Workflow Templates** (`templates/.github/workflows/*.yml`):
+- `gitswarm-issue-triage.yml` — AI-powered issue classification, labeling, and duplicate detection
+- `gitswarm-pr-risk.yml` — PR risk assessment by path, size, and sensitivity
+- `gitswarm-consensus-merge.yml` — Merge PRs on gitswarm community consensus
+- `gitswarm-daily-digest.yml` — Scheduled daily activity summary with cron trigger
+- `gitswarm-fix-pr.yml` — Slash command `/fix` to auto-repair CI failures
+
+**MCP Server Configuration** (`templates/.mcp.json`):
+- Claude Code Action auto-detects `.mcp.json` in the repo root
+- Configures `@gitswarm/mcp-server` to run via `npx`
+- Environment variables (`GITSWARM_API_URL`, `GITSWARM_API_KEY`, `GITSWARM_REPO_ID`) are passed from GitHub Actions secrets
 
 **GitSwarm MCP Server** (`src/mcp-server/`):
 - `@gitswarm/mcp-server` npm package exposing gitswarm data via Model Context Protocol
 - Tools: `get_repo_config`, `get_consensus_status`, `get_agent_karma`, `list_active_streams`, `get_stream_status`, `search_issues`, `search_streams`, `get_repo_activity`, `get_stage_info`, `report_execution`
-- gh-aw workflows declare `mcp-servers: gitswarm:` in frontmatter to access these tools
-- Enables AI agents running inside workflows to query gitswarm state directly
+- Works with any MCP-compatible client (Claude Code, Claude Code Action, gh-aw, etc.)
 
-**Plugin Engine `ghaw` Execution Model**:
-- Config sync detects `gitswarm-*.md` files in `.github/workflows/` and registers them as plugins
-- Native GitHub triggers (issues, PRs) fire directly — no dispatch from gitswarm server needed
+**Plugin Engine `workflow` Execution Model**:
+- Config sync detects `gitswarm-*.yml` files in `.github/workflows/` and registers them as plugins
+- Native GitHub triggers (issues, PRs, schedule) fire directly — no dispatch needed
 - GitSwarm-only triggers (consensus, council) still dispatched via `repository_dispatch`
-- Two-layer safe outputs: gh-aw enforces at the Actions level, gitswarm enforces at the server level
+- gitswarm server enforces rate limits and records execution audit trail
 
-**Key advantages over Phase 1 YAML templates:**
-- AI agent does the reasoning (not bash heuristics)
-- Engine-portable: same Markdown prompt works with Claude, Copilot, or Codex
-- gh-aw handles sandboxing, network isolation, and safe output enforcement
+**Key advantages of this approach:**
+- No dependency on gh-aw (research demonstrator) — uses production GitHub Actions
+- AI agent does the reasoning via Claude Code Action's built-in capabilities
+- Full GitHub integration (PRs, issues, commits) provided by Claude Code Action out of the box
 - MCP server gives workflows access to gitswarm data (consensus, karma, streams)
-- Slash command support (`/fix`) not possible with pure repository_dispatch
+- Slash command support (`/fix`) via standard `issue_comment` trigger
+- Standard YAML — no compile step, no custom CLI extension needed
+- Repo owners can swap AI engines by changing the action (claude-code-action → codex-action)
 
 #### Phase 3: Governance Delegation (NEXT)
 
@@ -571,7 +580,7 @@ Migrated from hand-written YAML workflow templates to [GitHub Agentic Workflows]
 - Karma-weighted auto-merge for safe paths
 - Cross-repo policy enforcement
 - Standalone mode (no gitswarm server required)
-- `manual-approval:` gates for Tier 3 actions via gh-aw environment protection
+- GitHub Actions environment protection rules for Tier 3 approval gates
 
 #### Phase 4: Ecosystem
 
@@ -579,7 +588,7 @@ Migrated from hand-written YAML workflow templates to [GitHub Agentic Workflows]
 - Community plugin submissions and review process
 - Plugin versioning and update mechanism
 - Plugin composition (output of one plugin triggers another)
-- Shared gh-aw workflow library (like githubnext/agentics)
+- Shared workflow template library for common gitswarm patterns
 
 ---
 
@@ -593,10 +602,10 @@ Migrated from hand-written YAML workflow templates to [GitHub Agentic Workflows]
 
 4. **Multi-repo coordination**: If an org has 50 repos all with gitswarm plugins, how do org-wide policies compose with repo-level configs? Proposed: org-level `.gitswarm/` in a dedicated config repo, with repo-level overrides.
 
-5. **gh-aw adoption curve**: gh-aw is a research demonstrator, not a product. Should we maintain a fallback path (compiled YAML) for repos that can't or won't install the `gh` CLI extension? The `.lock.yml` files gh-aw generates are standard Actions YAML, so they could be committed directly.
+5. **MCP server distribution**: The `@gitswarm/mcp-server` needs to be published to npm for `npx` to work in workflows. Until then, the server could be vendored as a GitHub Action or referenced via a git URL.
 
-6. **MCP server distribution**: The `@gitswarm/mcp-server` needs to be published to npm for `npx` to work in workflows. Until then, the server could be vendored as a GitHub Action or referenced via a git URL.
+6. **Event ordering**: If multiple plugins trigger on the same event, what's the execution order? Proposed: priority field in plugin config, with built-in plugins executing before community/custom.
 
-5. **Event ordering**: If multiple plugins trigger on the same event, what's the execution order? Proposed: priority field in plugin config, with built-in plugins executing before community/custom.
+7. **Cost allocation**: AI-powered plugins (Tier 2) cost money. Who pays — the repo owner, the gitswarm platform, or the agent that triggered the event?
 
-6. **Cost allocation**: AI-powered plugins (Tier 2) cost money. Who pays — the repo owner, the gitswarm platform, or the agent that triggered the event?
+8. **Multi-engine workflows**: Currently each workflow uses one AI engine (Claude or Codex). Should we support fallback chains (try Claude, fall back to Codex) or engine selection based on task type?
