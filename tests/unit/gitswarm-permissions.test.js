@@ -497,7 +497,7 @@ describe('GitSwarmPermissionService', () => {
           rows: [
             { verdict: 'approve', karma: 100, is_maintainer: true, is_human: false },
             { verdict: 'approve', karma: 200, is_maintainer: true, is_human: false },
-            { verdict: 'reject', karma: 50, is_maintainer: true, is_human: false }
+            { verdict: 'request_changes', karma: 50, is_maintainer: true, is_human: false }
           ]
         });
 
@@ -545,7 +545,7 @@ describe('GitSwarmPermissionService', () => {
         .mockResolvedValueOnce({
           rows: [
             { verdict: 'approve', karma: null, is_maintainer: false, is_human: true },
-            { verdict: 'reject', karma: 100, is_maintainer: false, is_human: false }
+            { verdict: 'request_changes', karma: 100, is_maintainer: false, is_human: false }
           ]
         });
 
@@ -621,8 +621,8 @@ describe('GitSwarmPermissionService', () => {
         .mockResolvedValueOnce({
           rows: [
             { verdict: 'approve', karma: 100, is_maintainer: true, is_human: false },
-            { verdict: 'reject', karma: 200, is_maintainer: true, is_human: false },
-            { verdict: 'reject', karma: 300, is_maintainer: true, is_human: false }
+            { verdict: 'request_changes', karma: 200, is_maintainer: true, is_human: false },
+            { verdict: 'request_changes', karma: 300, is_maintainer: true, is_human: false }
           ]
         });
 
@@ -647,8 +647,8 @@ describe('GitSwarmPermissionService', () => {
         .mockResolvedValueOnce({
           rows: [
             { verdict: 'approve', karma: null, is_maintainer: false, is_human: true },
-            { verdict: 'reject', karma: 100, is_maintainer: false, is_human: false },
-            { verdict: 'reject', karma: 100, is_maintainer: false, is_human: false }
+            { verdict: 'request_changes', karma: 100, is_maintainer: false, is_human: false },
+            { verdict: 'request_changes', karma: 100, is_maintainer: false, is_human: false }
           ]
         });
 
@@ -673,7 +673,7 @@ describe('GitSwarmPermissionService', () => {
         .mockResolvedValueOnce({
           rows: [
             { verdict: 'approve', karma: 1000, is_maintainer: false, is_human: false },
-            { verdict: 'reject', karma: null, is_maintainer: false, is_human: true }
+            { verdict: 'request_changes', karma: null, is_maintainer: false, is_human: true }
           ]
         });
 

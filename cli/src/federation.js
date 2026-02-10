@@ -28,6 +28,9 @@ import { ActivityService } from './core/activity.js';
 import { SyncClient } from './sync-client.js';
 import { generateId } from '../../shared/ids.js';
 import { BUILTIN_PLUGINS } from './plugins/builtins.js';
+import { CliSafeOutputs } from './plugins/safe-outputs.js';
+import { MergeLock } from './merge-lock.js';
+import { readConfigYml, extractRepoFields, readPluginsYml, parsePlugins } from './config-reader.js';
 
 const GITSWARM_DIR = '.gitswarm';
 const DB_FILE = 'federation.db';
@@ -49,6 +52,15 @@ export class Federation {
 
     // Give council a back-reference so it can delegate git ops
     this.council.federation = this;
+
+    // Safe outputs enforcer for plugin budget/rate limiting
+    this.safeOutputs = new CliSafeOutputs(store);
+
+    // Merge lock to prevent concurrent buffer merges
+    this.mergeLock = new MergeLock(join(repoPath, GITSWARM_DIR));
+
+    // Cached plugins from .gitswarm/plugins.yml
+    this._pluginsCache = null;
 
     // git-cascade tracker — initialized lazily via _ensureTracker()
     this.tracker = null;
@@ -191,6 +203,10 @@ export class Federation {
     store.migrate();
     const fed = new Federation(join(swarmDir, '..'), store);
     fed._ensureTracker();
+
+    // Apply .gitswarm/config.yml if present (repo-level config takes precedence)
+    fed._applyRepoConfig();
+
     return fed;
   }
 
@@ -333,6 +349,44 @@ export class Federation {
     }
 
     return { updated: updatedFields, config: { ...localConfig, ...updates } };
+  }
+
+  /**
+   * Apply .gitswarm/config.yml to the local repos table.
+   * Repo-owned fields from the YAML take precedence over config.json values.
+   * Called once during open() — idempotent.
+   */
+  _applyRepoConfig() {
+    const yamlConfig = readConfigYml(this.repoPath);
+    if (!yamlConfig) return; // No config.yml — nothing to apply
+
+    const fields = extractRepoFields(yamlConfig);
+    if (Object.keys(fields).length === 0) return;
+
+    // Get repo synchronously (open() is sync, so use db.prepare directly)
+    const repo = this.store.db.prepare('SELECT id FROM repos LIMIT 1').get();
+    if (!repo) return;
+
+    // Build SET clause for each field
+    for (const [key, value] of Object.entries(fields)) {
+      try {
+        this.store.db.prepare(`UPDATE repos SET ${key} = ? WHERE id = ?`).run(value, repo.id);
+      } catch {
+        // Column may not exist in older schema versions — skip silently
+      }
+    }
+  }
+
+  /**
+   * Load plugins from .gitswarm/plugins.yml.
+   * Returns parsed plugin definitions or empty array if no file exists.
+   */
+  loadPlugins() {
+    if (this._pluginsCache) return this._pluginsCache;
+
+    const pluginsConfig = readPluginsYml(this.repoPath);
+    this._pluginsCache = pluginsConfig ? parsePlugins(pluginsConfig) : [];
+    return this._pluginsCache;
   }
 
   /** Get the single repo record (local federations have one repo). */
@@ -581,18 +635,25 @@ export class Federation {
     // Mode-specific post-commit behavior
     if (repo?.merge_mode === 'swarm') {
       // Auto-merge to buffer (bypasses consensus)
-      try {
-        const bufferBranch = repo.buffer_branch || 'buffer';
-        const streamBranch = tracker.getStreamBranchName(streamId);
+      const lockResult = this.mergeLock.acquire(agentId);
+      if (!lockResult.acquired) {
+        result.mergeError = lockResult.reason;
+      } else {
+        try {
+          const bufferBranch = repo.buffer_branch || 'buffer';
+          const streamBranch = tracker.getStreamBranchName(streamId);
 
-        _git(this.repoPath, `git checkout "${bufferBranch}"`);
-        _git(this.repoPath, `git merge "${streamBranch}" --no-ff -m "Merge ${streamBranch} into ${bufferBranch}"`);
-        result.merged = true;
+          _git(this.repoPath, `git checkout "${bufferBranch}"`);
+          _git(this.repoPath, `git merge "${streamBranch}" --no-ff -m "Merge ${streamBranch} into ${bufferBranch}"`);
+          result.merged = true;
 
-        // Mark stream as merged in git-cascade
-        tracker.updateStream(streamId, { status: 'merged' });
-      } catch (err) {
-        result.mergeError = err.message;
+          // Mark stream as merged in git-cascade
+          tracker.updateStream(streamId, { status: 'merged' });
+        } catch (err) {
+          result.mergeError = err.message;
+        } finally {
+          this.mergeLock.release();
+        }
       }
     }
 
@@ -688,6 +749,15 @@ export class Federation {
    */
   async submitReview(streamId, reviewerId, verdict, feedback = '', opts = {}) {
     const { reviewBlockId = null, isHuman = false } = opts;
+
+    // Normalize verdict: 'reject' is not a valid stored value — map to 'request_changes'
+    if (verdict === 'reject') verdict = 'request_changes';
+
+    const validVerdicts = ['approve', 'request_changes', 'comment'];
+    if (!validVerdicts.includes(verdict)) {
+      throw new Error(`Invalid verdict "${verdict}". Must be one of: ${validVerdicts.join(', ')}`);
+    }
+
     const repo = await this.repo();
 
     // Record in gitswarm's patch_reviews table
@@ -829,57 +899,68 @@ export class Federation {
       }
     }
 
-    // Merge stream branch into buffer via git
-    const streamBranch = tracker.getStreamBranchName(streamId);
-
-    _git(this.repoPath, `git checkout "${bufferBranch}"`);
-    try {
-      _git(this.repoPath, `git merge "${streamBranch}" --no-ff -m "Merge ${streamBranch} into ${bufferBranch}"`);
-    } catch (err) {
-      // Abort merge on conflict and report
-      _gitSafe(this.repoPath, 'git merge --abort');
-      throw new Error(`Merge failed: ${err.message}`);
+    // Acquire merge lock to prevent concurrent buffer merges
+    const lockResult = this.mergeLock.acquire(agentId);
+    if (!lockResult.acquired) {
+      throw new Error(lockResult.reason);
     }
 
-    // Mark stream as merged in git-cascade and policy table
-    tracker.updateStream(streamId, { status: 'merged' });
     try {
-      await this.store.query(
-        `UPDATE streams SET status = 'merged', review_status = 'approved', updated_at = datetime('now') WHERE id = ?`,
-        [streamId]
-      );
-    } catch (err) {
-      console.error(`Warning: failed to update stream status in policy table: ${err.message}`);
-    }
-    const mergeResult = { success: true, newHead: _git(this.repoPath, 'git rev-parse HEAD') };
+      // Merge stream branch into buffer via git
+      const streamBranch = tracker.getStreamBranchName(streamId);
 
-    // Update stage metrics after merge
-    await this.stages.updateMetrics(repo.id, tracker);
-
-    await this.activity.log({
-      agent_id: agentId,
-      event_type: 'stream_merged',
-      target_type: 'stream',
-      target_id: streamId,
-      metadata: { bufferBranch, mergeResult },
-    });
-
-    // Mode B: report merge to server
-    if (this.sync) {
+      _git(this.repoPath, `git checkout "${bufferBranch}"`);
       try {
-        await this.sync.syncMergeCompleted(repo.id, streamId, {
-          mergeCommit: mergeResult.newHead,
-          targetBranch: bufferBranch,
-        });
-      } catch {
-        this.sync._queueEvent({ type: 'merge', data: {
-          repoId: repo.id, streamId,
-          mergeCommit: mergeResult.newHead, targetBranch: bufferBranch,
-        }});
+        _git(this.repoPath, `git merge "${streamBranch}" --no-ff -m "Merge ${streamBranch} into ${bufferBranch}"`);
+      } catch (err) {
+        // Abort merge on conflict and report
+        _gitSafe(this.repoPath, 'git merge --abort');
+        throw new Error(`Merge failed: ${err.message}`);
       }
-    }
 
-    return { streamId, mergeResult };
+      // Mark stream as merged in git-cascade and policy table
+      tracker.updateStream(streamId, { status: 'merged' });
+      try {
+        await this.store.query(
+          `UPDATE streams SET status = 'merged', review_status = 'approved', updated_at = datetime('now') WHERE id = ?`,
+          [streamId]
+        );
+      } catch (err) {
+        console.error(`Warning: failed to update stream status in policy table: ${err.message}`);
+      }
+      const mergeResult = { success: true, newHead: _git(this.repoPath, 'git rev-parse HEAD') };
+
+      // Update stage metrics after merge
+      await this.stages.updateMetrics(repo.id, tracker);
+
+      await this.activity.log({
+        agent_id: agentId,
+        event_type: 'stream_merged',
+        target_type: 'stream',
+        target_id: streamId,
+        metadata: { bufferBranch, mergeResult },
+      });
+
+      // Mode B: report merge to server
+      if (this.sync) {
+        try {
+          await this.sync.syncMergeCompleted(repo.id, streamId, {
+            mergeCommit: mergeResult.newHead,
+            targetBranch: bufferBranch,
+          });
+        } catch {
+          this.sync._queueEvent({ type: 'merge', data: {
+            repoId: repo.id, streamId,
+            mergeCommit: mergeResult.newHead, targetBranch: bufferBranch,
+          }});
+        }
+      }
+
+      return { streamId, mergeResult };
+    } finally {
+      // Always release the lock, even on failure
+      this.mergeLock.release();
+    }
   }
 
   // ── Stream inspection ──────────────────────────────────────
@@ -1257,19 +1338,76 @@ export class Federation {
   }
 
   async _fireBuiltinPlugins(trigger, repo, eventData) {
+    // Merge builtin plugins with plugins.yml definitions for this trigger.
+    // plugins.yml can override safe_outputs for builtins (matched by action name).
+    const yamlPlugins = this.loadPlugins();
+
     for (const [name, plugin] of Object.entries(BUILTIN_PLUGINS)) {
-      if (plugin.trigger === trigger) {
-        try {
-          await plugin.execute(this, repo, eventData);
-        } catch (err) {
-          // Log but don't throw — plugins are non-fatal
-          await this.activity.log({
-            event_type: 'plugin_error',
-            target_type: 'repo',
-            target_id: repo.id,
-            metadata: { plugin: name, trigger, error: err.message },
-          });
-        }
+      if (plugin.trigger !== trigger) continue;
+
+      // Find matching plugin.yml definition for safe_outputs constraints
+      const yamlMatch = yamlPlugins.find(p =>
+        p.enabled && p.actions.includes(name) && p.trigger_event === `gitswarm.${trigger}`
+      );
+      const safeOutputsDef = yamlMatch?.safe_outputs || {};
+
+      // Create execution context with safe-outputs budget
+      const context = this.safeOutputs.createContext({
+        name: yamlMatch?.name || name,
+        safe_outputs: safeOutputsDef,
+      });
+
+      // Check rate limits
+      const rateCheck = this.safeOutputs.checkRateLimit(
+        yamlMatch?.name || name,
+        context.limits
+      );
+      if (!rateCheck.allowed) {
+        await this.activity.log({
+          event_type: 'plugin_rate_limited',
+          target_type: 'repo',
+          target_id: repo.id,
+          metadata: { plugin: name, trigger, reason: rateCheck.reason },
+        });
+        continue;
+      }
+
+      // Check action budget before executing
+      const actionCheck = this.safeOutputs.checkAction(context, name);
+      if (!actionCheck.allowed) {
+        await this.activity.log({
+          event_type: 'plugin_blocked',
+          target_type: 'repo',
+          target_id: repo.id,
+          metadata: { plugin: name, trigger, reason: actionCheck.reason },
+        });
+        continue;
+      }
+
+      try {
+        const result = await plugin.execute(this, repo, eventData);
+        this.safeOutputs.recordAction(context, name);
+
+        // Log execution for rate limiting tracking
+        await this.activity.log({
+          event_type: 'plugin_executed',
+          target_type: 'repo',
+          target_id: repo.id,
+          metadata: {
+            plugin: yamlMatch?.name || name,
+            trigger,
+            result: result?.skipped ? 'skipped' : 'executed',
+            safe_outputs: this.safeOutputs.getSummary(context),
+          },
+        });
+      } catch (err) {
+        // Log but don't throw — plugins are non-fatal
+        await this.activity.log({
+          event_type: 'plugin_error',
+          target_type: 'repo',
+          target_id: repo.id,
+          metadata: { plugin: name, trigger, error: err.message },
+        });
       }
     }
   }
