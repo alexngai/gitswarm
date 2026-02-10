@@ -1,0 +1,82 @@
+name: "GitSwarm: Issue Triage"
+
+# Triages newly opened issues: classifies, labels, checks for duplicates,
+# and posts a triage summary using the gitswarm MCP server for context.
+
+on:
+  issues:
+    types: [opened]
+  repository_dispatch:
+    types: [gitswarm.plugin.issue-enrichment]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: claude-sonnet-4-5-20250929
+          max_turns: 15
+          prompt: |
+            # GitSwarm Issue Triage
+
+            You are a triage assistant for a gitswarm-managed open source project.
+            A new issue has just been opened and needs to be processed.
+
+            ## Your tasks
+
+            1. **Read the issue** — understand the title, body, and any attached context.
+
+            2. **Check for duplicates** — search existing open issues for similar topics.
+               If you find a likely duplicate, add the `duplicate` label and post a comment
+               linking to the original issue. Consider closing the issue if it's a clear duplicate.
+
+            3. **Classify the issue** — choose the most appropriate label(s):
+               - `bug` — something is broken or behaving unexpectedly
+               - `feature` — a new capability that doesn't exist yet
+               - `enhancement` — an improvement to existing functionality
+               - `documentation` — docs are missing, unclear, or incorrect
+               - `good-first-issue` — suitable for new contributors (simple, well-scoped)
+               - `needs-info` — the issue lacks sufficient detail to act on
+
+            4. **Estimate complexity** — based on the scope of changes needed:
+               - **Low**: isolated change, single file, well-defined fix
+               - **Medium**: touches multiple files or requires design decisions
+               - **High**: architectural change, cross-cutting concern, or significant scope
+
+            5. **Check project context** — read `CONTRIBUTING.md` and `.gitswarm/config.yml`
+               if they exist, to understand project conventions and triage expectations.
+
+            6. **Use gitswarm context** — use the gitswarm MCP server to check for
+               related streams (in-progress work) that might already address this issue.
+               Also search for related existing issues/tasks via the MCP server.
+
+            7. **Post a triage summary comment** with:
+               - Your classification and reasoning
+               - Complexity estimate
+               - Any related issues or in-progress streams
+               - Suggested next steps for a contributor
+
+            8. **Report back to gitswarm** — When done, use the gitswarm MCP server's
+               `report_execution` tool to report your triage results. Include actions taken
+               (labels added, comments posted, issues closed) in the report.
+
+            ## Guidelines
+
+            - Be concise — maintainers are busy, keep comments under 200 words
+            - When uncertain between labels, prefer the more specific one
+            - Only add `good-first-issue` if the fix is genuinely approachable for a newcomer
+            - Only close issues if they are clear, exact duplicates — not just similar topics
+            - Add a maximum of 3 labels, post a maximum of 1 comment, close at most 1 issue
+        env:
+          GITSWARM_API_URL: ${{ secrets.GITSWARM_API_URL }}
+          GITSWARM_API_KEY: ${{ secrets.GITSWARM_API_KEY }}
+          GITSWARM_REPO_ID: ${{ secrets.GITSWARM_REPO_ID }}

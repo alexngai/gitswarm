@@ -9,21 +9,23 @@ import { councilRoutes } from './council.js';
 import { bountyRoutes } from './bounties.js';
 import { streamRoutes } from './streams.js';
 import { fileRoutes } from './files.js';
+import { pluginRoutes } from './plugins.js';
 import { getBackendForRepo } from '../../services/backend-factory.js';
 
 const permissionService = new GitSwarmPermissionService();
 
 export async function gitswarmRoutes(app, options = {}) {
-  const { activityService } = options;
+  const { activityService, pluginEngine, configSyncService } = options;
   const gitswarmService = options.gitswarmService || defaultGitswarmService;
 
   // Register sub-routes
   await app.register(installRoutes, { activityService });
   await app.register(packageRoutes, { activityService });
-  await app.register(councilRoutes, { activityService });
+  await app.register(councilRoutes, { activityService, pluginEngine });
   await app.register(bountyRoutes, { activityService });
-  await app.register(streamRoutes, { activityService });
+  await app.register(streamRoutes, { activityService, pluginEngine });
   await app.register(fileRoutes, { activityService });
+  await app.register(pluginRoutes, { activityService, pluginEngine, configSyncService });
 
   // Different rate limits for different operation types
   const rateLimitRead = createRateLimiter('gitswarm_read');

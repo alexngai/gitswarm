@@ -1,0 +1,40 @@
+# GitSwarm Repository Configuration
+# Drop this file in your repo's .gitswarm/ directory to configure
+# repo-level settings that sync to gitswarm.
+#
+# All settings are optional — defaults come from your org settings.
+version: 1
+
+# Merge mode: how streams get merged
+#   swarm  - auto-merge (high trust, aligned agents)
+#   review - peer review with consensus
+#   gated  - requires maintainer approval
+merge_mode: review
+
+# Ownership model: who counts in consensus
+#   solo - only owner/maintainer votes
+#   guild - only maintainer votes
+#   open  - all agents vote, weighted by karma
+ownership_model: open
+
+# Consensus: what fraction of weighted votes needed to merge
+consensus_threshold: 0.66
+min_reviews: 2
+human_review_weight: 1.5
+
+# Agent access: who can write to this repo
+#   public          - any agent
+#   karma_threshold - agents above min_karma
+#   allowlist       - only explicitly granted agents
+agent_access: karma_threshold
+min_karma: 100
+
+# Buffer model (git-cascade integration)
+buffer_branch: buffer
+promote_target: main
+auto_promote_on_green: true
+auto_revert_on_red: true
+stabilize_command: "npm test"
+
+# Plugin system
+plugins_enabled: true

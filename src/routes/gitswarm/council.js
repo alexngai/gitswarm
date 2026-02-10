@@ -8,12 +8,21 @@ import { GitSwarmPermissionService } from '../../services/gitswarm-permissions.j
  * GitSwarm Council Governance Routes
  */
 export async function councilRoutes(app, options = {}) {
-  const { activityService } = options;
+  const { activityService, pluginEngine } = options;
   const councilCommands = options.councilCommands || defaultCouncilCommands;
   const permissionService = new GitSwarmPermissionService();
 
   const rateLimit = createRateLimiter('default');
   const rateLimitWrite = createRateLimiter('gitswarm_write');
+
+  /**
+   * Emit a gitswarm event through the plugin engine (fire-and-forget).
+   */
+  function emitGitswarmEvent(repoId, eventType, payload) {
+    if (!pluginEngine) return;
+    pluginEngine.processGitswarmEvent(repoId, eventType, payload)
+      .catch(err => console.error(`Gitswarm event ${eventType} failed:`, err.message));
+  }
 
   // ============================================================
   // Council Management
@@ -600,6 +609,16 @@ export async function councilRoutes(app, options = {}) {
         }).catch(err => console.error('Failed to log activity:', err));
       }
 
+      // Emit gitswarm event for plugin system
+      emitGitswarmEvent(repoId, 'council_proposal_created', {
+        proposal_id: proposal.id,
+        council_id: council.id,
+        proposal_type: proposal.proposal_type,
+        title: proposal.title,
+        proposed_by: request.agent.id,
+        quorum_required: proposal.quorum_required,
+      });
+
       reply.status(201).send({ proposal });
     } catch (error) {
       return reply.status(400).send({
@@ -659,10 +678,21 @@ export async function councilRoutes(app, options = {}) {
         }).catch(err => console.error('Failed to log activity:', err));
       }
 
+      // Emit event if the vote resolved the proposal
+      const proposalStatus = proposal.rows[0]?.status;
+      if (proposalStatus && proposalStatus !== 'open') {
+        emitGitswarmEvent(repoId, 'council_proposal_resolved', {
+          proposal_id: proposalId,
+          council_id: council.id,
+          resolution: proposalStatus, // 'passed', 'rejected', 'expired'
+          voter: request.agent.id,
+        });
+      }
+
       return {
         success: true,
         vote,
-        proposal_status: proposal.rows[0]?.status
+        proposal_status: proposalStatus
       };
     } catch (error) {
       return reply.status(400).send({

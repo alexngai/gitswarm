@@ -1,0 +1,138 @@
+# GitSwarm Plugin Configuration
+# Defines automated behaviors triggered by gitswarm/GitHub events.
+#
+# Plugins dispatch work to your repo's GitHub Actions where YOUR installed
+# agents (Claude, Codex, Copilot) provide the compute. The gitswarm app
+# is an orchestrator, not a compute provider.
+version: 1
+
+plugins:
+  # ──────────────────────────────────────────────────────────
+  # Tier 1: Event-Driven Automation (deterministic, no AI)
+  # ──────────────────────────────────────────────────────────
+
+  auto-promote:
+    enabled: true
+    trigger: gitswarm.stabilization_passed
+    conditions:
+      branch: buffer
+    actions:
+      - promote_buffer_to_main
+      - close_completed_tasks
+    safe_outputs:
+      max_merges: 1
+      max_issue_closures: 10
+
+  stale-stream-cleanup:
+    enabled: false    # enable when ready
+    trigger: schedule.daily
+    conditions:
+      stream_inactive_days: 14
+    actions:
+      - notify_stream_owner
+    safe_outputs:
+      max_comments: 5
+      max_executions_per_day: 1
+
+  # ──────────────────────────────────────────────────────────
+  # Tier 2: AI-Augmented Processing
+  #
+  # These dispatch to GitHub Actions. The actual AI processing
+  # happens in YOUR repo's Actions environment using YOUR
+  # installed agents (Claude, Codex, Copilot).
+  # ──────────────────────────────────────────────────────────
+
+  issue-enrichment:
+    enabled: true
+    trigger: issues.opened
+    engine: auto          # uses whatever AI agent is installed
+    model: fast           # prefer fast/cheap model for triage
+    context:
+      - file: CONTRIBUTING.md
+      - file: .gitswarm/config.yml
+      - recent_issues: 20
+    actions:
+      - analyze_issue_context
+      - add_labels
+      - estimate_complexity
+      - suggest_related_streams
+    safe_outputs:
+      max_comments: 1
+      allowed_labels:
+        - bug
+        - feature
+        - enhancement
+        - documentation
+        - good-first-issue
+        - duplicate
+      max_label_additions: 3
+      max_executions_per_hour: 10
+
+  pr-risk-gate:
+    enabled: true
+    trigger: pull_request.opened
+    engine: auto
+    model: fast
+    risk_rules:
+      blocked_paths:
+        - ".github/workflows/"
+        - ".gitswarm/"
+        - "scripts/"
+      safe_paths:
+        - "docs/"
+        - "tests/"
+        - "*.md"
+      max_files_changed: 15
+      max_lines_changed: 500
+    actions:
+      - assess_risk
+      - add_risk_label
+      - post_summary_comment
+    safe_outputs:
+      max_comments: 1
+      allowed_labels:
+        - low-risk
+        - medium-risk
+        - high-risk
+      max_label_additions: 1
+
+  # ──────────────────────────────────────────────────────────
+  # Tier 3: Governance Delegation
+  #
+  # These act on gitswarm consensus/council decisions.
+  # The most powerful tier — merges PRs, modifies branches
+  # based on community consensus.
+  # ──────────────────────────────────────────────────────────
+
+  consensus-merge:
+    enabled: true
+    trigger: gitswarm.consensus_reached
+    conditions:
+      consensus_threshold_met: true
+      stabilization: green
+    actions:
+      - merge_stream_to_buffer
+      - create_github_pr
+      - notify_contributors
+    safe_outputs:
+      max_merges: 1
+      max_prs: 1
+      max_comments: 3
+
+  karma-fast-track:
+    enabled: false    # enable when repo is established
+    trigger: gitswarm.stream_submitted
+    conditions:
+      agent_karma: ">= 5000"
+      files_match:
+        - "docs/**"
+        - "tests/**"
+        - "*.md"
+      max_files_changed: 5
+    actions:
+      - auto_approve_review
+      - merge_to_buffer
+    safe_outputs:
+      max_approvals: 1
+      max_merges: 1
+      max_executions_per_hour: 5

@@ -1,0 +1,24 @@
+{
+  "name": "@gitswarm/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server that exposes gitswarm data to AI agents in GitHub Actions workflows",
+  "type": "module",
+  "bin": {
+    "gitswarm-mcp": "./index.js"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "gitswarm",
+    "mcp",
+    "model-context-protocol",
+    "github-actions",
+    "ai-agents"
+  ],
+  "license": "MIT"
+}

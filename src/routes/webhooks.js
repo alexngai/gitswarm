@@ -2,9 +2,13 @@ import { query } from '../config/database.js';
 import { githubApp } from '../services/github.js';
 
 let _activityService = null;
+let _pluginEngine = null;
+let _configSyncService = null;
 
 export async function webhookRoutes(app, options = {}) {
   _activityService = options.activityService || null;
+  _pluginEngine = options.pluginEngine || null;
+  _configSyncService = options.configSyncService || null;
   // GitHub webhook handler
   app.post('/webhooks/github', {
     config: {
@@ -50,8 +54,44 @@ export async function webhookRoutes(app, options = {}) {
         case 'issue_comment':
           await handleIssueCommentEvent(request.body);
           break;
+        case 'workflow_run':
+          await handleWorkflowRunEvent(request.body);
+          break;
         default:
           app.log.info({ event }, 'Unhandled GitHub event');
+      }
+
+      // Route event through plugin engine (non-blocking)
+      if (_pluginEngine) {
+        _pluginEngine.processWebhookEvent(event, request.body)
+          .catch(err => app.log.error({ error: err.message }, 'Plugin engine error'));
+
+        // Post-hoc audit: if this event represents a mutation that could have
+        // been produced by a dispatched AI workflow, attribute it for budget tracking
+        const auditAction = _mapWebhookToAuditAction(event, request.body);
+        if (auditAction) {
+          const auditRepoId = await _resolveRepoIdFromPayload(request.body);
+          if (auditRepoId) {
+            _pluginEngine.auditWorkflowAction(auditRepoId, auditAction, request.body)
+              .catch(err => app.log.error({ error: err.message }, 'Audit action error'));
+          }
+        }
+      }
+
+      // Check if push touches .gitswarm/ files — trigger config sync
+      if (event === 'push' && _configSyncService) {
+        const commits = request.body.commits || [];
+        const touchesConfig = commits.some(c =>
+          [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]
+            .some(f => f.startsWith('.gitswarm/'))
+        );
+        if (touchesConfig) {
+          const repoId = await _resolveRepoIdFromPayload(request.body);
+          if (repoId) {
+            _configSyncService.syncRepoConfig(repoId)
+              .catch(err => app.log.error({ error: err.message }, 'Config sync error on push'));
+          }
+        }
       }
 
       return { received: true };
@@ -258,6 +298,14 @@ async function handleExternalPullRequest(payload) {
         metadata: { repo_id: repo.id, source: 'github_pr', pr_number: pull_request.number },
       });
     }
+
+    // Emit gitswarm event for stream submission
+    emitGitswarmEvent(repo.id, 'stream_submitted', {
+      stream_id: streamId,
+      pr_number: pull_request.number,
+      stream_name: pull_request.head.ref,
+      agent: { id: agentId },
+    });
   } else if (action === 'closed') {
     const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
     const newStatus = pull_request.merged ? 'merged' : 'abandoned';
@@ -286,6 +334,15 @@ async function handleExternalPullRequest(payload) {
           metadata: { repo_id: repo.id, merge_commit: pull_request.merge_commit_sha },
         });
       }
+
+      // Emit gitswarm event for stream merge
+      emitGitswarmEvent(repo.id, 'stream_merged', {
+        stream_id: streamId,
+        pr_number: pull_request.number,
+        stream_name: pull_request.head.ref,
+        merge_commit: pull_request.merge_commit_sha,
+        agent: { id: agentId },
+      });
     } else if (_activityService) {
       // PR closed without merge (abandoned)
       await _activityService.logActivity({
@@ -388,6 +445,14 @@ async function handlePullRequestReviewEvent(payload) {
 
     // Update reviewer stats
     await updateReviewerStats(reviewerMapping.agent_id, verdict);
+
+    // Check consensus after agent review
+    if (verdict !== 'comment' && patch.repo_id) {
+      const streamId = `gh-pr-${repository.id}-${pull_request.number}`;
+      await checkAndEmitConsensus(
+        patch.repo_id, streamId, pull_request.number, pull_request.head.ref
+      );
+    }
   } else {
     // Human review from GitHub - store differently
     await storeHumanReview(patch.id, review, reviewerMapping);
@@ -474,6 +539,17 @@ async function writeReviewToStream(repository, pull_request, review, reviewerMap
   }
 
   console.log(`Review written to stream ${streamId}: ${review.user.login} ${verdict}`);
+
+  // Check consensus after each review and emit gitswarm events
+  if (verdict !== 'comment') {
+    const repoId = streamResult.rows[0]?.repo_id
+      || (await query(`SELECT repo_id FROM gitswarm_streams WHERE id = $1`, [streamId])).rows[0]?.repo_id;
+    if (repoId) {
+      await checkAndEmitConsensus(
+        repoId, streamId, pull_request.number, pull_request.head.ref
+      );
+    }
+  }
 }
 
 // Store human review from GitHub
@@ -1044,4 +1120,170 @@ async function handleBountyCommand(repoId, issue, comment, command, args) {
     default:
       console.log(`Unknown bounty command: ${command}`);
   }
+}
+
+// ============================================================
+// Workflow Run Events (passive execution tracking)
+// ============================================================
+
+async function handleWorkflowRunEvent(payload) {
+  const { action, workflow_run, repository } = payload;
+
+  // Only process completed workflow runs for gitswarm workflows
+  if (action !== 'completed') return;
+  if (!workflow_run?.name?.toLowerCase().includes('gitswarm')) return;
+
+  const repoId = await _resolveRepoIdFromPayload(payload);
+  if (!repoId) return;
+
+  const conclusion = workflow_run.conclusion; // 'success', 'failure', 'cancelled', etc.
+
+  // Resolve dispatched execution records that match this workflow
+  if (_pluginEngine) {
+    try {
+      await _pluginEngine.resolveWorkflowCompletion(
+        repoId,
+        workflow_run.name,
+        conclusion
+      );
+    } catch (err) {
+      console.error('Failed to resolve workflow completion:', err.message);
+    }
+  }
+}
+
+// ============================================================
+// Gitswarm Event Emission Helpers
+// ============================================================
+
+/**
+ * Emit a gitswarm event through the plugin engine.
+ * Called at lifecycle points where gitswarm-specific events occur.
+ * Fire-and-forget (non-blocking).
+ */
+function emitGitswarmEvent(repoId, eventType, payload) {
+  if (!_pluginEngine) return;
+  _pluginEngine.processGitswarmEvent(repoId, eventType, payload)
+    .catch(err => console.error(`Gitswarm event ${eventType} failed:`, err.message));
+}
+
+/**
+ * Check consensus status after a review and emit events if threshold is met.
+ * Called after reviews are recorded.
+ */
+async function checkAndEmitConsensus(repoId, streamId, prNumber, branchName) {
+  try {
+    const reviews = await query(`
+      SELECT verdict FROM gitswarm_stream_reviews WHERE stream_id = $1
+    `, [streamId]);
+
+    const approvals = reviews.rows.filter(r => r.verdict === 'approve').length;
+    const rejections = reviews.rows.filter(r => r.verdict === 'request_changes').length;
+    const total = approvals + rejections;
+    if (total === 0) return;
+
+    const repoConfig = await query(`
+      SELECT consensus_threshold FROM gitswarm_repos WHERE id = $1
+    `, [repoId]);
+    const threshold = repoConfig.rows[0]?.consensus_threshold || 0.66;
+    const ratio = approvals / total;
+
+    // Get stream author info
+    const stream = await query(`
+      SELECT agent_id FROM gitswarm_streams WHERE id = $1
+    `, [streamId]);
+    const agentId = stream.rows[0]?.agent_id;
+
+    let agentKarma = 0;
+    if (agentId) {
+      const karmaResult = await query(`SELECT karma FROM agents WHERE id = $1`, [agentId]);
+      agentKarma = karmaResult.rows[0]?.karma || 0;
+    }
+
+    if (ratio >= threshold) {
+      // Guard: only emit consensus_reached once per stream per hour
+      const alreadyEmitted = await query(`
+        SELECT id FROM gitswarm_plugin_executions
+        WHERE repo_id = $1 AND trigger_event = 'gitswarm.consensus_reached'
+          AND trigger_payload::text LIKE $2
+          AND created_at > NOW() - INTERVAL '1 hour'
+        LIMIT 1
+      `, [repoId, `%${streamId}%`]);
+
+      if (alreadyEmitted.rows.length === 0) {
+        emitGitswarmEvent(repoId, 'consensus_reached', {
+          stream_id: streamId,
+          pr_number: prNumber,
+          stream_name: branchName,
+          consensus: { achieved: ratio, approvals, rejections, threshold },
+          agent: { id: agentId, karma: agentKarma },
+        });
+      }
+    } else if (rejections > 0 && rejections >= total * (1 - threshold)) {
+      // Guard: only emit consensus_blocked once per stream per hour
+      const blockedAlreadyEmitted = await query(`
+        SELECT id FROM gitswarm_plugin_executions
+        WHERE repo_id = $1 AND trigger_event = 'gitswarm.consensus_blocked'
+          AND trigger_payload::text LIKE $2
+          AND created_at > NOW() - INTERVAL '1 hour'
+        LIMIT 1
+      `, [repoId, `%${streamId}%`]);
+
+      if (blockedAlreadyEmitted.rows.length === 0) {
+        emitGitswarmEvent(repoId, 'consensus_blocked', {
+          stream_id: streamId,
+          pr_number: prNumber,
+          stream_name: branchName,
+          consensus: { achieved: ratio, approvals, rejections, threshold },
+        });
+      }
+    }
+  } catch (err) {
+    console.error('checkAndEmitConsensus failed:', err.message);
+  }
+}
+
+/**
+ * Map a webhook event to an audit action name.
+ * Returns null if the event doesn't represent a trackable mutation.
+ */
+function _mapWebhookToAuditAction(event, payload) {
+  const action = payload.action;
+  switch (event) {
+    case 'issues':
+      if (action === 'labeled') return 'add_label';
+      if (action === 'unlabeled') return 'remove_label';
+      if (action === 'closed') return 'close_issue';
+      return null;
+    case 'issue_comment':
+      if (action === 'created') return 'add_comment';
+      return null;
+    case 'pull_request':
+      if (action === 'labeled') return 'add_label';
+      if (action === 'opened') return 'create_pr';
+      if (action === 'closed' && payload.pull_request?.merged) return 'merge_stream';
+      return null;
+    case 'pull_request_review':
+      if (payload.review?.state === 'approved') return 'auto_approve';
+      return null;
+    case 'create':
+      if (payload.ref_type === 'branch') return 'create_branch';
+      if (payload.ref_type === 'tag') return 'tag_release';
+      return null;
+    default:
+      return null;
+  }
+}
+
+// Helper to resolve gitswarm repo ID from webhook payload
+async function _resolveRepoIdFromPayload(payload) {
+  const repository = payload.repository;
+  if (!repository) return null;
+
+  const result = await query(`
+    SELECT id FROM gitswarm_repos
+    WHERE github_repo_id = $1 AND status = 'active'
+  `, [repository.id]);
+
+  return result.rows[0]?.id || null;
 }

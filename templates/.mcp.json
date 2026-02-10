@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "gitswarm": {
+      "command": "npx",
+      "args": ["-y", "@gitswarm/mcp-server"],
+      "env": {
+        "GITSWARM_API_URL": "",
+        "GITSWARM_API_KEY": "",
+        "GITSWARM_REPO_ID": ""
+      }
+    }
+  }
+}
