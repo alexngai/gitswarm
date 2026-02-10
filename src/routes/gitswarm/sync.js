@@ -192,10 +192,45 @@ export async function syncRoutes(app, options = {}) {
       ORDER BY cp.proposed_at DESC LIMIT 20
     `, [sinceDate]);
 
+    // Reviews on this agent's streams (e.g., someone reviewed your work)
+    const reviews = await query(`
+      SELECT sr.stream_id, sr.reviewer_id, sr.verdict, sr.reviewed_at, a.name as reviewer_name
+      FROM gitswarm_stream_reviews sr
+      JOIN gitswarm_streams s ON sr.stream_id = s.id
+      LEFT JOIN agents a ON sr.reviewer_id = a.id
+      WHERE s.agent_id = $1 AND sr.reviewed_at > $2
+      ORDER BY sr.reviewed_at DESC LIMIT 20
+    `, [agentId, sinceDate]);
+
+    // Merges on repos where this agent is a maintainer
+    const merges = await query(`
+      SELECT m.stream_id, m.agent_id, m.merge_commit, m.target_branch, m.created_at,
+             a.name as agent_name, s.name as stream_name
+      FROM gitswarm_merges m
+      JOIN gitswarm_maintainers mt ON m.repo_id = mt.repo_id
+      LEFT JOIN agents a ON m.agent_id = a.id
+      LEFT JOIN gitswarm_streams s ON m.stream_id = s.id
+      WHERE mt.agent_id = $1 AND m.created_at > $2
+      ORDER BY m.created_at DESC LIMIT 20
+    `, [agentId, sinceDate]);
+
+    // Config changes on repos this agent has access to
+    const configChanges = await query(`
+      SELECT rc.repo_id, rc.last_synced_at, r.github_full_name
+      FROM gitswarm_repo_config rc
+      JOIN gitswarm_repos r ON rc.repo_id = r.id
+      JOIN gitswarm_maintainers mt ON r.id = mt.repo_id
+      WHERE mt.agent_id = $1 AND rc.last_synced_at > $2
+      ORDER BY rc.last_synced_at DESC LIMIT 20
+    `, [agentId, sinceDate]);
+
     return {
       tasks: tasks.rows,
       access_changes: accessChanges.rows,
       proposals: proposals.rows,
+      reviews: reviews.rows,
+      merges: merges.rows,
+      config_changes: configChanges.rows,
       polled_at: new Date().toISOString(),
     };
   });
@@ -316,11 +351,19 @@ async function processSyncEvent(type, data, agentId, { activityService, pluginEn
       `, [data.repoId, data.toStage || data.to_stage]);
       break;
 
+    case 'task_claim':
+      await query(`
+        INSERT INTO gitswarm_task_claims (task_id, agent_id, stream_id, status)
+        VALUES ($1, $2, $3, 'active')
+        ON CONFLICT (task_id, agent_id) DO NOTHING
+      `, [data.taskId || data.task_id, agentId, data.streamId || data.stream_id || null]);
+      break;
+
     case 'task_submission':
       await query(`
         UPDATE gitswarm_task_claims SET status = 'submitted', submission_notes = $2, submitted_at = NOW()
         WHERE task_id = $1 AND agent_id = $3
-      `, [data.taskId, data.notes || data.submission_notes, agentId]);
+      `, [data.taskId || data.task_id, data.notes || data.submission_notes, agentId]);
       break;
 
     default:

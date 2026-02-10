@@ -138,7 +138,7 @@ export class SyncClient {
    * CLI performs the actual git merge locally if approved.
    */
   async requestMerge(repoId, streamId) {
-    return this._post(`/gitswarm/repos/${repoId}/streams/${streamId}/merge`, {});
+    return this._post(`/gitswarm/repos/${repoId}/streams/${streamId}/merge-request`, {});
   }
 
   /**
@@ -207,8 +207,8 @@ export class SyncClient {
   /**
    * Claim a task.
    */
-  async claimTask(taskId, { streamId } = {}) {
-    return this._post(`/gitswarm/tasks/${taskId}/claim`, {
+  async claimTask(repoId, taskId, { streamId } = {}) {
+    return this._post(`/gitswarm/repos/${repoId}/tasks/${taskId}/claim`, {
       agent_id: this.agentId,
       stream_id: streamId,
     });
@@ -271,8 +271,8 @@ export class SyncClient {
 
   // ── Task Sync ─────────────────────────────────────────────
 
-  async syncTaskSubmission(taskId, { streamId, notes }) {
-    return this._post(`/gitswarm/tasks/${taskId}/submit`, {
+  async syncTaskSubmission(repoId, taskId, claimId, { streamId, notes }) {
+    return this._post(`/gitswarm/repos/${repoId}/tasks/${taskId}/claims/${claimId}/submit`, {
       agent_id: this.agentId,
       stream_id: streamId,
       submission_notes: notes,
@@ -418,8 +418,10 @@ export class SyncClient {
         return this.syncCouncilVote(data.repoId, data.proposalId, data);
       case 'stage_progression':
         return this.syncStageProgression(data.repoId, data);
+      case 'task_claim':
+        return this.claimTask(data.repoId, data.taskId, data);
       case 'task_submission':
-        return this.syncTaskSubmission(data.taskId, data);
+        return this.syncTaskSubmission(data.repoId, data.taskId, data.claimId, data);
       default:
         throw new Error(`Unknown queued event type: ${type}`);
     }

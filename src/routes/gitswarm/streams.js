@@ -469,7 +469,54 @@ export async function streamRoutes(app, options = {}) {
   });
 
   // ============================================================
-  // Merge to buffer
+  // Merge request (approval check only — does NOT record a merge)
+  // ============================================================
+
+  app.post('/gitswarm/repos/:repoId/streams/:streamId/merge-request', {
+    preHandler: [authenticate, rateLimitRead],
+  }, async (request, reply) => {
+    const { repoId, streamId } = request.params;
+    const agentId = request.agent.id;
+
+    const repo = await query(`
+      SELECT merge_mode, buffer_branch FROM gitswarm_repos WHERE id = $1
+    `, [repoId]);
+
+    if (repo.rows.length === 0) {
+      return reply.status(404).send({ error: 'Repository not found' });
+    }
+
+    const { merge_mode, buffer_branch } = repo.rows[0];
+
+    if (merge_mode === 'gated') {
+      const perm = await permissionService.canPerform(agentId, repoId, 'merge');
+      if (!perm.allowed) {
+        return reply.status(403).send({
+          error: 'Forbidden',
+          message: 'Gated mode requires maintainer approval to merge',
+        });
+      }
+    }
+
+    if (merge_mode !== 'swarm') {
+      const consensus = await permissionService.checkConsensus(streamId, repoId);
+      if (!consensus.reached) {
+        return reply.status(409).send({
+          approved: false,
+          consensus,
+          bufferBranch: buffer_branch,
+        });
+      }
+    }
+
+    return {
+      approved: true,
+      bufferBranch: buffer_branch,
+    };
+  });
+
+  // ============================================================
+  // Merge completed (records actual merge — called after git merge)
   // ============================================================
 
   app.post('/gitswarm/repos/:repoId/streams/:streamId/merge', {
@@ -785,5 +832,43 @@ export async function streamRoutes(app, options = {}) {
     `, [repoId, streamTypes, limit, offset]);
 
     return { events: result.rows };
+  });
+
+  // ============================================================
+  // Repo Config (for CLI config pull)
+  // ============================================================
+
+  app.get('/gitswarm/repos/:repoId/config', {
+    preHandler: [authenticate, rateLimitRead],
+  }, async (request, reply) => {
+    const { repoId } = request.params;
+
+    const canRead = await permissionService.canPerform(request.agent.id, repoId, 'read');
+    if (!canRead.allowed) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const repo = await query(`
+      SELECT merge_mode, ownership_model, consensus_threshold, min_reviews,
+             human_review_weight, agent_access, min_karma, buffer_branch,
+             promote_target, auto_promote_on_green, auto_revert_on_red,
+             stabilize_command, plugins_enabled, stage
+      FROM gitswarm_repos WHERE id = $1
+    `, [repoId]);
+
+    if (repo.rows.length === 0) {
+      return reply.status(404).send({ error: 'Repository not found' });
+    }
+
+    // Include config sync info if available
+    const configSync = await query(`
+      SELECT config_sha, plugins_sha, last_synced_at, sync_error
+      FROM gitswarm_repo_config WHERE repo_id = $1
+    `, [repoId]);
+
+    return {
+      config: repo.rows[0],
+      config_sync: configSync.rows[0] || null,
+    };
   });
 }

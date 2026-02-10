@@ -419,6 +419,17 @@ commands.task = async (fed, { positional, flags }) => {
     const claim = await fed.tasks.claim(fullId, agent.id, flags.stream);
     console.log(`Task claimed: ${short(claim.id)}`);
     if (claim.stream_id) console.log(`  stream: ${claim.stream_id}`);
+
+    // Mode B: sync task claim to server
+    if (fed.sync) {
+      try {
+        await fed.sync.claimTask(repo.id, fullId, { streamId: flags.stream });
+      } catch {
+        fed.sync._queueEvent({ type: 'task_claim', data: {
+          repoId: repo.id, taskId: fullId, streamId: flags.stream,
+        }});
+      }
+    }
     return;
   }
 
@@ -432,6 +443,21 @@ commands.task = async (fed, { positional, flags }) => {
       notes: flags.notes || '',
     });
     console.log(`Submission recorded: ${short(result.id)}`);
+
+    // Mode B: sync task submission to server
+    if (fed.sync) {
+      try {
+        await fed.sync.syncTaskSubmission(repo.id, result.task_id, fullId, {
+          streamId: result.stream_id,
+          notes: flags.notes || '',
+        });
+      } catch {
+        fed.sync._queueEvent({ type: 'task_submission', data: {
+          repoId: repo.id, taskId: result.task_id, claimId: fullId,
+          streamId: result.stream_id, notes: flags.notes || '',
+        }});
+      }
+    }
     return;
   }
 
@@ -619,6 +645,20 @@ commands.status = async (fed) => {
   } catch {
     // Tracker may not be available
   }
+
+  // Check for Tier 2/3 plugin compatibility
+  try {
+    const pluginWarnings = fed.checkPluginCompatibility();
+    if (pluginWarnings.length > 0) {
+      console.log('\nWarnings:');
+      for (const w of pluginWarnings) {
+        console.log(`  ! ${w}`);
+      }
+      console.log('  Connect to a server (Mode B) to enable these plugins.');
+    }
+  } catch {
+    // Non-fatal
+  }
 };
 
 // --- log ---
@@ -635,7 +675,25 @@ commands.log = async (fed, { flags }) => {
 };
 
 // --- config ---
-commands.config = async (fed, { positional }) => {
+commands.config = async (fed, { positional, flags }) => {
+  // Pull config from server
+  if (flags.pull) {
+    const result = await fed.pullConfig();
+    if (!result) {
+      console.error('Not connected to server. Use gitswarm config --pull after connecting (Mode B).');
+      process.exit(1);
+    }
+    if (result.updated.length === 0) {
+      console.log('Config is up to date with server.');
+    } else {
+      console.log(`Updated ${result.updated.length} fields from server:`);
+      for (const field of result.updated) {
+        console.log(`  ${field} = ${result.config[field]}`);
+      }
+    }
+    return;
+  }
+
   const config = fed.config();
   if (positional.length === 0) {
     console.log(JSON.stringify(config, null, 2));
@@ -650,6 +708,45 @@ commands.config = async (fed, { positional }) => {
   config[positional[0]] = positional[1];
   write(joinPath(fed.swarmDir, 'config.json'), JSON.stringify(config, null, 2));
   console.log(`Set ${positional[0]} = ${positional[1]}`);
+};
+
+// --- sync ---
+commands.sync = async (fed) => {
+  if (!fed.sync) {
+    console.error('Not connected to server. Connect with Mode B first.');
+    process.exit(1);
+  }
+
+  // Push: flush queued events to server
+  console.log('Pushing local events to server...');
+  try {
+    await fed.sync.flushQueue();
+    console.log('  Queue flushed.');
+  } catch (err) {
+    console.error(`  Push failed: ${err.message}`);
+  }
+
+  // Pull: poll for server updates
+  console.log('Pulling updates from server...');
+  const updates = await fed.pollUpdates();
+  if (!updates) {
+    console.error('  Failed to poll updates.');
+    return;
+  }
+
+  const counts = [];
+  if (updates.tasks?.length > 0) counts.push(`${updates.tasks.length} new tasks`);
+  if (updates.access_changes?.length > 0) counts.push(`${updates.access_changes.length} access changes`);
+  if (updates.proposals?.length > 0) counts.push(`${updates.proposals.length} proposals`);
+  if (updates.reviews?.length > 0) counts.push(`${updates.reviews.length} reviews`);
+  if (updates.merges?.length > 0) counts.push(`${updates.merges.length} merges`);
+  if (updates.config_changes?.length > 0) counts.push(`${updates.config_changes.length} config changes`);
+
+  if (counts.length === 0) {
+    console.log('  Up to date.');
+  } else {
+    console.log(`  Received: ${counts.join(', ')}`);
+  }
 };
 
 // ── ID resolution helper ───────────────────────────────────
