@@ -266,4 +266,23 @@ All P0, P1, and P2 items from the original gap analysis have been implemented. T
 
 ---
 
-*Generated: 2024-01-15*
+## Cross-Level Architecture Fixes (2026-02-10)
+
+A full-stack review identified friction points where the three operational levels (CLI, server, repo-level config) diverge in behavior. Four critical/high-priority issues were fixed:
+
+| Fix | Issue | Files Changed |
+|-----|-------|---------------|
+| #11 | Council `merge_stream` only flipped a DB flag on server; now executes actual merge via backend | `src/services/council-commands.js` |
+| #15 | Consensus evaluated against stale data when flush partially failed; now blocks merge on review sync failures | `cli/src/sync-client.js`, `cli/src/federation.js` |
+| #2 | Gated mode bypassed server policy in Mode B; now delegates to `requestMerge` endpoint | `cli/src/federation.js` |
+| #7 | Tier 2/3 plugins silently ignored in Mode A; now warns on open and logs skipped plugins | `cli/src/federation.js` |
+
+See `docs/CROSS_LEVEL_FIXES.md` for detailed design rationale and behavioral change tables.
+
+Tests: `tests/unit/cross-level-friction.test.js` (19 tests)
+
+Remaining lower-priority cross-level gaps are documented in `CROSS_LEVEL_FIXES.md § Remaining Known Gaps`.
+
+---
+
+*Generated: 2024-01-15 | Updated: 2026-02-10*
