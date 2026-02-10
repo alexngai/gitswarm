@@ -540,17 +540,15 @@ export class Federation {
     // Mode B: report commit to server
     if (this.sync) {
       try {
-        const repo2 = await this.repo();
-        await this.sync.syncCommit(repo2.id, streamId, {
+        await this.sync.syncCommit(repo.id, streamId, {
           commitHash: commit,
           changeId,
           message,
         });
       } catch {
         // Server unreachable — queue for later sync
-        const repo2 = await this.repo();
         this.sync._queueEvent({ type: 'commit', data: {
-          repoId: repo2.id, streamId, commitHash: commit, changeId, message,
+          repoId: repo.id, streamId, commitHash: commit, changeId, message,
         }});
       }
     }
@@ -896,25 +894,23 @@ export class Federation {
         // Tag creation may fail if buffer doesn't exist
       }
 
-      // Fire builtin plugins for stabilization_passed
+      // Fire builtin plugins for stabilization_passed.
+      // The promote_buffer_to_main plugin handles auto-promotion if configured.
       let promoted = false;
       try {
         await this._fireBuiltinPlugins('stabilization_passed', repo, {
           tag: tagName, bufferBranch, passed: true,
         });
-        // Check if auto-promote plugin already handled promotion
-        promoted = repo.auto_promote_on_green || false;
+        promoted = !!repo.auto_promote_on_green;
       } catch {
-        // Plugin execution non-fatal
-      }
-
-      // Fallback: promote directly if auto_promote_on_green and plugin didn't run
-      if (repo.auto_promote_on_green && !promoted) {
-        try {
-          const result = await this.promote({ tag: tagName });
-          promoted = result.success;
-        } catch {
-          // Promotion failed, not critical
+        // Plugin execution failed — fall back to direct promotion
+        if (repo.auto_promote_on_green) {
+          try {
+            const result = await this.promote({ tag: tagName });
+            promoted = result.success;
+          } catch {
+            // Promotion failed, not critical
+          }
         }
       }
 

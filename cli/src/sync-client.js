@@ -378,12 +378,12 @@ export class SyncClient {
         await this._dispatchQueuedEvent(event.event_type, data);
         await this.store.query(`DELETE FROM sync_queue WHERE id = ?`, [event.id]);
         flushed++;
-      } catch {
+      } catch (err) {
         // Update attempt count
         try {
           await this.store.query(
             `UPDATE sync_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?`,
-            [String(arguments[0]?.message || 'unknown'), event.id]
+            [String(err?.message || 'unknown'), event.id]
           );
         } catch { /* ignore */ }
         break; // Stop on first failure (preserve ordering)
