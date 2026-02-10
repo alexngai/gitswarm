@@ -270,6 +270,71 @@ export class Federation {
     return JSON.parse(readFileSync(p, 'utf-8'));
   }
 
+  /** Write updated values back to `.gitswarm/config.json`. */
+  _saveConfig(updates) {
+    const p = join(this.swarmDir, CONFIG_FILE);
+    const current = this.config();
+    const merged = { ...current, ...updates, _lastSync: new Date().toISOString() };
+    writeFileSync(p, JSON.stringify(merged, null, 2) + '\n');
+    return merged;
+  }
+
+  /**
+   * Pull config from server and reconcile with local config.json + repos table.
+   * Only updates server-owned fields and fields where remote is newer.
+   * Returns { updated: [...fields], config } or null if no sync client.
+   */
+  async pullConfig() {
+    if (!this.sync) return null;
+
+    const repo = await this.repo();
+    if (!repo) return null;
+
+    const remote = await this.sync.getRepoConfig(repo.id);
+    if (!remote || !remote.config) return null;
+
+    // Fields the server owns — always take from server
+    const serverOwnedFields = [
+      'merge_mode', 'ownership_model', 'consensus_threshold', 'min_reviews',
+      'human_review_weight', 'buffer_branch', 'promote_target',
+      'auto_promote_on_green', 'auto_revert_on_red', 'stabilize_command',
+      'agent_access', 'min_karma', 'plugins_enabled', 'stage',
+    ];
+
+    const localConfig = this.config();
+    const updates = {};
+    const updatedFields = [];
+
+    for (const field of serverOwnedFields) {
+      if (remote.config[field] !== undefined && remote.config[field] !== localConfig[field]) {
+        updates[field] = remote.config[field];
+        updatedFields.push(field);
+      }
+    }
+
+    if (updatedFields.length > 0) {
+      // Update config.json
+      this._saveConfig(updates);
+
+      // Update local repos table to match
+      const repoUpdateFields = [
+        'merge_mode', 'ownership_model', 'consensus_threshold', 'min_reviews',
+        'human_review_weight', 'buffer_branch', 'promote_target',
+        'auto_promote_on_green', 'auto_revert_on_red', 'stabilize_command',
+      ];
+      for (const field of repoUpdateFields) {
+        if (updates[field] !== undefined) {
+          await this.store.query(
+            `UPDATE repos SET ${field} = ? WHERE id = ?`,
+            [updates[field], repo.id]
+          );
+        }
+      }
+    }
+
+    return { updated: updatedFields, config: { ...localConfig, ...updates } };
+  }
+
   /** Get the single repo record (local federations have one repo). */
   async repo() {
     const r = await this.store.query(`SELECT * FROM repos LIMIT 1`);
@@ -383,7 +448,8 @@ export class Federation {
       }
     }
 
-    // Dual-write: record stream in policy-level streams table
+    // Dual-write: record stream in policy-level streams table.
+    // This is critical for consensus checks and stage metrics — log errors rather than swallowing.
     const branchForStream = tracker.getStreamBranchName(streamId);
     try {
       await this.store.query(
@@ -392,8 +458,9 @@ export class Federation {
         [streamId, repo.id, agentId, streamName, branchForStream,
          repo.buffer_branch || 'buffer', dependsOn || null, taskId || null]
       );
-    } catch {
-      // streams table may not exist in older schemas — non-fatal
+    } catch (err) {
+      console.error(`Warning: failed to write stream to policy table: ${err.message}`);
+      console.error('Consensus checks and stage metrics may be incomplete.');
     }
 
     await this.activity.log({
@@ -585,7 +652,9 @@ export class Federation {
         `UPDATE streams SET status = 'in_review', review_status = 'in_review', updated_at = datetime('now') WHERE id = ?`,
         [streamId]
       );
-    } catch { /* streams table may not exist */ }
+    } catch (err) {
+      console.error(`Warning: failed to update stream in policy table: ${err.message}`);
+    }
 
     await this.activity.log({
       agent_id: agentId,
@@ -732,6 +801,13 @@ export class Federation {
       // Check consensus — use server as authority when connected (Mode B)
       let consensus;
       if (repo.consensus_authority === 'server' && this.sync) {
+        // Flush any pending review events so the server has the latest data
+        try {
+          await this.sync.flushQueue();
+        } catch {
+          // Non-fatal: server may be unreachable — the consensus check below will handle it
+        }
+
         try {
           consensus = await this.sync.checkConsensus(repo.id, streamId);
         } catch {
@@ -772,7 +848,9 @@ export class Federation {
         `UPDATE streams SET status = 'merged', review_status = 'approved', updated_at = datetime('now') WHERE id = ?`,
         [streamId]
       );
-    } catch { /* streams table may not exist */ }
+    } catch (err) {
+      console.error(`Warning: failed to update stream status in policy table: ${err.message}`);
+    }
     const mergeResult = { success: true, newHead: _git(this.repoPath, 'git rev-parse HEAD') };
 
     // Update stage metrics after merge
@@ -1149,6 +1227,35 @@ export class Federation {
    * Only handles Tier 1 (deterministic automations) locally.
    * Tier 2 (AI) and Tier 3 (governance) are server-only.
    */
+  /**
+   * Check if the repo has .gitswarm/plugins.yml with Tier 2/3 plugins
+   * that require a server connection to execute. Returns warnings.
+   */
+  checkPluginCompatibility() {
+    const { existsSync: exists, readFileSync: read } = require('fs');
+    const pluginsPath = join(this.repoPath, '.gitswarm', 'plugins.yml');
+    if (!exists(pluginsPath)) return [];
+
+    const content = read(pluginsPath, 'utf-8');
+    const warnings = [];
+
+    // Simple heuristic: check for Tier 2/3 indicators
+    const tier2Indicators = ['engine:', 'model:', 'dispatch'];
+    const tier3Indicators = ['consensus_reached', 'council', 'governance'];
+
+    const hasTier2 = tier2Indicators.some(i => content.includes(i));
+    const hasTier3 = tier3Indicators.some(i => content.includes(i));
+
+    if (hasTier2 && !this.sync) {
+      warnings.push('Tier 2 (AI-augmented) plugins in plugins.yml require a server connection to execute.');
+    }
+    if (hasTier3 && !this.sync) {
+      warnings.push('Tier 3 (governance) plugins in plugins.yml require a server connection to execute.');
+    }
+
+    return warnings;
+  }
+
   async _fireBuiltinPlugins(trigger, repo, eventData) {
     for (const [name, plugin] of Object.entries(BUILTIN_PLUGINS)) {
       if (plugin.trigger === trigger) {
@@ -1171,7 +1278,8 @@ export class Federation {
 
   /**
    * Poll the server for updates relevant to this agent.
-   * Returns task assignments, access changes, etc.
+   * Returns task assignments, access changes, reviews, merges, and config changes.
+   * Applies remote review updates to local patch_reviews table for consistency.
    */
   async pollUpdates() {
     if (!this.sync) return null;
@@ -1180,9 +1288,32 @@ export class Federation {
       const since = cfg._lastPoll || new Date(0).toISOString();
       const updates = await this.sync.pollUpdates(since);
 
+      // Apply remote reviews to local patch_reviews table (Fix #10: bidirectional sync)
+      if (updates.reviews && updates.reviews.length > 0) {
+        for (const review of updates.reviews) {
+          try {
+            await this.store.query(
+              `INSERT OR IGNORE INTO patch_reviews (stream_id, reviewer_id, verdict, feedback, is_human)
+               VALUES (?, ?, ?, ?, 0)`,
+              [review.stream_id, review.reviewer_id, review.verdict, review.feedback || '']
+            );
+          } catch {
+            // May already exist — non-fatal
+          }
+        }
+      }
+
+      // If config changed on server, pull latest config
+      if (updates.config_changes && updates.config_changes.length > 0) {
+        try {
+          await this.pullConfig();
+        } catch {
+          // Non-fatal
+        }
+      }
+
       // Persist poll timestamp
-      cfg._lastPoll = new Date().toISOString();
-      writeFileSync(join(this.swarmDir, CONFIG_FILE), JSON.stringify(cfg, null, 2));
+      this._saveConfig({ _lastPoll: new Date().toISOString() });
 
       return updates;
     } catch {

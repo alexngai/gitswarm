@@ -142,6 +142,15 @@ export class ConfigSyncService {
    * are managed via the API and are NOT overwritten by config.yml.
    */
   async _syncRepoSettings(repoId, config) {
+    // Warn if config.yml contains server-owned fields (they'll be ignored)
+    const SERVER_OWNED = ['agent_access', 'min_karma', 'ownership_model', 'is_private',
+      'stage', 'require_human_approval', 'human_can_force_merge'];
+    const ignored = SERVER_OWNED.filter(f => config[f] !== undefined);
+    if (ignored.length > 0) {
+      console.warn(`Config sync: ignoring server-owned fields in config.yml: ${ignored.join(', ')}. ` +
+        `These can only be changed via the API.`);
+    }
+
     // Repo-owned fields only — server-owned fields are excluded.
     const settingsMap = {
       merge_mode: config.merge_mode,

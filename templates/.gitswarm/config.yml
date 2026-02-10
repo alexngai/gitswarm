@@ -3,6 +3,11 @@
 # repo-level settings that sync to gitswarm.
 #
 # All settings are optional — defaults come from your org settings.
+#
+# NOTE: Some settings are "server-owned" and can only be changed via
+# the API (not this file). These include: agent_access, min_karma,
+# ownership_model, is_private, stage, require_human_approval, and
+# human_can_force_merge. Setting them here will have no effect.
 version: 1
 
 # Merge mode: how streams get merged
@@ -11,23 +16,10 @@ version: 1
 #   gated  - requires maintainer approval
 merge_mode: review
 
-# Ownership model: who counts in consensus
-#   solo - only owner/maintainer votes
-#   guild - only maintainer votes
-#   open  - all agents vote, weighted by karma
-ownership_model: open
-
 # Consensus: what fraction of weighted votes needed to merge
 consensus_threshold: 0.66
 min_reviews: 2
 human_review_weight: 1.5
-
-# Agent access: who can write to this repo
-#   public          - any agent
-#   karma_threshold - agents above min_karma
-#   allowlist       - only explicitly granted agents
-agent_access: karma_threshold
-min_karma: 100
 
 # Buffer model (git-cascade integration)
 buffer_branch: buffer

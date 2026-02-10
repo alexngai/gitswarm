@@ -270,12 +270,16 @@ describe('StageProgressionService', () => {
 
   describe('updateRepoMetrics', () => {
     it('should update contributor and patch counts', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ count: '5' }] });
-      mockQuery.mockResolvedValueOnce({ rows: [{ count: '12' }] });
+      // Query 1: COUNT from streams (contributor + stream count in one query)
+      mockQuery.mockResolvedValueOnce({ rows: [{ contributor_count: '5', stream_count: '12' }] });
+      // Query 2: COUNT from merges (contributor + merge count)
+      mockQuery.mockResolvedValueOnce({ rows: [{ contributor_count: '3', merge_count: '10' }] });
+      // Query 3: UPDATE repos
       mockQuery.mockResolvedValueOnce({ rows: [] });
 
       const result = await stageService.updateRepoMetrics('repo-uuid');
 
+      // Takes the max of streams vs merges
       expect(result.contributor_count).toBe(5);
       expect(result.patch_count).toBe(12);
     });
