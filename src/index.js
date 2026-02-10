@@ -174,6 +174,44 @@ app.setErrorHandler((error, request, reply) => {
   });
 });
 
+/**
+ * Startup sync: re-sync .gitswarm/ config for all active repos with plugins enabled.
+ * Ensures the database is up to date after server restart.
+ * Runs in batches with delay to avoid GitHub API rate limits.
+ */
+async function startupSync() {
+  try {
+    const repos = await db.query(`
+      SELECT id FROM gitswarm_repos
+      WHERE status = 'active' AND plugins_enabled = true
+    `);
+
+    if (repos.rows.length === 0) return;
+    console.log(`Startup sync: ${repos.rows.length} repos with plugins enabled`);
+
+    const BATCH_SIZE = 5;
+    const BATCH_DELAY_MS = 2000;
+
+    for (let i = 0; i < repos.rows.length; i += BATCH_SIZE) {
+      const batch = repos.rows.slice(i, i + BATCH_SIZE);
+      await Promise.allSettled(
+        batch.map(repo =>
+          configSyncService.syncRepoConfig(repo.id)
+            .catch(err => console.error(`Startup sync failed for ${repo.id}:`, err.message))
+        )
+      );
+
+      if (i + BATCH_SIZE < repos.rows.length) {
+        await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+      }
+    }
+
+    console.log('Startup sync complete');
+  } catch (err) {
+    console.error('Startup sync error:', err.message);
+  }
+}
+
 // Start server
 async function start() {
   try {
@@ -187,6 +225,9 @@ async function start() {
     console.log(`BotHub API running at http://${config.host}:${config.port}`);
     console.log(`API prefix: ${apiPrefix}`);
     console.log(`WebSocket: ws://${config.host}:${config.port}/ws`);
+
+    // Run startup sync in background (non-blocking)
+    startupSync();
   } catch (err) {
     app.log.error(err);
     process.exit(1);
@@ -208,4 +249,4 @@ process.on('SIGTERM', shutdown);
 start();
 
 // Export for testing
-export { app, wsService, activityService, embeddingsService, notificationService };
+export { app, wsService, activityService, embeddingsService, notificationService, pluginEngine, configSyncService };

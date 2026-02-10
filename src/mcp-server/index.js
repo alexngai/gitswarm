@@ -3,29 +3,31 @@
 /**
  * GitSwarm MCP Server
  *
- * Exposes gitswarm data to AI agents running inside gh-aw workflows
+ * Exposes gitswarm data to AI agents running inside GitHub Actions workflows
  * via the Model Context Protocol (MCP). This is the bridge that lets
- * GitHub Actions workflows access gitswarm concepts (consensus, karma,
- * streams, repo config) without routing through the gitswarm web app.
+ * workflow-based AI agents (claude-code-action, codex-action) access
+ * gitswarm concepts (consensus, karma, streams, repo config).
  *
  * Architecture:
- *   gh-aw workflow → MCP client → this server → gitswarm API
+ *   GitHub Actions workflow → AI agent → MCP client → this server → gitswarm API
  *
  * The server reads GITSWARM_API_URL and GITSWARM_API_KEY from env,
  * then exposes tools that the AI agent in the workflow can call.
  *
- * Usage in gh-aw frontmatter:
- *   mcp-servers:
- *     gitswarm:
- *       command: "npx"
- *       args: ["-y", "@gitswarm/mcp-server"]
- *       env:
- *         GITSWARM_API_URL: "${{ secrets.GITSWARM_API_URL }}"
- *         GITSWARM_API_KEY: "${{ secrets.GITSWARM_API_KEY }}"
- *       allowed:
- *         - get_repo_config
- *         - get_agent_karma
- *         - search_streams
+ * Usage in .mcp.json (auto-detected by claude-code-action):
+ *   {
+ *     "mcpServers": {
+ *       "gitswarm": {
+ *         "command": "npx",
+ *         "args": ["-y", "@gitswarm/mcp-server"],
+ *         "env": {
+ *           "GITSWARM_API_URL": "",
+ *           "GITSWARM_API_KEY": "",
+ *           "GITSWARM_REPO_ID": ""
+ *         }
+ *       }
+ *     }
+ *   }
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';

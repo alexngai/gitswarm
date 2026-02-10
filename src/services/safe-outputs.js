@@ -17,7 +17,7 @@ const DEFAULT_LIMITS = {
   max_commits: 5,
   max_files_changed: 20,
   max_issue_closures: 1,
-  max_pr_creates: 1,
+  max_prs: 1,
   max_approvals: 1,
   max_tags: 1,
   max_releases: 1,
@@ -26,26 +26,31 @@ const DEFAULT_LIMITS = {
   cooldown_seconds: 60,
 };
 
-// Actions that map to safe output counters
+// Actions that map to safe output counters.
+// Keys must match what plugins.yml uses (e.g., max_prs, max_merges).
 const ACTION_COST_MAP = {
-  'add_comment':        'max_comments',
-  'post_summary':       'max_comments',
-  'add_label':          'max_label_additions',
-  'add_labels':         'max_label_additions',
-  'remove_label':       'max_label_removals',
-  'merge_to_buffer':    'max_merges',
-  'merge_stream':       'max_merges',
-  'auto_approve':       'max_approvals',
-  'auto_approve_review': 'max_approvals',
-  'create_branch':      'max_branch_creates',
-  'create_pr':          'max_pr_creates',
-  'create_github_pr':   'max_pr_creates',
-  'close_issue':        'max_issue_closures',
-  'close_completed_tasks': 'max_issue_closures',
-  'create_commit':      'max_commits',
-  'tag_release':        'max_tags',
+  'add_comment':            'max_comments',
+  'post_summary':           'max_comments',
+  'add_label':              'max_label_additions',
+  'add_labels':             'max_label_additions',
+  'remove_label':           'max_label_removals',
+  'merge_to_buffer':        'max_merges',
+  'merge_stream':           'max_merges',
+  'merge_stream_to_buffer': 'max_merges',
+  'promote_buffer_to_main': 'max_merges',
+  'auto_approve':           'max_approvals',
+  'auto_approve_review':    'max_approvals',
+  'create_branch':          'max_branch_creates',
+  'create_pr':              'max_prs',
+  'create_github_pr':       'max_prs',
+  'close_issue':            'max_issue_closures',
+  'close_completed_tasks':  'max_issue_closures',
+  'create_commit':          'max_commits',
+  'tag_release':            'max_tags',
   'tag_release_semver_patch': 'max_tags',
-  'create_release':     'max_releases',
+  'create_release':         'max_releases',
+  'notify_contributors':    'max_comments',
+  'notify_stream_owner':    'max_comments',
 };
 
 export class SafeOutputsEnforcer {
@@ -75,7 +80,8 @@ export class SafeOutputsEnforcer {
   checkAction(context, actionName, count = 1) {
     const limitKey = ACTION_COST_MAP[actionName];
     if (!limitKey) {
-      // Unknown action type — allow by default (no budget tracking)
+      // Unknown action type — warn and allow by default (no budget tracking)
+      console.warn(`Safe outputs: unknown action "${actionName}", allowing by default`);
       return { allowed: true };
     }
 
@@ -106,11 +112,28 @@ export class SafeOutputsEnforcer {
   }
 
   /**
+   * Periodically clean up stale rate limit records older than 7 days.
+   * Called opportunistically during rate limit checks (~2% of the time).
+   */
+  _cleanupStaleRateLimits() {
+    if (!this.db) return;
+    if (Math.random() > 0.02) return;
+
+    this.db.query(`
+      DELETE FROM gitswarm_plugin_rate_limits
+      WHERE window_start < NOW() - INTERVAL '7 days'
+    `).catch(err => console.error('Rate limit cleanup failed:', err.message));
+  }
+
+  /**
    * Check rate limits (per-hour and per-day execution counts).
    * Returns { allowed: boolean, reason?: string, retryAfter?: number }
    */
   async checkRateLimit(pluginId, limits) {
     if (!this.db) return { allowed: true };
+
+    // Opportunistic cleanup of stale rate limit records
+    this._cleanupStaleRateLimits();
 
     const now = new Date();
 

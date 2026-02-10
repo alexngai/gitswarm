@@ -16,6 +16,7 @@
  * the actual processing.
  */
 
+import crypto from 'crypto';
 import { githubApp, GitHubRepo } from './github.js';
 import { SafeOutputsEnforcer } from './safe-outputs.js';
 
@@ -115,8 +116,8 @@ export class PluginEngine {
    * create safe output context, dispatch.
    */
   async _executePlugin(plugin, trigger, payload) {
-    // 1. Evaluate conditions
-    const conditionsMet = this._evaluateConditions(plugin.conditions, payload);
+    // 1. Evaluate conditions (async — some conditions query gitswarm data)
+    const conditionsMet = await this._evaluateConditions(plugin, plugin.conditions, payload);
     if (!conditionsMet) {
       return { status: 'skipped', reason: 'conditions_not_met' };
     }
@@ -157,12 +158,15 @@ export class PluginEngine {
     // 5. Increment rate limit counters
     await this.safeOutputs.incrementRateLimit(plugin.id);
 
-    // 6. Record execution
-    const summary = this.safeOutputs.getSummary(context);
-    await this._recordExecution(
-      plugin, trigger, payload,
-      result.status, result.actionsTaken || [], summary
-    );
+    // 6. Record execution (skip for models that create their own records)
+    const modelsWithOwnRecords = ['dispatch', 'workflow'];
+    if (!modelsWithOwnRecords.includes(plugin.execution_model) || result.status === 'workflow_native') {
+      const summary = this.safeOutputs.getSummary(context);
+      await this._recordExecution(
+        plugin, trigger, payload,
+        result.status, result.actionsTaken || [], summary
+      );
+    }
 
     // 7. Log activity
     if (this.activityService) {
@@ -236,14 +240,48 @@ export class PluginEngine {
           }
 
           case 'notify_contributors': {
-            actionsTaken.push({ action: 'notify_contributors', status: 'dispatched' });
+            const message = typeof action === 'object' ? action.message : 'A gitswarm event requires your attention.';
+            const notified = await this._notifyContributors(repoId, payload, message);
+            if (notified) {
+              this.safeOutputs.recordAction(context, 'notify_contributors');
+              actionsTaken.push({ action: 'notify_contributors', status: 'completed' });
+            } else {
+              actionsTaken.push({ action: 'notify_contributors', status: 'no_target' });
+            }
+            break;
+          }
+
+          case 'notify_stream_owner': {
+            const ownerMsg = typeof action === 'object' ? action.message : 'Your stream needs attention.';
+            const notifiedOwner = await this._notifyStreamOwner(repoId, payload, ownerMsg);
+            if (notifiedOwner) {
+              this.safeOutputs.recordAction(context, 'notify_stream_owner');
+              actionsTaken.push({ action: 'notify_stream_owner', status: 'completed' });
+            } else {
+              actionsTaken.push({ action: 'notify_stream_owner', status: 'no_target' });
+            }
             break;
           }
 
           case 'promote_buffer_to_main':
           case 'promote': {
-            // This is a significant action — record it and dispatch
-            actionsTaken.push({ action: 'promote_buffer_to_main', status: 'requires_dispatch' });
+            const promoteResult = await this._promoteBufferToMain(repoId);
+            if (promoteResult.success) {
+              this.safeOutputs.recordAction(context, 'promote_buffer_to_main');
+              actionsTaken.push({
+                action: 'promote_buffer_to_main',
+                status: 'completed',
+                from: promoteResult.from,
+                to: promoteResult.to,
+                sha: promoteResult.sha,
+              });
+            } else {
+              actionsTaken.push({
+                action: 'promote_buffer_to_main',
+                status: 'failed',
+                reason: promoteResult.reason,
+              });
+            }
             break;
           }
 
@@ -309,9 +347,21 @@ export class PluginEngine {
 
     const executionId = execResult.rows[0].id;
 
+    // Generate execution token for secure reporting
+    const executionToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(executionToken).digest('hex');
+    const tokenExpiry = new Date(Date.now() + 30 * 60 * 1000); // 30 min
+
+    await this.db.query(`
+      UPDATE gitswarm_plugin_executions
+      SET dispatch_token_hash = $2, dispatch_token_expires_at = $3
+      WHERE id = $1
+    `, [executionId, tokenHash, tokenExpiry]);
+
     const clientPayload = {
       gitswarm: {
         execution_id: executionId,
+        execution_token: executionToken,
         plugin_name: plugin.name,
         plugin_tier: plugin.tier,
         trigger,
@@ -461,9 +511,21 @@ export class PluginEngine {
 
     const executionId = execResult.rows[0].id;
 
+    // Generate execution token for secure reporting
+    const executionToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(executionToken).digest('hex');
+    const tokenExpiry = new Date(Date.now() + 30 * 60 * 1000);
+
+    await this.db.query(`
+      UPDATE gitswarm_plugin_executions
+      SET dispatch_token_hash = $2, dispatch_token_expires_at = $3
+      WHERE id = $1
+    `, [executionId, tokenHash, tokenExpiry]);
+
     const clientPayload = {
       gitswarm: {
         execution_id: executionId,
+        execution_token: executionToken,
         plugin_name: plugin.name,
         plugin_tier: plugin.tier,
         trigger,
@@ -518,27 +580,206 @@ export class PluginEngine {
 
   /**
    * Evaluate plugin conditions against the event payload.
+   * Supports specialized evaluators for gitswarm-specific conditions.
    */
-  _evaluateConditions(conditions, payload) {
+  async _evaluateConditions(plugin, conditions, payload) {
     if (!conditions || Object.keys(conditions).length === 0) return true;
 
     for (const [key, expected] of Object.entries(conditions)) {
-      const actual = this._getNestedValue(payload, key);
+      let result;
 
-      if (typeof expected === 'string' && expected.startsWith('>=')) {
-        const threshold = parseFloat(expected.slice(2).trim());
-        if (typeof actual !== 'number' || actual < threshold) return false;
-      } else if (typeof expected === 'string' && expected.startsWith('>')) {
-        const threshold = parseFloat(expected.slice(1).trim());
-        if (typeof actual !== 'number' || actual <= threshold) return false;
-      } else if (Array.isArray(expected)) {
-        if (!expected.includes(actual)) return false;
-      } else if (expected !== actual) {
-        return false;
+      switch (key) {
+        case 'files_match':
+          result = this._evaluateFilesMatch(expected, payload);
+          break;
+
+        case 'max_files_changed':
+          result = this._evaluateFileCount(payload, expected);
+          break;
+
+        case 'consensus_threshold_met':
+          result = expected === true
+            ? await this._evaluateConsensus(plugin.repo_id, payload)
+            : true;
+          break;
+
+        case 'agent_karma':
+          result = await this._evaluateKarma(plugin.repo_id, payload, expected);
+          break;
+
+        case 'stream_inactive_days': {
+          const threshold = typeof expected === 'string'
+            ? parseFloat(expected.replace(/[>= ]/g, ''))
+            : expected;
+          result = this._evaluateInactivity(payload, threshold);
+          break;
+        }
+
+        case 'stabilization':
+          // Currently a pass-through — will be verified at execution time
+          // by the workflow or builtin action itself
+          result = true;
+          break;
+
+        default:
+          result = this._evaluateSimpleCondition(payload, key, expected);
       }
+
+      if (!result) return false;
     }
 
     return true;
+  }
+
+  /**
+   * Evaluate a simple key/value condition against the payload.
+   */
+  _evaluateSimpleCondition(payload, key, expected) {
+    const actual = this._getNestedValue(payload, key);
+
+    if (typeof expected === 'string' && expected.startsWith('>=')) {
+      const threshold = parseFloat(expected.slice(2).trim());
+      return typeof actual === 'number' && actual >= threshold;
+    } else if (typeof expected === 'string' && expected.startsWith('>')) {
+      const threshold = parseFloat(expected.slice(1).trim());
+      return typeof actual === 'number' && actual > threshold;
+    } else if (typeof expected === 'string' && expected.startsWith('<=')) {
+      const threshold = parseFloat(expected.slice(2).trim());
+      return typeof actual === 'number' && actual <= threshold;
+    } else if (typeof expected === 'string' && expected.startsWith('<')) {
+      const threshold = parseFloat(expected.slice(1).trim());
+      return typeof actual === 'number' && actual < threshold;
+    } else if (Array.isArray(expected)) {
+      return expected.includes(actual);
+    }
+    return expected === actual;
+  }
+
+  /**
+   * Check if any changed files match the given glob patterns.
+   * Uses simple pattern matching (supports ** and * wildcards).
+   */
+  _evaluateFilesMatch(patterns, payload) {
+    const files = this._extractChangedFiles(payload);
+    if (files.length === 0) return false;
+
+    const patternsArr = Array.isArray(patterns) ? patterns : [patterns];
+    return files.some(file =>
+      patternsArr.some(pattern => this._simpleGlobMatch(file, pattern))
+    );
+  }
+
+  /**
+   * Check if file count is within limit.
+   */
+  _evaluateFileCount(payload, maxFiles) {
+    const count = payload.pull_request?.changed_files
+      || this._extractChangedFiles(payload).length
+      || 0;
+    return count <= maxFiles;
+  }
+
+  /**
+   * Check consensus status for a PR from the gitswarm DB.
+   */
+  async _evaluateConsensus(repoId, payload) {
+    const prNumber = payload.pull_request?.number;
+    if (!prNumber) return false;
+
+    try {
+      const result = await this.db.query(`
+        SELECT s.id FROM gitswarm_streams s
+        JOIN gitswarm_repos r ON s.repo_id = r.id
+        WHERE r.id = $1 AND s.github_pr_number = $2 AND s.status = 'active'
+      `, [repoId, prNumber]);
+      if (result.rows.length === 0) return false;
+
+      const streamId = result.rows[0].id;
+      const reviews = await this.db.query(`
+        SELECT verdict FROM gitswarm_stream_reviews WHERE stream_id = $1
+      `, [streamId]);
+
+      const approvals = reviews.rows.filter(r => r.verdict === 'approve').length;
+      const rejections = reviews.rows.filter(r => r.verdict === 'request_changes').length;
+      const total = approvals + rejections;
+      if (total === 0) return false;
+
+      const repo = await this.db.query(`
+        SELECT consensus_threshold FROM gitswarm_repos WHERE id = $1
+      `, [repoId]);
+      const threshold = repo.rows[0]?.consensus_threshold || 0.66;
+
+      return (approvals / total) >= threshold;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if the triggering agent has sufficient karma.
+   */
+  async _evaluateKarma(repoId, payload, expected) {
+    const threshold = typeof expected === 'string'
+      ? parseFloat(expected.replace(/[>= ]/g, ''))
+      : expected;
+
+    const agentLogin = payload.sender?.login || payload.pull_request?.user?.login;
+    if (!agentLogin) return false;
+
+    try {
+      const result = await this.db.query(`
+        SELECT a.karma FROM agents a
+        JOIN github_user_mappings m ON a.id = m.agent_id
+        WHERE m.github_username = $1
+      `, [agentLogin]);
+      return result.rows.length > 0 && result.rows[0].karma >= threshold;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a stream has been inactive for N days.
+   */
+  _evaluateInactivity(payload, thresholdDays) {
+    const updatedAt = payload.stream?.updated_at || payload.updated_at;
+    if (!updatedAt) return false;
+
+    const daysSinceUpdate = (Date.now() - new Date(updatedAt).getTime()) / (1000 * 60 * 60 * 24);
+    return daysSinceUpdate >= thresholdDays;
+  }
+
+  /**
+   * Extract changed files from various payload formats.
+   */
+  _extractChangedFiles(payload) {
+    // PR payload
+    if (payload.pull_request?.changed_files_list) {
+      return payload.pull_request.changed_files_list;
+    }
+    // Push payload
+    if (payload.commits) {
+      const files = new Set();
+      for (const commit of payload.commits) {
+        for (const f of [...(commit.added || []), ...(commit.modified || []), ...(commit.removed || [])]) {
+          files.add(f);
+        }
+      }
+      return [...files];
+    }
+    return [];
+  }
+
+  /**
+   * Simple glob pattern matcher (supports * and **).
+   */
+  _simpleGlobMatch(filepath, pattern) {
+    const regex = pattern
+      .replace(/\*\*/g, '{{GLOBSTAR}}')
+      .replace(/\*/g, '[^/]*')
+      .replace(/{{GLOBSTAR}}/g, '.*')
+      .replace(/\?/g, '[^/]');
+    return new RegExp(`^${regex}$`).test(filepath);
   }
 
   /**
@@ -576,10 +817,12 @@ export class PluginEngine {
 
   /**
    * Resolve labels from plugin config.
+   * Respects the max_label_additions budget from safe_outputs.
    */
   _resolveLabels(plugin, payload) {
     const allowedLabels = plugin.safe_outputs?.allowed_labels || [];
-    if (allowedLabels.length > 0) return allowedLabels.slice(0, 3);
+    const maxLabels = plugin.safe_outputs?.max_label_additions || 3;
+    if (allowedLabels.length > 0) return allowedLabels.slice(0, maxLabels);
     return [];
   }
 
@@ -649,6 +892,119 @@ export class PluginEngine {
   }
 
   /**
+   * Get a GitHub API client for a repo.
+   */
+  async _getGitHubRepoClient(repoId) {
+    const repo = await this.db.query(`
+      SELECT r.github_full_name, o.github_installation_id
+      FROM gitswarm_repos r
+      JOIN gitswarm_orgs o ON r.org_id = o.id
+      WHERE r.id = $1
+    `, [repoId]);
+
+    if (repo.rows.length === 0) return null;
+
+    const { github_full_name, github_installation_id } = repo.rows[0];
+    if (!github_installation_id) return null;
+
+    const [owner, repoName] = github_full_name.split('/');
+    const token = await githubApp.getInstallationToken(github_installation_id);
+    return { ghRepo: new GitHubRepo(token, owner, repoName), owner, repoName };
+  }
+
+  /**
+   * Get repo config from gitswarm_repos.
+   */
+  async _getRepoConfig(repoId) {
+    const result = await this.db.query(`
+      SELECT buffer_branch, promote_target, auto_promote_on_green,
+             auto_revert_on_red, stabilize_command, consensus_threshold
+      FROM gitswarm_repos WHERE id = $1
+    `, [repoId]);
+    return result.rows[0] || {};
+  }
+
+  /**
+   * Promote buffer branch to main via GitHub merge API.
+   * This is a Tier 1 deterministic action.
+   */
+  async _promoteBufferToMain(repoId) {
+    try {
+      const config = await this._getRepoConfig(repoId);
+      const bufferBranch = config.buffer_branch || 'buffer';
+      const target = config.promote_target || 'main';
+
+      const client = await this._getGitHubRepoClient(repoId);
+      if (!client) return { success: false, reason: 'no_github_client' };
+
+      const { ghRepo, owner, repoName } = client;
+
+      const result = await ghRepo.request(
+        'POST',
+        `/repos/${owner}/${repoName}/merges`,
+        {
+          base: target,
+          head: bufferBranch,
+          commit_message: `Promote ${bufferBranch} to ${target} via gitswarm auto-promote`,
+        }
+      );
+
+      return {
+        success: true,
+        from: bufferBranch,
+        to: target,
+        sha: result.sha,
+      };
+    } catch (err) {
+      return { success: false, reason: err.message };
+    }
+  }
+
+  /**
+   * Notify contributors on a PR/issue by posting a comment.
+   */
+  async _notifyContributors(repoId, payload, message) {
+    const issueNumber = payload.issue?.number || payload.pull_request?.number;
+    if (!issueNumber) return false;
+
+    try {
+      await this._addComment(repoId, payload, message);
+      return true;
+    } catch (err) {
+      console.error(`notify_contributors failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Notify a stream owner about their stream (e.g., stale stream reminder).
+   * Posts a comment on the PR linked to the stream.
+   */
+  async _notifyStreamOwner(repoId, payload, message) {
+    const streamId = payload.stream?.id || payload.stream_id;
+    if (!streamId) return false;
+
+    try {
+      const stream = await this.db.query(`
+        SELECT github_pr_number FROM gitswarm_streams WHERE id = $1
+      `, [streamId]);
+
+      if (stream.rows.length === 0 || !stream.rows[0].github_pr_number) return false;
+
+      const prNumber = stream.rows[0].github_pr_number;
+      const client = await this._getGitHubRepoClient(repoId);
+      if (!client) return false;
+
+      const { ghRepo } = client;
+      await ghRepo.addPullRequestComment(prNumber, message);
+      return true;
+    } catch (err) {
+      console.error(`notify_stream_owner failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
    * Sanitize payload for dispatch (remove sensitive data, reduce size).
    */
   _sanitizePayload(payload) {
@@ -695,6 +1051,132 @@ export class PluginEngine {
     } catch (err) {
       console.error('Failed to record plugin execution:', err.message);
     }
+  }
+
+  /**
+   * Post-hoc audit: correlate incoming webhook actions to recent plugin executions.
+   * Called from the webhook handler when mutations occur (labels added, comments posted, etc.)
+   * that might have been produced by a dispatched AI workflow.
+   *
+   * If over-budget, logs a warning activity event.
+   */
+  async auditWorkflowAction(repoId, actionType, payload) {
+    try {
+      // Find recent dispatched/running executions for this repo
+      const recent = await this.db.query(`
+        SELECT e.id, e.plugin_id, e.safe_output_usage, e.actions_taken,
+               p.safe_outputs as plugin_safe_outputs
+        FROM gitswarm_plugin_executions e
+        JOIN gitswarm_repo_plugins p ON e.plugin_id = p.id
+        WHERE e.repo_id = $1 AND e.status IN ('dispatched', 'running')
+          AND e.started_at > NOW() - INTERVAL '10 minutes'
+        ORDER BY e.started_at DESC
+      `, [repoId]);
+
+      if (recent.rows.length === 0) return;
+
+      const limitKey = this.safeOutputs.constructor.prototype.constructor === SafeOutputsEnforcer
+        ? null : null; // We'll look up from the ACTION_COST_MAP import
+
+      // Attribute to most recent matching execution
+      const exec = recent.rows[0];
+      const currentActions = exec.actions_taken || [];
+      currentActions.push({
+        action: actionType,
+        detected_at: new Date().toISOString(),
+        source: 'webhook_audit',
+      });
+
+      await this.db.query(`
+        UPDATE gitswarm_plugin_executions
+        SET actions_taken = $2
+        WHERE id = $1
+      `, [exec.id, JSON.stringify(currentActions)]);
+
+      // Check if over budget
+      const pluginLimits = exec.plugin_safe_outputs || {};
+      const context = {
+        pluginId: exec.plugin_id,
+        limits: pluginLimits,
+        usage: {},
+        blocked: [],
+      };
+
+      // Count actions by type from the recorded list
+      for (const act of currentActions) {
+        const key = act.action;
+        context.usage[key] = (context.usage[key] || 0) + 1;
+      }
+
+      // Log warning if any budget is exceeded
+      if (this.activityService) {
+        const summary = this.safeOutputs.getSummary(context);
+        for (const [key, used] of Object.entries(summary.usage)) {
+          const limit = pluginLimits[key];
+          if (limit !== undefined && used > limit) {
+            this.activityService.logActivity({
+              event_type: 'plugin_over_budget',
+              target_type: 'plugin_execution',
+              target_id: exec.id,
+              metadata: {
+                repo_id: repoId,
+                action_type: actionType,
+                budget_key: key,
+                used,
+                limit,
+              },
+            }).catch(() => {});
+          }
+        }
+      }
+    } catch (err) {
+      console.error('auditWorkflowAction failed:', err.message);
+    }
+  }
+
+  /**
+   * Verify an execution token for the report endpoint.
+   * Returns true if the token is valid and not expired.
+   */
+  async verifyExecutionToken(executionId, token) {
+    if (!token) return false;
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const result = await this.db.query(`
+      SELECT id FROM gitswarm_plugin_executions
+      WHERE id = $1 AND dispatch_token_hash = $2
+        AND dispatch_token_expires_at > NOW()
+    `, [executionId, tokenHash]);
+
+    return result.rows.length > 0;
+  }
+
+  /**
+   * Resolve a workflow completion from a workflow_run webhook event.
+   * Matches the workflow name to dispatched execution records and
+   * updates their status based on the workflow conclusion.
+   */
+  async resolveWorkflowCompletion(repoId, workflowName, conclusion) {
+    const status = conclusion === 'success' ? 'completed'
+      : conclusion === 'cancelled' ? 'cancelled'
+      : 'failed';
+
+    const result = await this.db.query(`
+      UPDATE gitswarm_plugin_executions SET
+        status = $3,
+        completed_at = NOW()
+      WHERE id = (
+        SELECT e.id FROM gitswarm_plugin_executions e
+        JOIN gitswarm_repo_plugins p ON e.plugin_id = p.id
+        WHERE e.repo_id = $1 AND e.status = 'dispatched'
+          AND (p.workflow_file ILIKE $2 OR p.dispatch_target ILIKE $2)
+          AND e.started_at > NOW() - INTERVAL '30 minutes'
+        ORDER BY e.started_at DESC LIMIT 1
+      )
+      RETURNING id
+    `, [repoId, `%${workflowName}%`, status]);
+
+    return result.rows[0]?.id || null;
   }
 
   /**

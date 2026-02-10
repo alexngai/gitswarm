@@ -348,9 +348,12 @@ export async function pluginRoutes(app, options = {}) {
 
   // ============================================================
   // Report execution result (callback from GitHub Actions)
+  // Supports two auth modes:
+  //   1. Execution token (X-GitSwarm-Execution-Token header) — short-lived, per-execution
+  //   2. Standard Bearer token (via authenticate middleware) — long-lived agent key
   // ============================================================
   app.post('/gitswarm/repos/:id/plugins/executions/:execId/report', {
-    preHandler: [authenticate, rateLimitWrite],
+    preHandler: [rateLimitWrite],
     schema: {
       body: {
         type: 'object',
@@ -365,6 +368,27 @@ export async function pluginRoutes(app, options = {}) {
     },
   }, async (request, reply) => {
     const { id, execId } = request.params;
+
+    // Try execution token auth first
+    const execToken = request.headers['x-gitswarm-execution-token'];
+    let authenticated = false;
+
+    if (execToken && pluginEngine) {
+      authenticated = await pluginEngine.verifyExecutionToken(execId, execToken);
+    }
+
+    // Fall back to standard Bearer auth
+    if (!authenticated) {
+      try {
+        await authenticate(request, reply);
+        authenticated = true;
+      } catch {
+        return reply.status(401).send({
+          error: 'Unauthorized',
+          message: 'Valid execution token or Bearer token required',
+        });
+      }
+    }
 
     // Verify the execution belongs to this repo
     const execResult = await query(`

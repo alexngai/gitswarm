@@ -65,6 +65,10 @@ jobs:
                - Any related issues or in-progress streams
                - Suggested next steps for a contributor
 
+            8. **Report back to gitswarm** — When done, use the gitswarm MCP server's
+               `report_execution` tool to report your triage results. Include actions taken
+               (labels added, comments posted, issues closed) in the report.
+
             ## Guidelines
 
             - Be concise — maintainers are busy, keep comments under 200 words

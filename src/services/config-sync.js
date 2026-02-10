@@ -10,7 +10,7 @@
 
 import { githubApp } from './github.js';
 import { GitHubRepo } from './github.js';
-import yaml from 'js-yaml'; // Note: fallback to JSON parse if yaml not available
+import yaml from 'js-yaml';
 
 export class ConfigSyncService {
   constructor(db) {
@@ -123,7 +123,8 @@ export class ConfigSyncService {
     }
 
     // Detect gitswarm workflow templates (.github/workflows/gitswarm-*.yml)
-    const detectedWorkflows = await this._detectWorkflowTemplates(ghRepo, repo.default_branch);
+    // and link them to existing config plugins instead of creating duplicates
+    const detectedWorkflows = await this._detectWorkflowTemplates(ghRepo, repo.default_branch, repoId);
 
     return {
       synced: true,
@@ -286,92 +287,24 @@ export class ConfigSyncService {
   }
 
   /**
-   * Parse YAML content with fallback to JSON.
+   * Parse YAML content. Requires js-yaml (listed in package.json dependencies).
    */
   _parseYaml(content) {
-    try {
-      // Try yaml parse first
-      if (typeof yaml !== 'undefined' && yaml.load) {
-        return yaml.load(content);
-      }
-    } catch (e) {
-      // Fallback below
-    }
-
-    // Fallback: simple YAML-ish parser for the subset we need
-    // This handles the basic key: value and nested structures
-    try {
-      return JSON.parse(content);
-    } catch (e) {
-      // Attempt basic YAML parsing
-      return this._basicYamlParse(content);
-    }
+    return yaml.load(content);
   }
 
   /**
-   * Basic YAML parser for simple configs.
-   * Handles the key: value structure we use in .gitswarm/ configs.
-   */
-  _basicYamlParse(content) {
-    const result = {};
-    const lines = content.split('\n');
-    const stack = [{ obj: result, indent: -1 }];
-
-    for (const line of lines) {
-      // Skip comments and empty lines
-      const trimmed = line.trimStart();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-
-      const indent = line.length - trimmed.length;
-      const match = trimmed.match(/^([^:]+):\s*(.*)$/);
-      if (!match) continue;
-
-      const [, key, rawValue] = match;
-      const cleanKey = key.trim();
-
-      // Pop stack to find parent
-      while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
-        stack.pop();
-      }
-
-      const parent = stack[stack.length - 1].obj;
-
-      if (rawValue.trim()) {
-        // Simple value
-        let value = rawValue.trim();
-        // Remove quotes
-        if ((value.startsWith('"') && value.endsWith('"')) ||
-            (value.startsWith("'") && value.endsWith("'"))) {
-          value = value.slice(1, -1);
-        }
-        // Parse booleans and numbers
-        if (value === 'true') value = true;
-        else if (value === 'false') value = false;
-        else if (value === 'null') value = null;
-        else if (!isNaN(value) && value !== '') value = Number(value);
-
-        parent[cleanKey] = value;
-      } else {
-        // Nested object
-        parent[cleanKey] = {};
-        stack.push({ obj: parent[cleanKey], indent });
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * Detect gitswarm workflow files (.yml in .github/workflows/) and register
-   * them as plugins. These are standard GitHub Actions workflows that use
-   * AI agent actions (e.g., anthropics/claude-code-action) directly.
+   * Detect gitswarm workflow files (.yml in .github/workflows/) and reconcile
+   * them with existing config-sourced plugins.
    *
-   * We register them in the plugin DB for visibility/tracking. Workflows
-   * with native GitHub triggers (issues, pull_request) execute directly.
-   * Workflows with repository_dispatch triggers need our plugin engine
-   * to dispatch the event.
+   * If a config plugin's dispatch_target matches a workflow's repository_dispatch
+   * type, or their trigger events overlap, we LINK the config plugin to the
+   * workflow file (set workflow_file, execution_model='workflow') rather than
+   * creating a duplicate registration.
+   *
+   * Workflows without a matching config plugin are registered standalone.
    */
-  async _detectWorkflowTemplates(ghRepo, branch) {
+  async _detectWorkflowTemplates(ghRepo, branch, repoId) {
     const workflows = [];
 
     try {
@@ -382,7 +315,6 @@ export class ConfigSyncService {
 
       if (!Array.isArray(listing)) return workflows;
 
-      // Find .yml files that are gitswarm workflows
       const ymlFiles = listing.filter(f =>
         (f.name.endsWith('.yml') || f.name.endsWith('.yaml')) &&
         f.name.startsWith('gitswarm-')
@@ -406,43 +338,75 @@ export class ConfigSyncService {
         }
       }
     } catch (err) {
-      // Workflows directory doesn't exist or isn't accessible
       return workflows;
     }
 
-    // Register detected workflows as plugins (source = 'workflow')
+    if (!repoId) return workflows;
+
+    // Get existing config-sourced plugins for this repo
+    const existing = await this.db.query(`
+      SELECT id, name, trigger_event, dispatch_target
+      FROM gitswarm_repo_plugins
+      WHERE repo_id = $1 AND source = 'config'
+    `, [repoId]);
+
+    const configPlugins = existing.rows;
+
     for (const wf of workflows) {
       const triggerEvent = this._extractWorkflowTrigger(wf.on);
-      const usesAiAction = wf.uses_ai_action;
-      const tier = usesAiAction ? 'ai' : 'automation';
+      const allTriggers = this._extractAllWorkflowTriggers(wf.on);
 
-      await this.db.query(`
-        INSERT INTO gitswarm_repo_plugins (
-          repo_id, name, enabled, tier, trigger_event, conditions,
-          actions, safe_outputs, config, execution_model, dispatch_target,
-          priority, source
-        ) VALUES (
-          (SELECT id FROM gitswarm_repos WHERE github_full_name = $1 LIMIT 1),
-          $2, true, $3, $4, '{}', '[]', '{}', $5, 'workflow', $6, 0, 'workflow'
-        )
-        ON CONFLICT (repo_id, name) DO UPDATE SET
-          tier = $3, trigger_event = $4,
-          config = $5, execution_model = 'workflow', dispatch_target = $6,
-          updated_at = NOW()
-      `, [
-        `${ghRepo.owner}/${ghRepo.repo}`,
-        wf.name,
-        tier,
-        triggerEvent,
-        JSON.stringify({
-          workflow_name: wf.workflow_name,
-          description: wf.description,
-          filename: wf.filename,
-          permissions: wf.permissions,
-          uses_ai_action: wf.uses_ai_action,
-        }),
-        wf.filename,
-      ]);
+      // Try to find a matching config plugin by:
+      // 1. dispatch_target matches a repository_dispatch type in the workflow
+      // 2. trigger_event matches one of the workflow's native triggers
+      const matchingPlugin = configPlugins.find(cp => {
+        // Check if config plugin's dispatch_target matches workflow's repo_dispatch types
+        if (allTriggers.dispatchTypes.includes(cp.dispatch_target)) return true;
+        // Check if trigger events overlap
+        if (allTriggers.nativeTriggers.includes(cp.trigger_event)) return true;
+        return false;
+      });
+
+      if (matchingPlugin) {
+        // Link the config plugin to this workflow file instead of creating a duplicate.
+        // Set execution_model to 'workflow' so the plugin engine knows the workflow
+        // fires natively for GitHub triggers.
+        await this.db.query(`
+          UPDATE gitswarm_repo_plugins
+          SET workflow_file = $2, execution_model = 'workflow', updated_at = NOW()
+          WHERE id = $1
+        `, [matchingPlugin.id, wf.filename]);
+      } else {
+        // No matching config plugin — register as a standalone workflow plugin
+        const usesAiAction = wf.uses_ai_action;
+        const tier = usesAiAction ? 'ai' : 'automation';
+
+        await this.db.query(`
+          INSERT INTO gitswarm_repo_plugins (
+            repo_id, name, enabled, tier, trigger_event, conditions,
+            actions, safe_outputs, config, execution_model, dispatch_target,
+            priority, source, workflow_file
+          ) VALUES ($1, $2, true, $3, $4, '{}', '[]', '{}', $5, 'workflow', $6, 0, 'workflow', $7)
+          ON CONFLICT (repo_id, name) DO UPDATE SET
+            tier = $3, trigger_event = $4,
+            config = $5, execution_model = 'workflow', dispatch_target = $6,
+            workflow_file = $7, updated_at = NOW()
+        `, [
+          repoId,
+          wf.name,
+          tier,
+          triggerEvent,
+          JSON.stringify({
+            workflow_name: wf.workflow_name,
+            description: wf.description,
+            filename: wf.filename,
+            permissions: wf.permissions,
+            uses_ai_action: wf.uses_ai_action,
+          }),
+          wf.filename,
+          wf.filename,
+        ]);
+      }
     }
 
     return workflows;
@@ -478,24 +442,60 @@ export class ConfigSyncService {
     if (typeof on === 'string') return on;
     if (typeof on !== 'object') return 'unknown';
 
-    // Check for repository_dispatch (gitswarm-specific triggers)
+    // Prefer native triggers over repository_dispatch for the primary trigger,
+    // since that's what the plugin engine matches against for audit.
+    const nativeTriggers = Object.keys(on).filter(k =>
+      k !== 'workflow_dispatch' && k !== 'repository_dispatch'
+    );
+
+    if (nativeTriggers.length > 0) {
+      const first = nativeTriggers[0];
+      const config = on[first];
+      if (config?.types?.[0]) {
+        return `${first}.${config.types[0]}`;
+      }
+      return first;
+    }
+
+    // Fall back to repository_dispatch
     if (on.repository_dispatch?.types?.[0]) {
       return on.repository_dispatch.types[0];
     }
 
-    // Use the first native trigger
-    const triggers = Object.keys(on).filter(k => k !== 'workflow_dispatch');
-    if (triggers.length === 0) return 'unknown';
+    return 'unknown';
+  }
 
-    const first = triggers[0];
-    const config = on[first];
+  /**
+   * Extract ALL trigger events from a workflow for matching against config plugins.
+   * Returns { nativeTriggers: string[], dispatchTypes: string[] }
+   */
+  _extractAllWorkflowTriggers(on) {
+    const result = { nativeTriggers: [], dispatchTypes: [] };
+    if (typeof on === 'string') {
+      result.nativeTriggers.push(on);
+      return result;
+    }
+    if (typeof on !== 'object') return result;
 
-    // Include action type if specified (e.g., issues.opened)
-    if (config?.types?.[0]) {
-      return `${first}.${config.types[0]}`;
+    for (const [key, config] of Object.entries(on)) {
+      if (key === 'repository_dispatch') {
+        const types = config?.types || [];
+        result.dispatchTypes.push(...types);
+      } else if (key === 'workflow_dispatch' || key === 'schedule') {
+        // Skip these for matching purposes
+      } else {
+        // Native trigger (issues, pull_request, issue_comment, etc.)
+        if (config?.types) {
+          for (const type of config.types) {
+            result.nativeTriggers.push(`${key}.${type}`);
+          }
+        } else {
+          result.nativeTriggers.push(key);
+        }
+      }
     }
 
-    return first;
+    return result;
   }
 
   async _recordSyncError(repoId, error) {

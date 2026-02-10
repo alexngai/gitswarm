@@ -61,6 +61,10 @@ jobs:
                - What you changed to fix it
                - Whether local verification passed
 
+            6. **Report back to gitswarm** — When done, use the gitswarm MCP server's
+               `report_execution` tool to report what you fixed and whether the fix was
+               successful.
+
             ## Safety rules
 
             - Only push to the PR's head branch — never to main, buffer, or other branches

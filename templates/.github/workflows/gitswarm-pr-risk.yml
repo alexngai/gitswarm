@@ -78,6 +78,10 @@ jobs:
                agent with high karma (check via gitswarm MCP if available), note that this
                PR is a candidate for fast-track merge via gitswarm consensus.
 
+            6. **Report back to gitswarm** — When done, use the gitswarm MCP server's
+               `report_execution` tool to report your assessment results. Include the
+               risk level and actions taken in the report.
+
             ## Guidelines
 
             - Be factual, not opinionated — state what changed, let reviewers decide
