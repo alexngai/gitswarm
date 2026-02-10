@@ -574,6 +574,20 @@ Migrated from gh-aw Markdown templates to standard GitHub Actions YAML workflows
 - Standard YAML — no compile step, no custom CLI extension needed
 - Repo owners can swap AI engines by changing the action (claude-code-action → codex-action)
 
+**Phase 2 Gap Remediation** (`src/db/migrations/004_plugin_gap_remediation.sql`):
+
+All gaps between the Phase 1/2 implementation and the design spec have been addressed:
+
+- **Two-plane interop**: Server-side plugin engine and repo-side GitHub Actions workflows operate independently. The server observes workflow outcomes via `workflow_run` webhooks and reports back via execution tokens. Neither plane depends on the other.
+- **Gitswarm event emission**: All 8 gitswarm-only events (`consensus_reached`, `consensus_blocked`, `stream_submitted`, `stream_merged`, `stabilization_passed`, `stabilization_failed`, `council_proposal_created`, `council_proposal_resolved`) are now emitted from their respective lifecycle points in webhook handlers, stream routes, and council routes.
+- **Builtin action implementations**: `promote_buffer_to_main`, `notify_contributors`, and `notify_stream_owner` use real GitHub API calls instead of stubs.
+- **Execution tokens**: Each dispatched execution receives a short-lived (30 min) SHA-256-hashed token. The report endpoint accepts either an execution token (`X-GitSwarm-Execution-Token` header) or a standard Bearer token.
+- **Post-hoc safe output audit**: `auditWorkflowAction` in the plugin engine correlates webhook events (labels, comments, merges) to recent dispatched executions and counts them against the plugin's safe output budget.
+- **Workflow completion tracking**: `workflow_run.completed` webhooks are matched to dispatched executions via exact `workflow_file` match or normalized `dispatch_target` fallback.
+- **Consensus deduplication**: Both `consensus_reached` and `consensus_blocked` events are guarded against repeated firing (once per stream per hour).
+- **Startup sync**: On server boot, all active repos with `plugins_enabled = true` are re-synced in batches to catch any config changes missed during downtime.
+- **Rate limit cleanup**: Stale rate limit records (>7 days) are probabilistically cleaned up during normal operation.
+
 #### Phase 3: Governance Delegation (NEXT)
 
 - Council proposal auto-execution at repo level
@@ -589,6 +603,20 @@ Migrated from gh-aw Markdown templates to standard GitHub Actions YAML workflows
 - Plugin versioning and update mechanism
 - Plugin composition (output of one plugin triggers another)
 - Shared workflow template library for common gitswarm patterns
+
+---
+
+### Architectural Decisions
+
+1. **Workflows are autonomous.** The server never prevents a workflow from running. It observes, audits, and rate-limits future dispatches based on past behavior.
+
+2. **The server dispatches only what GitHub can't.** Native GitHub events (issues, PRs, comments, schedule) trigger workflows directly. The server dispatches only gitswarm-originated events (consensus, council, stabilization).
+
+3. **`plugins.yml` is policy, workflows are execution.** `plugins.yml` declares what a plugin should do, its limits, and conditions. The workflow `.yml` file implements the execution. Config sync links them via the `workflow_file` column.
+
+4. **MCP is the interop bridge.** The MCP server is the only runtime dependency between planes. If it's unavailable, workflows still function (with GitHub data only), and the server still tracks (without workflow feedback).
+
+5. **Execution tokens replace shared API keys.** Each dispatched execution gets a short-lived token for reporting back, rather than using a long-lived API key that has broader permissions.
 
 ---
 
