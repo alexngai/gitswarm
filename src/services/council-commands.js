@@ -1,4 +1,5 @@
 import { query } from '../config/database.js';
+import { getBackendForRepo } from './backend-factory.js';
 
 /**
  * Council Commands Service
@@ -532,31 +533,116 @@ export class CouncilCommandsService {
 
   async executeMergeStream(repoId, data) {
     const { stream_id } = data;
-    // Mark stream as approved for merge by council
+
+    // Mark stream as council-approved
     await this.query(`
       UPDATE gitswarm_streams SET review_status = 'approved', updated_at = NOW()
       WHERE id = $1 AND repo_id = $2
     `, [stream_id, repoId]);
-    return { executed: true, action: 'merge_stream', stream_id };
+
+    // Actually perform the merge via the repo's backend
+    const backend = await getBackendForRepo(repoId);
+    try {
+      const mergeResult = await backend.mergePullRequest(repoId, stream_id, {
+        commit_title: `Council merge: stream ${stream_id}`,
+        merge_method: 'merge',
+      });
+
+      // Record the merge
+      const mergeCommit = mergeResult?.mergeCommit || mergeResult?.sha || null;
+      await this.query(`
+        INSERT INTO gitswarm_merges (repo_id, stream_id, agent_id, merge_commit, target_branch)
+        VALUES ($1, $2, 'council', $3, (SELECT buffer_branch FROM gitswarm_repos WHERE id = $1))
+      `, [repoId, stream_id, mergeCommit]);
+
+      await this.query(`
+        UPDATE gitswarm_streams SET status = 'merged', updated_at = NOW()
+        WHERE id = $1
+      `, [stream_id]);
+
+      return { executed: true, action: 'merge_stream', stream_id, merge_commit: mergeCommit };
+    } catch (err) {
+      // Backend merge failed — leave the stream as approved so CLI or
+      // a retry can pick it up, but report the failure clearly.
+      return {
+        executed: false,
+        action: 'merge_stream',
+        stream_id,
+        error: err.message,
+        status: 'approved_pending_merge',
+      };
+    }
   }
 
   async executeRevertStream(repoId, data) {
     const { stream_id } = data;
-    // Mark stream for revert
+
+    // Mark stream for revert in DB
     await this.query(`
       UPDATE gitswarm_streams SET status = 'reverted', updated_at = NOW()
       WHERE id = $1 AND repo_id = $2
     `, [stream_id, repoId]);
+
+    // Attempt the revert via backend (best-effort — cascade backend can
+    // revert, GitHub backend has no direct revert API for branch merges).
+    try {
+      const repo = await this.query(`
+        SELECT git_backend FROM gitswarm_repos WHERE id = $1
+      `, [repoId]);
+      const backendType = repo.rows[0]?.git_backend || 'github';
+
+      if (backendType === 'cascade') {
+        const backend = await getBackendForRepo(repoId);
+        // CascadeBackend delegates to git-cascade-manager.mergeToBuffer
+        // which doesn't have a revert method — but the cascade manager
+        // does have rollback. For now, record the intent.
+      }
+      // For github backend, revert requires creating a revert PR which is
+      // out of scope for a council action — the DB flag is sufficient for
+      // agents or plugins to act on.
+    } catch {
+      // Non-fatal: DB state is already updated
+    }
+
     return { executed: true, action: 'revert_stream', stream_id };
   }
 
   async executePromote(repoId, data) {
-    // Record that council approved promotion
+    const repo = await this.query(`
+      SELECT buffer_branch, promote_target, git_backend FROM gitswarm_repos WHERE id = $1
+    `, [repoId]);
+
+    if (repo.rows.length === 0) {
+      return { executed: false, action: 'promote', error: 'repo_not_found' };
+    }
+
+    const { buffer_branch, promote_target, git_backend } = repo.rows[0];
+
+    // Record the promotion
     await this.query(`
       INSERT INTO gitswarm_promotions (repo_id, from_branch, to_branch, triggered_by)
-      SELECT id, buffer_branch, promote_target, 'council'
-      FROM gitswarm_repos WHERE id = $1
-    `, [repoId]);
+      VALUES ($1, $2, $3, 'council')
+    `, [repoId, buffer_branch, promote_target]);
+
+    // For cascade backend, attempt the actual fast-forward
+    if (git_backend === 'cascade') {
+      try {
+        const { execSync } = await import('child_process');
+        const { gitCascadeManager } = await import('./git-cascade-manager.js');
+        const ctx = await gitCascadeManager.getTracker(repoId);
+        if (ctx) {
+          execSync(
+            `git checkout "${promote_target}" && git merge --ff-only "${buffer_branch}"`,
+            { cwd: ctx.repoPath, encoding: 'utf-8' }
+          );
+        }
+      } catch (err) {
+        return { executed: true, action: 'promote', warning: `promotion recorded but fast-forward failed: ${err.message}` };
+      }
+    }
+    // For github backend, promotion is typically handled by plugins or
+    // the merge-to-main flow — the DB record signals intent.
+
     return { executed: true, action: 'promote' };
   }
 

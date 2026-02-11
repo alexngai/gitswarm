@@ -318,8 +318,13 @@ export class SyncClient {
    * Flush queued events to server using the batch sync endpoint.
    * Falls back to individual dispatch if batch endpoint is unavailable.
    */
+  /**
+   * Flush queued events to server using the batch sync endpoint.
+   * Returns structured result including which event types failed,
+   * so callers (e.g. mergeToBuffer) can block on critical failures.
+   */
   async flushQueue() {
-    if (!this.store) return { flushed: 0, remaining: 0 };
+    if (!this.store) return { flushed: 0, remaining: 0, failedTypes: [] };
 
     let events;
     try {
@@ -327,10 +332,10 @@ export class SyncClient {
         `SELECT * FROM sync_queue ORDER BY id ASC LIMIT 100`
       );
     } catch {
-      return { flushed: 0, remaining: 0 };
+      return { flushed: 0, remaining: 0, failedTypes: [] };
     }
 
-    if (!events.rows.length) return { flushed: 0, remaining: 0 };
+    if (!events.rows.length) return { flushed: 0, remaining: 0, failedTypes: [] };
 
     // Try batch endpoint first
     try {
@@ -343,8 +348,11 @@ export class SyncClient {
 
       const response = await this._post('/gitswarm/sync/batch', { events: batch });
 
-      // Delete successfully processed events
+      // Delete successfully processed events and track failures by type
       let flushed = 0;
+      const failedTypes = [];
+      const seqToType = Object.fromEntries(batch.map(b => [b.seq, b.type]));
+
       for (const r of (response.results || [])) {
         if (r.status === 'ok' || r.status === 'duplicate') {
           try {
@@ -352,12 +360,24 @@ export class SyncClient {
           } catch { /* ignore */ }
           flushed++;
         } else {
+          failedTypes.push(seqToType[r.seq] || 'unknown');
           break; // Stop at first error to preserve ordering
         }
       }
 
+      // Events after the break point are also unflushed — collect their types
+      const processedSeqs = new Set((response.results || [])
+        .filter(r => r.status === 'ok' || r.status === 'duplicate')
+        .map(r => r.seq));
+      for (const e of events.rows) {
+        if (!processedSeqs.has(e.id)) {
+          const type = e.event_type;
+          if (!failedTypes.includes(type)) failedTypes.push(type);
+        }
+      }
+
       const remaining = await this.store.query('SELECT COUNT(*) as count FROM sync_queue');
-      return { flushed, remaining: remaining.rows[0]?.count || 0 };
+      return { flushed, remaining: remaining.rows[0]?.count || 0, failedTypes };
     } catch (err) {
       // Batch endpoint unavailable — fall back to individual dispatch
       if (err.status === 404) {
@@ -372,6 +392,7 @@ export class SyncClient {
    */
   async _flushQueueIndividual(events) {
     let flushed = 0;
+    const failedTypes = [];
     for (const event of events) {
       try {
         const data = JSON.parse(event.payload);
@@ -379,6 +400,7 @@ export class SyncClient {
         await this.store.query(`DELETE FROM sync_queue WHERE id = ?`, [event.id]);
         flushed++;
       } catch (err) {
+        failedTypes.push(event.event_type);
         // Update attempt count
         try {
           await this.store.query(
@@ -389,7 +411,15 @@ export class SyncClient {
         break; // Stop on first failure (preserve ordering)
       }
     }
-    return { flushed, remaining: events.length - flushed };
+
+    // Collect types of unprocessed events after the break
+    for (const event of events.slice(flushed + (failedTypes.length ? 1 : 0))) {
+      if (!failedTypes.includes(event.event_type)) {
+        failedTypes.push(event.event_type);
+      }
+    }
+
+    return { flushed, remaining: events.length - flushed, failedTypes };
   }
 
   async _dispatchQueuedEvent(type, data) {

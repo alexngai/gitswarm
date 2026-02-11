@@ -207,6 +207,12 @@ export class Federation {
     // Apply .gitswarm/config.yml if present (repo-level config takes precedence)
     fed._applyRepoConfig();
 
+    // Warn about plugins that require a server connection
+    const pluginWarnings = fed.checkPluginCompatibility();
+    for (const w of pluginWarnings) {
+      console.error(`[gitswarm] warning: ${w}`);
+    }
+
     return fed;
   }
 
@@ -861,21 +867,61 @@ export class Federation {
 
     // Permission check depends on mode
     if (mode === 'gated') {
-      const { isMaintainer } = await this.permissions.isMaintainer(agentId, repo.id);
-      if (!isMaintainer) {
-        throw new Error('Gated mode: only maintainers can merge streams to buffer');
+      if (this.sync) {
+        // Mode B: delegate the full gated check to the server, which can
+        // enforce maintainer status, human approval, and any additional
+        // gating policies configured on the repo.
+        try {
+          const approval = await this.sync.requestMerge(repo.id, streamId);
+          if (!approval.approved) {
+            throw new Error(
+              `Gated mode: server denied merge — ${approval.consensus?.reason || 'maintainer approval required'}`
+            );
+          }
+          // Server approved — skip the local consensus check below since
+          // requestMerge already validated both gated permissions and consensus.
+        } catch (err) {
+          if (err.message?.includes('server denied merge')) throw err;
+          // Server unreachable — queue instead of allowing local bypass
+          this.sync._queueEvent({ type: 'merge_requested', data: {
+            repoId: repo.id, streamId,
+          }});
+          throw new Error(
+            'Gated mode: server unavailable for approval. Merge queued for when connectivity returns.'
+          );
+        }
+      } else {
+        // Mode A: fall back to local maintainer check (no human-in-the-loop available)
+        const { isMaintainer } = await this.permissions.isMaintainer(agentId, repo.id);
+        if (!isMaintainer) {
+          throw new Error('Gated mode: only maintainers can merge streams to buffer');
+        }
       }
     }
 
-    if (mode === 'review' || mode === 'gated') {
-      // Check consensus — use server as authority when connected (Mode B)
+    if (mode === 'review' || (mode === 'gated' && !this.sync)) {
+      // Check consensus — use server as authority when connected (Mode B).
+      // In gated mode with sync, requestMerge above already checked consensus.
       let consensus;
       if (repo.consensus_authority === 'server' && this.sync) {
-        // Flush any pending review events so the server has the latest data
+        // Flush any pending review events so the server has the latest data.
+        // Block the merge if review-critical events failed to sync — the
+        // server would evaluate consensus against incomplete data.
+        const REVIEW_CRITICAL_TYPES = ['review', 'submit_review'];
+        let flushResult;
         try {
-          await this.sync.flushQueue();
+          flushResult = await this.sync.flushQueue();
         } catch {
-          // Non-fatal: server may be unreachable — the consensus check below will handle it
+          // Server unreachable — handled by the consensus check below
+          flushResult = null;
+        }
+
+        if (flushResult?.failedTypes?.some(t => REVIEW_CRITICAL_TYPES.includes(t))) {
+          throw new Error(
+            `Cannot check consensus: review event(s) failed to sync to server ` +
+            `(${flushResult.failedTypes.filter(t => REVIEW_CRITICAL_TYPES.includes(t)).join(', ')}). ` +
+            `Retry with \`gitswarm merge\` when connectivity is restored.`
+          );
         }
 
         try {
@@ -1341,6 +1387,28 @@ export class Federation {
     // Merge builtin plugins with plugins.yml definitions for this trigger.
     // plugins.yml can override safe_outputs for builtins (matched by action name).
     const yamlPlugins = this.loadPlugins();
+    const builtinNames = Object.keys(BUILTIN_PLUGINS);
+
+    // Log any plugins.yml entries for this trigger that aren't handled locally.
+    // These are Tier 2/3 plugins that require a server connection.
+    const skippedPlugins = yamlPlugins.filter(p =>
+      p.enabled &&
+      p.trigger_event === `gitswarm.${trigger}` &&
+      !p.actions.some(a => builtinNames.includes(a))
+    );
+    if (skippedPlugins.length > 0) {
+      const names = skippedPlugins.map(p => p.name).join(', ');
+      await this.activity.log({
+        event_type: 'plugins_skipped_no_server',
+        target_type: 'repo',
+        target_id: repo.id,
+        metadata: {
+          trigger,
+          skipped: names,
+          reason: 'Tier 2/3 plugins require a server connection',
+        },
+      });
+    }
 
     for (const [name, plugin] of Object.entries(BUILTIN_PLUGINS)) {
       if (plugin.trigger !== trigger) continue;
