@@ -18,15 +18,26 @@ COPY web/ ./
 # Build frontend
 RUN npm run build
 
-# Stage 2: Build backend dependencies
+# Stage 2: Build backend
 FROM node:20-alpine AS backend-builder
 
 WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+COPY tsconfig.json ./
 
-# Install production dependencies only
+# Install all dependencies (including dev for tsc)
+RUN npm ci
+
+# Copy backend and shared source
+COPY src/ ./src/
+COPY shared/ ./shared/
+
+# Compile TypeScript
+RUN npx tsc
+
+# Remove dev dependencies for production
 RUN npm ci --only=production
 
 # Stage 3: Production image
@@ -46,8 +57,8 @@ WORKDIR /app
 # Copy production node_modules
 COPY --from=backend-builder /app/node_modules ./node_modules
 
-# Copy application source
-COPY --chown=bothub:nodejs src/ ./src/
+# Copy compiled backend
+COPY --from=backend-builder --chown=bothub:nodejs /app/dist ./dist
 COPY --chown=bothub:nodejs docs/ ./docs/
 COPY --chown=bothub:nodejs package.json ./
 
@@ -70,4 +81,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
 
 # Start application
-CMD ["node", "src/index.js"]
+CMD ["node", "dist/src/index.js"]

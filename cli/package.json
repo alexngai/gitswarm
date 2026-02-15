@@ -4,18 +4,17 @@
   "description": "CLI for local multi-agent federation coordination via git",
   "type": "module",
   "bin": {
-    "gitswarm": "./bin/gitswarm.js"
+    "gitswarm": "./dist/bin/gitswarm.js"
   },
-  "main": "src/index.js",
+  "main": "dist/src/index.js",
   "exports": {
-    ".": "./src/index.js",
-    "./core/*": "./src/core/*.js",
-    "./store": "./src/store/sqlite.js",
-    "./shared/*": "./src/shared/*.js"
+    ".": "./dist/src/index.js",
+    "./core/*": "./dist/src/core/*.js",
+    "./store": "./dist/src/store/sqlite.js",
+    "./shared/*": "./dist/src/shared/*.js"
   },
   "files": [
-    "bin/",
-    "src/",
+    "dist/",
     "README.md"
   ],
   "engines": {
@@ -29,11 +28,12 @@
   "homepage": "https://github.com/alexngai/gitswarm#readme",
   "bugs": "https://github.com/alexngai/gitswarm/issues",
   "scripts": {
-    "build": "npm run test",
+    "build": "tsc",
     "prepublishOnly": "npm run build",
     "publish:npm": "npm publish --access public",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "gitswarm",
@@ -58,7 +58,9 @@
     }
   },
   "devDependencies": {
-    "git-cascade": ">=0.1.0",
+    "typescript": "^5.9.0",
+    "@types/node": "^22.0.0",
+    "@types/better-sqlite3": "^7.6.0",
     "vitest": "^1.6.1"
   }
 }

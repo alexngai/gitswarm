@@ -4,7 +4,7 @@ import { resolve } from 'path';
 // Redirect missing git-cascade peer dependency to our in-memory mock
 // so integration/e2e tests can exercise the full Federation lifecycle.
 function mockGitCascade() {
-  const mockPath = resolve(import.meta.dirname, 'test/git-cascade-mock.js');
+  const mockPath = resolve(import.meta.dirname, 'test/git-cascade-mock.ts');
   return {
     name: 'mock-git-cascade',
     enforce: 'pre',
@@ -28,6 +28,6 @@ export default defineConfig({
     environment: 'node',
     testTimeout: 60000,
     hookTimeout: 30000,
-    include: ['test/**/*.test.js'],
+    include: ['test/**/*.test.ts'],
   },
 });
