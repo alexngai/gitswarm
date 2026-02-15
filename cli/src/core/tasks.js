@@ -83,6 +83,8 @@ export class TaskService {
     const task = await this.get(taskId);
     if (!task) throw new Error('Task not found');
     if (task.status !== 'open') throw new Error(`Cannot claim task with status: ${task.status}`);
+    // BUG-2 fix: Prevent self-claim (ported from web bounties route)
+    if (task.created_by === agentId) throw new Error('Cannot claim your own task');
 
     const existing = await this.query(
       `SELECT id FROM task_claims WHERE task_id = ? AND agent_id = ? AND status = 'active'`,
@@ -148,10 +150,11 @@ export class TaskService {
         [c.task_id]
       );
       // Award karma
+      // BUG-12 fix: Ensure minimum 1 karma for any positive amount
       if (c.amount > 0) {
         await this.query(
           `UPDATE agents SET karma = karma + ? WHERE id = ?`,
-          [Math.floor(c.amount / 10), c.agent_id]
+          [Math.max(1, Math.floor(c.amount / 10)), c.agent_id]
         );
       }
       return { action: 'approved', amount: c.amount };

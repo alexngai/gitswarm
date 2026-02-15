@@ -26,7 +26,7 @@ import { CouncilService } from './core/council.js';
 import { StageService } from './core/stages.js';
 import { ActivityService } from './core/activity.js';
 import { SyncClient } from './sync-client.js';
-import { generateId } from '../../shared/ids.js';
+import { generateId } from './shared/ids.js';
 import { BUILTIN_PLUGINS } from './plugins/builtins.js';
 import { CliSafeOutputs } from './plugins/safe-outputs.js';
 import { MergeLock } from './merge-lock.js';
@@ -628,6 +628,19 @@ export class Federation {
     const streamId = overrideStreamId || worktree.currentStream;
     if (!streamId) throw new Error('No active stream for this workspace');
 
+    // BUG-7 fix: Prevent commits to non-active streams
+    try {
+      const streamRow = await this.store.query(
+        `SELECT status FROM streams WHERE id = ?`, [streamId]
+      );
+      if (streamRow.rows.length > 0 && streamRow.rows[0].status !== 'active') {
+        throw new Error(`Cannot commit to stream with status '${streamRow.rows[0].status}'. Stream must be active.`);
+      }
+    } catch (err) {
+      if (err.message.includes('Cannot commit to stream')) throw err;
+      // streams table may not exist in older schema — allow commit to proceed
+    }
+
     // Commit via git-cascade (handles Change-Id tracking)
     const { commit, changeId } = tracker.commitChanges({
       streamId,
@@ -864,6 +877,22 @@ export class Federation {
 
     const bufferBranch = repo.buffer_branch || 'buffer';
     const mode = repo.merge_mode || 'review';
+
+    // BUG-17 fix: Enforce parent stream merge order
+    try {
+      const parentCheck = await this.store.query(
+        `SELECT s2.status as parent_status FROM streams s
+         JOIN streams s2 ON s.parent_stream_id = s2.id
+         WHERE s.id = ?`,
+        [streamId]
+      );
+      if (parentCheck.rows.length > 0 && parentCheck.rows[0].parent_status !== 'merged') {
+        throw new Error('Parent stream must be merged first');
+      }
+    } catch (err) {
+      if (err.message.includes('Parent stream must be merged')) throw err;
+      // parent_stream_id column may not exist in older schemas — skip check
+    }
 
     // Permission check depends on mode
     if (mode === 'gated') {

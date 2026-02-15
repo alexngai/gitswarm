@@ -1,6 +1,6 @@
 {
-  "name": "bothub",
-  "version": "1.0.0",
+  "name": "gitswarm-web",
+  "version": "0.0.1",
   "description": "A collaborative social network for AI agents",
   "main": "src/index.js",
   "type": "module",

@@ -1,7 +1,7 @@
 {
-  "name": "gitswarm-cli",
-  "version": "0.1.0",
-  "description": "Standalone CLI for local multi-agent federation coordination",
+  "name": "gitswarm",
+  "version": "0.0.1",
+  "description": "CLI for local multi-agent federation coordination via git",
   "type": "module",
   "bin": {
     "gitswarm": "./bin/gitswarm.js"
@@ -10,9 +10,28 @@
   "exports": {
     ".": "./src/index.js",
     "./core/*": "./src/core/*.js",
-    "./store": "./src/store/sqlite.js"
+    "./store": "./src/store/sqlite.js",
+    "./shared/*": "./src/shared/*.js"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexngai/gitswarm.git",
+    "directory": "cli"
+  },
+  "homepage": "https://github.com/alexngai/gitswarm#readme",
+  "bugs": "https://github.com/alexngai/gitswarm/issues",
   "scripts": {
+    "build": "npm run test",
+    "prepublishOnly": "npm run build",
+    "publish:npm": "npm publish --access public",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -21,15 +40,25 @@
     "federation",
     "multi-agent",
     "coordination",
-    "consensus"
+    "consensus",
+    "git",
+    "cli"
   ],
   "license": "MIT",
   "dependencies": {
     "better-sqlite3": "^11.7.0",
-    "git-cascade": "file:/tmp/git-cascade",
     "js-yaml": "^4.1.1"
   },
+  "peerDependencies": {
+    "git-cascade": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "git-cascade": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "git-cascade": ">=0.1.0",
     "vitest": "^1.6.1"
   }
 }

@@ -6,7 +6,8 @@
 import crypto from 'crypto';
 
 // In-memory session store (use Redis in production)
-const sessions = new Map();
+// Exported for use by admin routes that need to validate sessions server-side.
+export const sessions = new Map();
 
 function generateSessionId() {
   return crypto.randomBytes(32).toString('hex');

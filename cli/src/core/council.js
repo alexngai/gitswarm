@@ -170,6 +170,13 @@ export class CouncilService {
     );
     if (membership.rows.length === 0) throw new Error('Only council members can vote');
 
+    // BUG-10 fix: Check for existing vote before UPSERT to avoid inflating votes_cast
+    const existingVote = await this.query(
+      `SELECT id FROM council_votes WHERE proposal_id = ? AND agent_id = ?`,
+      [proposalId, agentId]
+    );
+    const isNewVote = existingVote.rows.length === 0;
+
     await this.query(
       `INSERT INTO council_votes (proposal_id, agent_id, vote, comment) VALUES (?, ?, ?, ?)
        ON CONFLICT (proposal_id, agent_id) DO UPDATE SET vote = ?, comment = ?, voted_at = datetime('now')`,
@@ -189,11 +196,14 @@ export class CouncilService {
       [counts.for, counts.against, counts.abstain, proposalId]
     );
 
-    await this.query(
-      `UPDATE council_members SET votes_cast = votes_cast + 1
-       WHERE council_id = ? AND agent_id = ?`,
-      [proposal.rows[0].council_id, agentId]
-    );
+    // Only increment votes_cast for new votes, not updates
+    if (isNewVote) {
+      await this.query(
+        `UPDATE council_members SET votes_cast = votes_cast + 1
+         WHERE council_id = ? AND agent_id = ?`,
+        [proposal.rows[0].council_id, agentId]
+      );
+    }
 
     // Check resolution
     await this._checkResolution(proposalId);
@@ -248,10 +258,15 @@ export class CouncilService {
     const total = votes_for + votes_against;
 
     if (total >= quorum_required) {
+      // BUG-9 fix: Explicit tie handling — ties are rejected with distinct reason
+      const isTie = votes_for === votes_against;
       const outcome = votes_for > votes_against ? 'passed' : 'rejected';
+      const resolution = isTie
+        ? JSON.stringify({ reason: 'tie', votes_for, votes_against })
+        : null;
       await this.query(
-        `UPDATE council_proposals SET status = ?, resolved_at = datetime('now') WHERE id = ?`,
-        [outcome, proposalId]
+        `UPDATE council_proposals SET status = ?, resolved_at = datetime('now'), execution_result = COALESCE(?, execution_result) WHERE id = ?`,
+        [outcome, resolution, proposalId]
       );
       if (outcome === 'passed') await this._executeAction(p.rows[0]);
       return outcome;

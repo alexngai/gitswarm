@@ -1,4 +1,4 @@
-import { query } from '../../config/database.js';
+import { query, getClient } from '../../config/database.js';
 import { authenticate } from '../../middleware/authenticate.js';
 import { createRateLimiter } from '../../middleware/rateLimit.js';
 import { GitSwarmPermissionService } from '../../services/gitswarm-permissions.js';
@@ -194,6 +194,34 @@ export async function streamRoutes(app, options = {}) {
     const { repoId, streamId } = request.params;
     const { status, review_status } = request.body;
 
+    // BUG-8 fix: Validate state machine transitions
+    if (status) {
+      const currentStream = await query(`
+        SELECT status FROM gitswarm_streams WHERE id = $1 AND repo_id = $2
+      `, [streamId, repoId]);
+
+      if (currentStream.rows.length === 0) {
+        return reply.status(404).send({ error: 'Stream not found' });
+      }
+
+      const validTransitions = {
+        active: ['in_review', 'abandoned'],
+        in_review: ['active', 'abandoned'],
+        merged: [],
+        abandoned: [],
+        reverted: [],
+      };
+
+      const currentStatus = currentStream.rows[0].status;
+      const allowed = validTransitions[currentStatus] || [];
+      if (!allowed.includes(status)) {
+        return reply.status(400).send({
+          error: 'Bad Request',
+          message: `Cannot transition from '${currentStatus}' to '${status}'`,
+        });
+      }
+    }
+
     const updates = [];
     const params = [];
     let paramIdx = 1;
@@ -375,6 +403,18 @@ export async function streamRoutes(app, options = {}) {
     const { repoId, streamId } = request.params;
     const agentId = request.agent.id;
 
+    // BUG-6 fix: Prevent submitting streams with no commits
+    const commits = await query(`
+      SELECT COUNT(*) as count FROM gitswarm_stream_commits WHERE stream_id = $1
+    `, [streamId]);
+
+    if (parseInt(commits.rows[0]?.count ?? 0) === 0) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: 'Cannot submit stream with no commits',
+      });
+    }
+
     const result = await query(`
       UPDATE gitswarm_streams SET
         status = 'in_review',
@@ -422,13 +462,21 @@ export async function streamRoutes(app, options = {}) {
     const reviewerId = request.body.reviewer_id || request.agent.id;
     const { verdict, feedback = '', is_human = false, tested = false } = request.body;
 
-    // Verify stream exists
+    // Verify stream exists and get author
     const stream = await query(`
-      SELECT id FROM gitswarm_streams WHERE id = $1 AND repo_id = $2
+      SELECT id, agent_id FROM gitswarm_streams WHERE id = $1 AND repo_id = $2
     `, [streamId, repoId]);
 
     if (stream.rows.length === 0) {
       return reply.status(404).send({ error: 'Stream not found' });
+    }
+
+    // BUG-1 fix: Prevent self-review (ported from patches.js)
+    if (stream.rows[0].agent_id === reviewerId) {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: 'Cannot review your own stream',
+      });
     }
 
     const result = await query(`
@@ -535,6 +583,43 @@ export async function streamRoutes(app, options = {}) {
     const agentId = request.agent.id;
     const { merge_commit, target_branch } = request.body || {};
 
+    // BUG-5 fix: Check stream status before merge
+    const streamCheck = await query(`
+      SELECT status, parent_stream_id FROM gitswarm_streams WHERE id = $1 AND repo_id = $2
+    `, [streamId, repoId]);
+
+    if (streamCheck.rows.length === 0) {
+      return reply.status(404).send({ error: 'Stream not found' });
+    }
+
+    if (streamCheck.rows[0].status === 'merged') {
+      return reply.status(409).send({
+        error: 'Conflict',
+        message: 'Stream is already merged',
+      });
+    }
+
+    if (streamCheck.rows[0].status !== 'in_review') {
+      return reply.status(400).send({
+        error: 'Bad Request',
+        message: `Cannot merge stream with status: ${streamCheck.rows[0].status}. Stream must be in_review.`,
+      });
+    }
+
+    // BUG-17 fix: Check parent stream is merged (dependency enforcement)
+    if (streamCheck.rows[0].parent_stream_id) {
+      const parent = await query(`
+        SELECT status FROM gitswarm_streams WHERE id = $1
+      `, [streamCheck.rows[0].parent_stream_id]);
+
+      if (parent.rows.length > 0 && parent.rows[0].status !== 'merged') {
+        return reply.status(409).send({
+          error: 'Conflict',
+          message: 'Parent stream must be merged first',
+        });
+      }
+    }
+
     // Check merge permission
     const repo = await query(`
       SELECT merge_mode, buffer_branch FROM gitswarm_repos WHERE id = $1
@@ -568,19 +653,41 @@ export async function streamRoutes(app, options = {}) {
       }
     }
 
-    // Record the merge
-    await query(`
-      INSERT INTO gitswarm_merges (repo_id, stream_id, agent_id, merge_commit, target_branch)
-      VALUES ($1, $2, $3, $4, $5)
-    `, [repoId, streamId, agentId, merge_commit, target_branch || buffer_branch]);
+    // BUG-11 fix: Use transaction for atomic consensus-check + merge
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
 
-    // Update stream status
-    await query(`
-      UPDATE gitswarm_streams SET status = 'merged', review_status = 'approved', updated_at = NOW()
-      WHERE id = $1
-    `, [streamId]);
+      // Record the merge
+      await client.query(`
+        INSERT INTO gitswarm_merges (repo_id, stream_id, agent_id, merge_commit, target_branch)
+        VALUES ($1, $2, $3, $4, $5)
+      `, [repoId, streamId, agentId, merge_commit, target_branch || buffer_branch]);
 
-    // Update repo metrics
+      // Update stream status with optimistic lock (only if still in_review)
+      const mergeResult = await client.query(`
+        UPDATE gitswarm_streams SET status = 'merged', review_status = 'approved', updated_at = NOW()
+        WHERE id = $1 AND status = 'in_review'
+        RETURNING *
+      `, [streamId]);
+
+      if (mergeResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return reply.status(409).send({
+          error: 'Conflict',
+          message: 'Stream status changed during merge (possible concurrent merge)',
+        });
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    // Update repo metrics (outside transaction — non-critical)
     await stageService.updateRepoMetrics(repoId);
 
     if (activityService) {

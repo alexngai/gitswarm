@@ -4,6 +4,7 @@
  */
 
 import { query } from '../config/database.js';
+import { sessions } from './auth.js';
 
 // Middleware to require admin role
 function requireAdmin(request, reply, done) {
@@ -31,16 +32,23 @@ export default async function adminRoutes(fastify, options) {
       return reply.status(401).send({ error: 'Unauthorized', message: 'Authentication required' });
     }
 
-    // Validate session (simplified - in production use proper session store)
-    try {
-      const sessionData = JSON.parse(Buffer.from(sessionId, 'base64').toString());
-      if (!sessionData.user || sessionData.user.role !== 'admin') {
-        return reply.status(403).send({ error: 'Forbidden', message: 'Admin access required' });
-      }
-      request.user = sessionData.user;
-    } catch {
+    // BUG-4 fix: Validate session against server-side session store
+    // (previously decoded base64 client-side, allowing forged sessions)
+    const session = sessions.get(sessionId);
+    if (!session) {
       return reply.status(401).send({ error: 'Unauthorized', message: 'Invalid session' });
     }
+
+    if (session.expires < Date.now()) {
+      sessions.delete(sessionId);
+      return reply.status(401).send({ error: 'Unauthorized', message: 'Session expired' });
+    }
+
+    if (!session.user || session.user.role !== 'admin') {
+      return reply.status(403).send({ error: 'Forbidden', message: 'Admin access required' });
+    }
+
+    request.user = session.user;
   });
 
   /**
@@ -229,12 +237,15 @@ export default async function adminRoutes(fastify, options) {
         actionResult.message = 'Content removed';
         break;
 
-      case 'warn_agent':
-        // Get agent ID from content
+      case 'warn_agent': {
+        // BUG-3 fix: Use allowlist to prevent SQL injection via target_type
+        const warnTableMap = { post: 'posts', comment: 'comments', knowledge: 'knowledge_nodes', agent: 'agents', sync: 'syncs' };
         let agentId = report.target_type === 'agent' ? report.target_id : null;
         if (!agentId) {
+          const tableName = warnTableMap[report.target_type];
+          if (!tableName) break;
           const contentResult = await query(
-            `SELECT author_id FROM ${report.target_type === 'knowledge' ? 'knowledge_nodes' : report.target_type + 's'} WHERE id = $1`,
+            `SELECT author_id FROM ${tableName} WHERE id = $1`,
             [report.target_id]
           );
           agentId = contentResult.rows[0]?.author_id;
@@ -245,13 +256,17 @@ export default async function adminRoutes(fastify, options) {
           actionResult.message = 'Agent warned (-10 karma)';
         }
         break;
+      }
 
-      case 'ban_agent':
-        // Get agent ID and ban
+      case 'ban_agent': {
+        // BUG-3 fix: Use allowlist to prevent SQL injection via target_type
+        const banTableMap = { post: 'posts', comment: 'comments', knowledge: 'knowledge_nodes', agent: 'agents', sync: 'syncs' };
         let targetAgentId = report.target_type === 'agent' ? report.target_id : null;
         if (!targetAgentId) {
+          const tableName = banTableMap[report.target_type];
+          if (!tableName) break;
           const contentResult = await query(
-            `SELECT author_id FROM ${report.target_type === 'knowledge' ? 'knowledge_nodes' : report.target_type + 's'} WHERE id = $1`,
+            `SELECT author_id FROM ${tableName} WHERE id = $1`,
             [report.target_id]
           );
           targetAgentId = contentResult.rows[0]?.author_id;
@@ -261,6 +276,7 @@ export default async function adminRoutes(fastify, options) {
           actionResult.message = 'Agent banned';
         }
         break;
+      }
     }
 
     // Update report status

@@ -3,7 +3,7 @@
  *
  * Import this from other tools or multi-agent frameworks:
  *
- *   import { Federation } from 'gitswarm-cli';
+ *   import { Federation } from 'gitswarm';
  *   const fed = Federation.open('/path/to/repo');
  *   const agents = await fed.listAgents();
  *   const { streamId, path } = await fed.createWorkspace({ agentId: agents[0].id });

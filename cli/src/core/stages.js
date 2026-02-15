@@ -6,8 +6,8 @@
  *
  * Adds git-cascade tracker integration for metric updates.
  */
-import { StageService as SharedStageService } from '../../../shared/stages.js';
-import { createSqliteAdapter, createTableResolver, CLI_TABLES } from '../../../shared/query-adapter.js';
+import { StageService as SharedStageService } from '../shared/stages.js';
+import { createSqliteAdapter, createTableResolver, CLI_TABLES } from '../shared/query-adapter.js';
 
 const t = createTableResolver(CLI_TABLES);
 

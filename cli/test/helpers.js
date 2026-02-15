@@ -17,27 +17,28 @@ const tempDirs = [];
 
 /**
  * Create a temp git repo with an initial commit.
- * Uses git clone from the gitswarm repo to avoid commit signing issues.
+ * Initializes a fresh repo with a single commit to provide working git history.
  */
 export function createTestRepo() {
   const tmpBase = mkdtempSync(join(tmpdir(), 'gsw-test-'));
   tempDirs.push(tmpBase);
 
   const repoPath = join(tmpBase, 'repo');
+  mkdirSync(repoPath, { recursive: true });
 
-  // Clone an existing repo to get a working git history
-  execSync(
-    `git clone --depth=1 file:///home/user/gitswarm "${repoPath}"`,
-    { encoding: 'utf-8', stdio: 'pipe' }
-  );
+  // Initialize a fresh git repo
+  execSync('git init', { cwd: repoPath, stdio: 'pipe' });
 
   // Configure for local commits (no signing)
   execSync('git config user.email "test@test.com"', { cwd: repoPath, stdio: 'pipe' });
   execSync('git config user.name "test"', { cwd: repoPath, stdio: 'pipe' });
   execSync('git config commit.gpgsign false', { cwd: repoPath, stdio: 'pipe' });
 
-  // Ensure 'main' branch exists and is checked out
+  // Create initial commit on main branch
   execSync('git checkout -B main', { cwd: repoPath, stdio: 'pipe' });
+  writeFileSync(join(repoPath, 'README.md'), '# Test Project\n');
+  execSync('git add .', { cwd: repoPath, stdio: 'pipe' });
+  execSync('git commit -m "initial commit"', { cwd: repoPath, stdio: 'pipe' });
 
   return repoPath;
 }
