@@ -1,100 +1,189 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { query } from '../config/database.js';
 import { githubApp } from '../services/github.js';
+import { giteaAdmin } from '../services/gitea-admin.js';
 
 let _activityService: Record<string, any> | null = null;
 let _pluginEngine: Record<string, any> | null = null;
 let _configSyncService: Record<string, any> | null = null;
 
+/**
+ * Detect webhook source from request headers.
+ * Returns 'github', 'gitea', or null if unrecognized.
+ */
+function detectWebhookSource(headers: Record<string, string | string[] | undefined>): 'github' | 'gitea' | null {
+  if (headers['x-github-event']) return 'github';
+  if (headers['x-gitea-event']) return 'gitea';
+  return null;
+}
+
+/**
+ * Extract event name and delivery ID from headers, normalized across backends.
+ */
+function extractWebhookMeta(headers: Record<string, string | string[] | undefined>, source: 'github' | 'gitea') {
+  if (source === 'gitea') {
+    return {
+      event: headers['x-gitea-event'] as string,
+      deliveryId: headers['x-gitea-delivery'] as string,
+      signature: headers['x-gitea-signature'] as string,
+    };
+  }
+  return {
+    event: headers['x-github-event'] as string,
+    deliveryId: headers['x-github-delivery'] as string,
+    signature: headers['x-hub-signature-256'] as string,
+  };
+}
+
+/**
+ * Verify webhook signature for the detected source.
+ */
+function verifySignature(rawBody: string, signature: string, source: 'github' | 'gitea'): boolean {
+  if (source === 'gitea') {
+    return giteaAdmin.verifyWebhookSignature(rawBody, signature);
+  }
+  return githubApp.verifyWebhookSignature(rawBody, signature);
+}
+
+/**
+ * Core webhook processing logic shared between /webhooks/github, /webhooks/gitea, and /webhooks/git.
+ */
+async function processWebhookEvent(
+  app: FastifyInstance,
+  event: string,
+  payload: Record<string, any>,
+  source: 'github' | 'gitea'
+): Promise<void> {
+  // Gitea and GitHub share the same event names and near-identical payloads
+  switch (event) {
+    case 'pull_request':
+      await handlePullRequestEvent(payload);
+      break;
+    case 'pull_request_review':
+      await handlePullRequestReviewEvent(payload);
+      break;
+    case 'installation':
+      // GitHub-only: App installation events
+      if (source === 'github') {
+        await handleInstallationEvent(payload);
+      }
+      break;
+    case 'installation_repositories':
+      if (source === 'github') {
+        await handleInstallationRepositoriesEvent(payload);
+      }
+      break;
+    case 'push':
+      await handlePushEvent(payload);
+      break;
+    case 'issues':
+      await handleIssuesEvent(payload);
+      break;
+    case 'issue_comment':
+      await handleIssueCommentEvent(payload);
+      break;
+    case 'workflow_run':
+      await handleWorkflowRunEvent(payload);
+      break;
+    default:
+      app.log.info({ event, source }, 'Unhandled webhook event');
+  }
+
+  // Route event through plugin engine (non-blocking)
+  if (_pluginEngine) {
+    _pluginEngine.processWebhookEvent(event, payload)
+      .catch((err: any) => app.log.error({ error: err.message }, 'Plugin engine error'));
+
+    const auditAction = _mapWebhookToAuditAction(event, payload);
+    if (auditAction) {
+      const auditRepoId = await _resolveRepoIdFromPayload(payload);
+      if (auditRepoId) {
+        _pluginEngine.auditWorkflowAction(auditRepoId, auditAction, payload)
+          .catch((err: any) => app.log.error({ error: err.message }, 'Audit action error'));
+      }
+    }
+  }
+
+  // Check if push touches .gitswarm/ files — trigger config sync
+  if (event === 'push' && _configSyncService) {
+    const commits = payload.commits || [];
+    const touchesConfig = commits.some((c: any) =>
+      [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]
+        .some((f: string) => f.startsWith('.gitswarm/'))
+    );
+    if (touchesConfig) {
+      const repoId = await _resolveRepoIdFromPayload(payload);
+      if (repoId) {
+        _configSyncService.syncRepoConfig(repoId)
+          .catch((err: any) => app.log.error({ error: err.message }, 'Config sync error on push'));
+      }
+    }
+  }
+}
+
 export async function webhookRoutes(app: FastifyInstance, options: Record<string, any> = {}): Promise<void> {
   _activityService = options.activityService || null;
   _pluginEngine = options.pluginEngine || null;
   _configSyncService = options.configSyncService || null;
-  // GitHub webhook handler
-  app.post('/webhooks/github', {
-    config: {
-      rawBody: true, // Need raw body for signature verification
-    },
+
+  /**
+   * Unified webhook endpoint — auto-detects GitHub vs Gitea from headers.
+   * POST /webhooks/git
+   */
+  app.post('/webhooks/git', {
+    config: { rawBody: true },
   }, async (request, reply) => {
-    const signature = request.headers['x-hub-signature-256'];
-    const event = request.headers['x-github-event'];
-    const deliveryId = request.headers['x-github-delivery'];
+    const source = detectWebhookSource(request.headers);
+    if (!source) {
+      return reply.status(400).send({ error: 'Unrecognized webhook source. Expected X-GitHub-Event or X-Gitea-Event header.' });
+    }
+
+    const { event, deliveryId, signature } = extractWebhookMeta(request.headers, source);
 
     if (!signature) {
       return reply.status(401).send({ error: 'Missing signature' });
     }
 
-    // Verify webhook signature
-    const rawBody = JSON.stringify((request.body as any));
-    if (!githubApp.verifyWebhookSignature(rawBody, signature as string)) {
+    const rawBody = JSON.stringify(request.body as any);
+    if (!verifySignature(rawBody, signature, source)) {
+      return reply.status(401).send({ error: 'Invalid signature' });
+    }
+
+    app.log.info({ event, deliveryId, source }, 'Received webhook');
+
+    try {
+      await processWebhookEvent(app, event, request.body as any, source);
+      return { received: true };
+    } catch (error: unknown) {
+      app.log.error({ error: (error as Error).message, source }, 'Error processing webhook');
+      return reply.status(500).send({ error: 'Webhook processing failed' });
+    }
+  });
+
+  /**
+   * Legacy GitHub webhook endpoint — kept for backward compatibility.
+   * POST /webhooks/github
+   */
+  app.post('/webhooks/github', {
+    config: { rawBody: true },
+  }, async (request, reply) => {
+    const signature = request.headers['x-hub-signature-256'] as string;
+    const event = request.headers['x-github-event'] as string;
+    const deliveryId = request.headers['x-github-delivery'] as string;
+
+    if (!signature) {
+      return reply.status(401).send({ error: 'Missing signature' });
+    }
+
+    const rawBody = JSON.stringify(request.body as any);
+    if (!githubApp.verifyWebhookSignature(rawBody, signature)) {
       return reply.status(401).send({ error: 'Invalid signature' });
     }
 
     app.log.info({ event, deliveryId }, 'Received GitHub webhook');
 
     try {
-      switch (event) {
-        case 'pull_request':
-          await handlePullRequestEvent((request.body as any));
-          break;
-        case 'pull_request_review':
-          await handlePullRequestReviewEvent((request.body as any));
-          break;
-        case 'installation':
-          await handleInstallationEvent((request.body as any));
-          break;
-        case 'installation_repositories':
-          await handleInstallationRepositoriesEvent((request.body as any));
-          break;
-        case 'push':
-          await handlePushEvent((request.body as any));
-          break;
-        case 'issues':
-          await handleIssuesEvent((request.body as any));
-          break;
-        case 'issue_comment':
-          await handleIssueCommentEvent((request.body as any));
-          break;
-        case 'workflow_run':
-          await handleWorkflowRunEvent((request.body as any));
-          break;
-        default:
-          app.log.info({ event }, 'Unhandled GitHub event');
-      }
-
-      // Route event through plugin engine (non-blocking)
-      if (_pluginEngine) {
-        _pluginEngine.processWebhookEvent(event, (request.body as any))
-          .catch((err: any) => app.log.error({ error: err.message }, 'Plugin engine error'));
-
-        // Post-hoc audit: if this event represents a mutation that could have
-        // been produced by a dispatched AI workflow, attribute it for budget tracking
-        const auditAction = _mapWebhookToAuditAction(event as string, (request.body as any));
-        if (auditAction) {
-          const auditRepoId = await _resolveRepoIdFromPayload((request.body as any));
-          if (auditRepoId) {
-            _pluginEngine.auditWorkflowAction(auditRepoId, auditAction, (request.body as any))
-              .catch((err: any) => app.log.error({ error: err.message }, 'Audit action error'));
-          }
-        }
-      }
-
-      // Check if push touches .gitswarm/ files — trigger config sync
-      if (event === 'push' && _configSyncService) {
-        const commits = ((request.body as any) as any).commits || [];
-        const touchesConfig = commits.some(c =>
-          [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]
-            .some(f => f.startsWith('.gitswarm/'))
-        );
-        if (touchesConfig) {
-          const repoId = await _resolveRepoIdFromPayload((request.body as any));
-          if (repoId) {
-            _configSyncService.syncRepoConfig(repoId)
-              .catch((err: any) => app.log.error({ error: err.message }, 'Config sync error on push'));
-          }
-        }
-      }
-
+      await processWebhookEvent(app, event, request.body as any, 'github');
       return { received: true };
     } catch (error: unknown) {
       app.log.error({ error: (error as Error).message }, 'Error processing webhook');

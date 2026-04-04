@@ -20,6 +20,14 @@ export interface AppConfig {
     clientId: string | undefined;
     clientSecret: string | undefined;
   };
+  gitea: {
+    url: string | undefined;
+    adminToken: string | undefined;
+    internalSecret: string | undefined;
+    sshUrl: string | undefined;
+    externalUrl: string | undefined;
+  };
+  defaultGitBackend: 'github' | 'gitea' | 'cascade';
   isDev: boolean;
 }
 
@@ -47,6 +55,17 @@ export const config: AppConfig = {
     clientId: process.env.GITHUB_CLIENT_ID,
     clientSecret: process.env.GITHUB_CLIENT_SECRET,
   },
+
+  gitea: {
+    url: process.env.GITEA_URL,
+    adminToken: process.env.GITEA_ADMIN_TOKEN,
+    internalSecret: process.env.GITEA_INTERNAL_SECRET,
+    sshUrl: process.env.GITEA_SSH_URL,
+    externalUrl: process.env.GITEA_EXTERNAL_URL,
+  },
+
+  defaultGitBackend: (process.env.DEFAULT_GIT_BACKEND as 'github' | 'gitea' | 'cascade') ||
+    (process.env.GITEA_URL ? 'gitea' : 'github'),
 
   isDev: process.env.NODE_ENV !== 'production',
 };

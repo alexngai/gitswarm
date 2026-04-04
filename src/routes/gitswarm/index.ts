@@ -13,6 +13,8 @@ import { fileRoutes } from './files.js';
 import { pluginRoutes } from './plugins.js';
 import { syncRoutes } from './sync.js';
 import { getBackendForRepo } from '../../services/backend-factory.js';
+import { giteaAdmin } from '../../services/gitea-admin.js';
+import { config } from '../../config/env.js';
 
 const permissionService = new GitSwarmPermissionService();
 
@@ -433,26 +435,71 @@ export async function gitswarmRoutes(app: FastifyInstance, options: Record<strin
       });
     }
 
-    // In a real implementation, we would create the repo on GitHub here
-    // For now, we'll create the database record with a placeholder github_repo_id
-    // The actual GitHub creation would happen via the GitSwarmService
+    const gitBackend = config.defaultGitBackend;
+    const orgName = org.gitea_org_name || org.github_org_name;
+    const fullName = `${orgName}/${name}`;
 
-    const fullName = `${org.github_org_name}/${name}`;
+    // Provision repo in the configured git backend
+    let giteaRepoId: number | null = null;
+    let giteaOwner: string | null = null;
+    let giteaRepoName: string | null = null;
+    let giteaUrl: string | null = null;
+    let githubRepoId: number | null = null;
 
-    // Generate a temporary repo ID (in production, this comes from GitHub)
-    const tempGithubRepoId = Date.now();
+    if (gitBackend === 'gitea' && giteaAdmin.isConfigured) {
+      // Ensure the Gitea org exists
+      const giteaOrg = await giteaAdmin.ensureOrg(orgName);
+
+      // Update org record with Gitea IDs if not set
+      if (!org.gitea_org_id) {
+        await query(`
+          UPDATE gitswarm_orgs SET gitea_org_id = $1, gitea_org_name = $2
+          WHERE id = $3
+        `, [giteaOrg.id, giteaOrg.username, org.id]);
+      }
+
+      // Create the repo in Gitea
+      const giteaRepo = await giteaAdmin.createRepo(orgName, name, {
+        isPrivate: is_private,
+        description,
+        autoInit: true,
+      });
+
+      giteaRepoId = giteaRepo.id;
+      giteaOwner = orgName;
+      giteaRepoName = name;
+      giteaUrl = giteaRepo.html_url;
+
+      // Install webhook pointing back to GitSwarm
+      const webhookUrl = `${config.host === '0.0.0.0' ? 'http://api:' + config.port : 'http://localhost:' + config.port}/api/v1/webhooks/git`;
+      await giteaAdmin.installWebhook(orgName, name, webhookUrl);
+
+      // Add the creating agent as a collaborator
+      const agentGiteaUser = await query(`
+        SELECT gitea_username FROM gitswarm_agent_gitea_users WHERE agent_id = $1
+      `, [request.agent.id]);
+
+      if (agentGiteaUser.rows.length > 0) {
+        await giteaAdmin.addRepoCollaborator(orgName, name, agentGiteaUser.rows[0].gitea_username, 'write');
+      }
+    } else {
+      // GitHub backend (existing behavior)
+      githubRepoId = Date.now();
+    }
 
     const result = await query(`
       INSERT INTO gitswarm_repos (
-        org_id, github_repo_name, github_repo_id, github_full_name,
+        org_id, name, github_repo_name, github_repo_id, github_full_name,
         is_private, description, ownership_model, consensus_threshold,
-        agent_access, min_karma
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        agent_access, min_karma, git_backend,
+        gitea_repo_id, gitea_owner, gitea_repo_name, gitea_url
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       RETURNING *
     `, [
-      org.id, name, tempGithubRepoId, fullName,
+      org.id, name, name, githubRepoId, fullName,
       is_private, description, ownership_model, consensus_threshold,
-      agent_access, min_karma
+      agent_access, min_karma, gitBackend,
+      giteaRepoId, giteaOwner, giteaRepoName, giteaUrl
     ]);
 
     const repo = result.rows[0];
@@ -473,7 +520,8 @@ export async function gitswarmRoutes(app: FastifyInstance, options: Record<strin
         metadata: {
           agent_name: request.agent.name,
           repo_name: fullName,
-          ownership_model
+          ownership_model,
+          git_backend: gitBackend
         }
       }).catch(err => console.error('Failed to log activity:', err));
     }
@@ -481,12 +529,16 @@ export async function gitswarmRoutes(app: FastifyInstance, options: Record<strin
     reply.status(201).send({
       repo: {
         id: repo.id,
+        name,
+        full_name: fullName,
         github_full_name: fullName,
         github_repo_name: name,
         description,
         is_private,
         ownership_model,
         agent_access,
+        git_backend: gitBackend,
+        gitea_url: giteaUrl,
         created_at: repo.created_at
       }
     });

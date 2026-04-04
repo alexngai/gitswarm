@@ -9,11 +9,13 @@
 import { query } from '../config/database.js';
 import { GitHubBackend } from './github-backend.js';
 import { CascadeBackend } from './cascade-backend.js';
+import { GiteaBackend } from './gitea-backend.js';
 import type { GitBackend } from './git-backend.js';
 
 // Cached singleton instances
 const githubBackend: GitHubBackend = new GitHubBackend();
 const cascadeBackend: CascadeBackend = new CascadeBackend();
+const giteaBackend: GiteaBackend = new GiteaBackend();
 
 /**
  * Get the appropriate backend for a repository.
@@ -35,6 +37,8 @@ export async function getBackendForRepo(repoId: string): Promise<GitBackend> {
   switch (backend) {
     case 'cascade':
       return cascadeBackend;
+    case 'gitea':
+      return giteaBackend;
     case 'github':
     default:
       return githubBackend;
@@ -47,6 +51,7 @@ export async function getBackendForRepo(repoId: string): Promise<GitBackend> {
 export function getBackend(name: string): GitBackend {
   switch (name) {
     case 'cascade': return cascadeBackend;
+    case 'gitea': return giteaBackend;
     case 'github': return githubBackend;
     default: throw new Error(`Unknown backend: ${name}`);
   }
