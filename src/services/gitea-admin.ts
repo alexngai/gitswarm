@@ -375,6 +375,130 @@ export class GiteaAdmin {
   }
 
   // ============================================================
+  // Server-side hook management
+  // ============================================================
+
+  /**
+   * Install GitSwarm governance hooks (pre-receive, post-receive) into a Gitea repo.
+   * Uses Gitea's API to set custom git hooks on the repo.
+   *
+   * Gitea exposes git hooks via:
+   *   GET/PATCH /api/v1/repos/{owner}/{repo}/hooks/git
+   */
+  async installServerHooks(
+    owner: string,
+    repo: string,
+    options?: {
+      apiUrl?: string;
+      internalSecret?: string;
+    }
+  ): Promise<void> {
+    const apiUrl = options?.apiUrl || 'http://api:3000/api/v1';
+    const secret = options?.internalSecret || this.internalSecret;
+
+    const preReceiveContent = `#!/bin/bash
+# GitSwarm pre-receive hook (auto-installed)
+GITSWARM_API_URL="${apiUrl}"
+GITSWARM_INTERNAL_SECRET="${secret}"
+REPO_PATH="$(pwd)"
+
+while read oldrev newrev refname; do
+  if [ "$newrev" = "0000000000000000000000000000000000000000" ]; then
+    continue
+  fi
+  RESULT=$(curl -sf --max-time 10 "\${GITSWARM_API_URL}/internal/git/pre-receive" \\
+    -H "Content-Type: application/json" \\
+    -H "X-Internal-Secret: \${GITSWARM_INTERNAL_SECRET}" \\
+    -d "{\\"repo_path\\": \\"\${REPO_PATH}\\", \\"ref\\": \\"\${refname}\\", \\"old_sha\\": \\"\${oldrev}\\", \\"new_sha\\": \\"\${newrev}\\", \\"pusher\\": \\"\${GITEA_PUSHER_NAME:-unknown}\\"}" 2>/dev/null)
+  if [ $? -ne 0 ]; then continue; fi
+  ALLOWED=$(echo "$RESULT" | grep -o '"allowed":\\s*\\(true\\|false\\)' | grep -o 'true\\|false')
+  if [ "$ALLOWED" != "true" ]; then
+    REASON=$(echo "$RESULT" | grep -o '"reason":"[^"]*"' | sed 's/"reason":"//;s/"$//')
+    echo "GitSwarm: push denied — \${REASON:-governance check failed}" >&2
+    exit 1
+  fi
+done
+exit 0`;
+
+    const postReceiveContent = `#!/bin/bash
+# GitSwarm post-receive hook (auto-installed)
+GITSWARM_API_URL="${apiUrl}"
+GITSWARM_INTERNAL_SECRET="${secret}"
+REPO_PATH="$(pwd)"
+
+while read oldrev newrev refname; do
+  curl -sf --max-time 5 "\${GITSWARM_API_URL}/internal/git/post-receive" \\
+    -H "Content-Type: application/json" \\
+    -H "X-Internal-Secret: \${GITSWARM_INTERNAL_SECRET}" \\
+    -d "{\\"repo_path\\": \\"\${REPO_PATH}\\", \\"ref\\": \\"\${refname}\\", \\"old_sha\\": \\"\${oldrev}\\", \\"new_sha\\": \\"\${newrev}\\", \\"pusher\\": \\"\${GITEA_PUSHER_NAME:-unknown}\\"}" >/dev/null 2>&1 &
+done
+wait 2>/dev/null
+exit 0`;
+
+    // Gitea git hooks API: PATCH /repos/{owner}/{repo}/hooks/git
+    // Updates the repo's server-side hooks
+    try {
+      await this.request<void>(
+        'PATCH',
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/hooks/git`,
+        [
+          { name: 'pre-receive', content: preReceiveContent },
+          { name: 'post-receive', content: postReceiveContent },
+        ]
+      );
+    } catch (error) {
+      // Gitea may not support the git hooks API in all editions.
+      // Fall back silently — hooks can be installed manually.
+      console.warn(`Failed to install server hooks for ${owner}/${repo}: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Verify that governance hooks are installed on a repo.
+   * Returns true if the pre-receive hook contains the GitSwarm marker.
+   */
+  async verifyHooksInstalled(owner: string, repo: string): Promise<boolean> {
+    try {
+      const hooks = await this.request<Array<{ name: string; content: string }>>(
+        'GET',
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/hooks/git`
+      );
+
+      const preReceive = hooks.find(h => h.name === 'pre-receive');
+      return !!(preReceive?.content?.includes('GitSwarm'));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Verify and reinstall hooks for all Gitea-backed repos.
+   * Call on startup to handle Gitea upgrades that may wipe custom hooks.
+   */
+  async verifyAllHooks(options?: { apiUrl?: string }): Promise<{ checked: number; reinstalled: number }> {
+    const { query: dbQuery } = await import('../config/database.js');
+
+    const repos = await dbQuery(`
+      SELECT gitea_owner, gitea_repo_name FROM gitswarm_repos
+      WHERE git_backend = 'gitea' AND gitea_owner IS NOT NULL AND status = 'active'
+    `);
+
+    let checked = 0;
+    let reinstalled = 0;
+
+    for (const repo of repos.rows) {
+      checked++;
+      const installed = await this.verifyHooksInstalled(repo.gitea_owner, repo.gitea_repo_name);
+      if (!installed) {
+        await this.installServerHooks(repo.gitea_owner, repo.gitea_repo_name, options);
+        reinstalled++;
+      }
+    }
+
+    return { checked, reinstalled };
+  }
+
+  // ============================================================
   // Utilities
   // ============================================================
 

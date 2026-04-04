@@ -37,6 +37,8 @@ import metricsRoutes, { recordRequest } from './routes/metrics.js';
 import reportRoutes from './routes/reports.js';
 import adminRoutes from './routes/admin.js';
 import { gitswarmRoutes } from './routes/gitswarm/index.js';
+import { internalGitHookRoutes } from './routes/internal/git-hooks.js';
+import { giteaAdmin } from './services/gitea-admin.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -144,6 +146,9 @@ app.register(adminRoutes, { prefix: `${apiPrefix}/admin`, db } as any);
 // GitSwarm routes (agent development ecosystem)
 app.register(gitswarmRoutes, { prefix: apiPrefix, activityService, pluginEngine, configSyncService } as any);
 
+// Internal routes (git hooks, no auth prefix — authenticated via shared secret)
+app.register(internalGitHookRoutes, { prefix: apiPrefix } as any);
+
 // WebSocket endpoint for real-time activity
 app.get('/ws', { websocket: true }, (connection) => {
   wsService.addClient(connection.socket);
@@ -229,6 +234,19 @@ async function start(): Promise<void> {
 
     // Run startup sync in background (non-blocking)
     startupSync();
+
+    // Verify Gitea server-side hooks are installed (non-blocking)
+    if (giteaAdmin.isConfigured) {
+      giteaAdmin.verifyAllHooks({
+        apiUrl: `http://localhost:${config.port}/api/${config.api.version}`,
+      }).then(({ checked, reinstalled }) => {
+        if (checked > 0) {
+          console.log(`Gitea hooks: verified ${checked} repos, reinstalled ${reinstalled}`);
+        }
+      }).catch(err => {
+        console.warn('Gitea hook verification failed:', (err as Error).message);
+      });
+    }
   } catch (err) {
     app.log.error(err);
     process.exit(1);

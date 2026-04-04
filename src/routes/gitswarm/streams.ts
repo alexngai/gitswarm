@@ -659,6 +659,14 @@ export async function streamRoutes(app: FastifyInstance, options: Record<string,
     try {
       await client.query('BEGIN');
 
+      // Record pending merge for pre-receive hook validation (Phase 2 governance).
+      // The pre-receive hook checks this table to verify that a push to a
+      // protected/buffer branch was initiated by a governance-approved merge.
+      await client.query(`
+        INSERT INTO gitswarm_pending_merges (repo_id, stream_id, expected_sha, status, expires_at)
+        VALUES ($1, $2, $3, 'pending', NOW() + INTERVAL '5 minutes')
+      `, [repoId, streamId, merge_commit || null]);
+
       // Record the merge
       await client.query(`
         INSERT INTO gitswarm_merges (repo_id, stream_id, agent_id, merge_commit, target_branch)

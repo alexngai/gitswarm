@@ -1,0 +1,34 @@
+#!/bin/bash
+# GitSwarm post-receive hook
+#
+# Fires after a push is accepted. Notifies GitSwarm for fast event propagation.
+# Runs asynchronously (non-blocking) — the push is already accepted.
+#
+# Environment variables:
+#   GITSWARM_API_URL       - GitSwarm API base URL
+#   GITSWARM_INTERNAL_SECRET - Shared secret for authentication
+#   GITEA_PUSHER_NAME      - Username of the pusher (set by Gitea)
+
+GITSWARM_API_URL="${GITSWARM_API_URL:-http://api:3000/api/v1}"
+GITSWARM_INTERNAL_SECRET="${GITSWARM_INTERNAL_SECRET:-}"
+REPO_PATH="$(pwd)"
+
+while read oldrev newrev refname; do
+  # Fire-and-forget: notify GitSwarm in the background
+  curl -sf --max-time 5 \
+    "${GITSWARM_API_URL}/internal/git/post-receive" \
+    -H "Content-Type: application/json" \
+    -H "X-Internal-Secret: ${GITSWARM_INTERNAL_SECRET}" \
+    -d "{
+      \"repo_path\": \"${REPO_PATH}\",
+      \"ref\": \"${refname}\",
+      \"old_sha\": \"${oldrev}\",
+      \"new_sha\": \"${newrev}\",
+      \"pusher\": \"${GITEA_PUSHER_NAME:-unknown}\"
+    }" >/dev/null 2>&1 &
+done
+
+# Wait for background processes to finish (optional — Gitea may kill the process)
+wait 2>/dev/null
+
+exit 0
