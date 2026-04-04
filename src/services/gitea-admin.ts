@@ -435,21 +435,25 @@ done
 wait 2>/dev/null
 exit 0`;
 
-    // Gitea git hooks API: PATCH /repos/{owner}/{repo}/hooks/git
-    // Updates the repo's server-side hooks
-    try {
-      await this.request<void>(
-        'PATCH',
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/hooks/git`,
-        [
-          { name: 'pre-receive', content: preReceiveContent },
-          { name: 'post-receive', content: postReceiveContent },
-        ]
-      );
-    } catch (error) {
-      // Gitea may not support the git hooks API in all editions.
-      // Fall back silently — hooks can be installed manually.
-      console.warn(`Failed to install server hooks for ${owner}/${repo}: ${(error as Error).message}`);
+    // Gitea git hooks API: PATCH /repos/{owner}/{repo}/hooks/git/{hook-name}
+    // Each hook is updated individually (pre-receive, post-receive)
+    const hooks = [
+      { name: 'pre-receive', content: preReceiveContent },
+      { name: 'post-receive', content: postReceiveContent },
+    ];
+
+    for (const hook of hooks) {
+      try {
+        await this.request<void>(
+          'PATCH',
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/hooks/git/${hook.name}`,
+          { content: hook.content }
+        );
+      } catch (error) {
+        // Gitea may not support the git hooks API in all editions.
+        // Fall back silently — hooks can be installed manually.
+        console.warn(`Failed to install ${hook.name} hook for ${owner}/${repo}: ${(error as Error).message}`);
+      }
     }
   }
 
@@ -459,13 +463,11 @@ exit 0`;
    */
   async verifyHooksInstalled(owner: string, repo: string): Promise<boolean> {
     try {
-      const hooks = await this.request<Array<{ name: string; content: string }>>(
+      const hook = await this.request<{ content: string }>(
         'GET',
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/hooks/git`
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/hooks/git/pre-receive`
       );
-
-      const preReceive = hooks.find(h => h.name === 'pre-receive');
-      return !!(preReceive?.content?.includes('GitSwarm'));
+      return !!(hook?.content?.includes('GitSwarm'));
     } catch {
       return false;
     }

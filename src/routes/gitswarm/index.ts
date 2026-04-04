@@ -12,6 +12,7 @@ import { streamRoutes } from './streams.js';
 import { fileRoutes } from './files.js';
 import { pluginRoutes } from './plugins.js';
 import { syncRoutes } from './sync.js';
+import { mirrorRoutes } from './mirrors.js';
 import { getBackendForRepo } from '../../services/backend-factory.js';
 import { giteaAdmin } from '../../services/gitea-admin.js';
 import { config } from '../../config/env.js';
@@ -31,6 +32,7 @@ export async function gitswarmRoutes(app: FastifyInstance, options: Record<strin
   await app.register(fileRoutes, { activityService });
   await app.register(pluginRoutes, { activityService, pluginEngine, configSyncService });
   await app.register(syncRoutes, { activityService, pluginEngine });
+  await app.register(mirrorRoutes, { activityService });
 
   // Different rate limits for different operation types
   const rateLimitRead = createRateLimiter('gitswarm_read');

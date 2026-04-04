@@ -38,6 +38,7 @@ import reportRoutes from './routes/reports.js';
 import adminRoutes from './routes/admin.js';
 import { gitswarmRoutes } from './routes/gitswarm/index.js';
 import { internalGitHookRoutes } from './routes/internal/git-hooks.js';
+import { githubCompatRoutes } from './routes/github-compat/index.js';
 import { giteaAdmin } from './services/gitea-admin.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -148,6 +149,9 @@ app.register(gitswarmRoutes, { prefix: apiPrefix, activityService, pluginEngine,
 
 // Internal routes (git hooks, no auth prefix — authenticated via shared secret)
 app.register(internalGitHookRoutes, { prefix: apiPrefix } as any);
+
+// GitHub-compatible API facade (/api/v3/)
+app.register(githubCompatRoutes, { prefix: '/api/v3', pluginEngine } as any);
 
 // WebSocket endpoint for real-time activity
 app.get('/ws', { websocket: true }, (connection) => {
