@@ -108,19 +108,19 @@ services:
       timeout: 5s
       retries: 5
 
-  # act_runner — GitHub Actions-compatible CI (optional)
-  # Uncomment when you need CI execution for plugins/workflows
-  # act_runner:
-  #   image: gitea/act_runner:latest
-  #   container_name: gitswarm-runner
-  #   environment:
-  #     - GITEA_INSTANCE_URL=http://gitea:3000
-  #     - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN:-}
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   depends_on:
-  #     gitea:
-  #       condition: service_healthy
+  # act_runner — GitHub Actions-compatible CI
+  act_runner:
+    image: gitea/act_runner:latest
+    container_name: gitswarm-runner
+    environment:
+      - GITEA_INSTANCE_URL=http://gitea:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      gitea:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

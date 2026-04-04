@@ -18,6 +18,9 @@ import EmbeddingsService from './services/embeddings.js';
 import NotificationService from './services/notifications.js';
 import PluginEngine from './services/plugin-engine.js';
 import ConfigSyncService from './services/config-sync.js';
+import { createGitSwarmMAPServer, initializeMAPServer } from './services/map-server.js';
+import { setMapServerRef } from './services/map-handlers.js';
+import { websocketStream } from '@multi-agent-protocol/sdk';
 
 // Route imports
 import { agentRoutes } from './routes/agents.js';
@@ -46,6 +49,8 @@ const __dirname = dirname(__filename);
 
 // Initialize services
 const wsService = new WebSocketService(redis);
+const mapServer = createGitSwarmMAPServer();
+setMapServerRef(mapServer);
 const activityService = new ActivityService(db, wsService);
 const embeddingsService = new EmbeddingsService(db);
 const notificationService = new NotificationService(db, redis);
@@ -153,9 +158,36 @@ app.register(internalGitHookRoutes, { prefix: apiPrefix } as any);
 // GitHub-compatible API facade (/api/v3/)
 app.register(githubCompatRoutes, { prefix: '/api/v3', pluginEngine } as any);
 
-// WebSocket endpoint for real-time activity
+// MAP protocol WebSocket endpoint (primary agent connection)
 app.get('/ws', { websocket: true }, (connection) => {
+  const stream = websocketStream(connection.socket as any);
+  const router = mapServer.accept(stream, { role: 'agent' });
+  router.start();
+});
+
+// Dashboard WebSocket endpoint (lightweight JSON feed, not MAP protocol)
+app.get('/ws/dashboard', { websocket: true }, (connection) => {
+  // Also add to legacy wsService for backward compat
   wsService.addClient(connection.socket);
+
+  // Subscribe to MAP events and forward as simple JSON
+  const handler = (event: any) => {
+    if (connection.socket.readyState === 1) {
+      try {
+        connection.socket.send(JSON.stringify({
+          type: event.type,
+          data: event.data,
+          timestamp: event.timestamp,
+        }));
+      } catch {
+        // Ignore send errors
+      }
+    }
+  };
+  mapServer.eventBus.on('*', handler);
+  connection.socket.on('close', () => {
+    mapServer.eventBus.off('*', handler);
+  });
 });
 
 // Skill documentation endpoint
@@ -236,6 +268,11 @@ async function start(): Promise<void> {
     console.log(`API prefix: ${apiPrefix}`);
     console.log(`WebSocket: ws://${config.host}:${config.port}/ws`);
 
+    // Initialize MAP server scopes for existing repos (non-blocking)
+    initializeMAPServer(mapServer).catch(err => {
+      console.warn('MAP server initialization failed:', (err as Error).message);
+    });
+
     // Run startup sync in background (non-blocking)
     startupSync();
 
@@ -272,4 +309,4 @@ process.on('SIGTERM', shutdown);
 start();
 
 // Export for testing
-export { app, wsService, activityService, embeddingsService, notificationService, pluginEngine, configSyncService };
+export { app, wsService, mapServer, activityService, embeddingsService, notificationService, pluginEngine, configSyncService };

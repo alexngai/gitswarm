@@ -14,7 +14,7 @@
 1. [Motivation](#1-motivation)
 2. [Current Architecture](#2-current-architecture)
 3. [Target Architecture](#3-target-architecture)
-4. [Design Decisions](#4-design-decisions) — D1-D10 resolved
+4. [Design Decisions](#4-design-decisions) — D1-D17 resolved
 5. [Gitea Integration Layer](#5-gitea-integration-layer)
 6. [GitHub-Compatible API Facade](#6-github-compatible-api-facade)
 7. [Git Protocol-Level Governance](#7-git-protocol-level-governance)
@@ -24,7 +24,7 @@
 11. [Deployment Architecture](#11-deployment-architecture)
 12. [Scaling to a Hosted Cloud Service](#12-scaling-to-a-hosted-cloud-service)
 13. [Migration Path](#13-migration-path) — includes GitHub mirroring
-14. [Implementation Roadmap](#14-implementation-roadmap) — 5 phases with dependency graph
+14. [Implementation Roadmap](#14-implementation-roadmap) — Phases 1-3, 4A (MAP-native), 4B (OpenHive federation), 4C (future), 5 (cloud)
 
 ---
 
@@ -249,6 +249,104 @@ ALTER TABLE gitswarm_streams ADD COLUMN stream_number INTEGER;
 - Agent deactivated → Gitea token revoked, Gitea user disabled
 
 Gitea tokens don't expire by default, which is fine for self-hosted. For cloud, add expiration + auto-renewal.
+
+### D11: GitSwarm coordinates git artifacts, OpenHive coordinates swarms
+
+**Decision:** GitSwarm owns governance of git artifacts (streams, branches, merge ordering, consensus, stabilization). OpenHive owns swarm-level orchestration (agent discovery, task decomposition, assignment, session tracking). Neither replaces the other.
+
+**Rationale:** GitSwarm already has deep git integration (Gitea backend, pre-receive hooks, buffer model). OpenHive already has swarm management, MAP hub, and task coordination. Duplicating either system's strengths in the other creates maintenance burden and architectural confusion. The boundary is clean: OpenHive decides *who does what*; GitSwarm enforces *how it gets into the repo*.
+
+**How to apply:** The swarm endpoint (`POST /repos/:id/swarm`) accepts pre-decomposed work (agent assignments + stream dependencies) and sets up the git infrastructure. It does NOT decide which agent works on what — that comes from OpenHive or the caller.
+
+### D12: MAP as the native real-time protocol (Level 2)
+
+**Decision:** GitSwarm speaks MAP natively. The `/ws` endpoint is a MAP server, not a custom WebSocket protocol. Agents connect via the MAP SDK, register with their GitSwarm identity, join repo scopes, and receive events via MAP subscriptions.
+
+**Rationale:** MAP already provides everything GitSwarm needs for real-time: filtered subscriptions, backpressure, causal ordering, reconnection with event replay, federation, and agent-to-agent messaging. Building a custom event system would duplicate MAP's capabilities and create a migration burden when connecting to OpenHive. Since we control MAP and it's already the protocol for the rest of the ecosystem, adopting it natively in Phase 4A (not 4B) avoids a costly later migration.
+
+**What MAP replaces:**
+- `WebSocketService` broadcast → MAP EventBus with typed events
+- Custom Redis pub/sub channel → MAP event delivery (backed by Redis for multi-pod)
+- No filtering (firehose) → MAP subscriptions with `eventTypes` + `fromScopes` filters
+- No reconnection handling → MAP session resume + event replay
+
+**What stays unchanged:**
+- REST API (`/api/v1/`, `/api/v3/`) — CRUD operations remain HTTP
+- Gitea integration — git operations, webhooks, pre-receive hooks
+- Database — agents, streams, reviews, merges in PostgreSQL
+
+### D13: Agent identity — GitSwarm UUID as MAP agent ID
+
+**Decision:** GitSwarm UUID is the canonical agent ID within GitSwarm's MAP server. Agents present their API key during MAP `agents/register`. The server resolves it to the existing `agents` table row and uses the GitSwarm UUID as the MAP agent ID.
+
+**Rationale:** GitSwarm agents are persistent entities with karma, reviews, and permissions. MAP agents are transient connection-scoped registrations. The persistent identity lives in GitSwarm's database; the MAP registration links the connection to that identity. The client is responsible for presenting its API key — the server resolves it.
+
+**Flow:**
+1. Agent connects: `ws://gitswarm/ws` → MAP `connect` handshake
+2. Agent calls `agents/register` with `metadata: { api_key: "bh_xxx" }`
+3. GitSwarm MAP server: `hash(api_key)` → lookup in `agents` table → found UUID
+4. MAP `AgentRegistry` stores agent with `id = GitSwarm UUID`
+5. Agent is registered in MAP with its persistent GitSwarm identity
+
+**Cross-system identity:** For linking GitSwarm agents to OpenHive swarm IDs or other systems, the `gitswarm_agent_external_identities` mapping table (Phase 4B) links identities without coupling systems.
+
+### D14: Scope auto-join with intelligent defaults
+
+**Decision:** Auto-join repos where the agent is a maintainer or has active streams. Explicit `scopes/join` required for other repos.
+
+**Rationale:** Maintainers always need events from repos they govern. Agents with active streams need merge/review events for their work. Other repos generate noise. Auto-join on connect reduces setup friction; explicit join gives agents control.
+
+**Auto-join logic on agent registration:**
+```sql
+-- Repos where agent is maintainer/owner
+SELECT repo_id FROM gitswarm_maintainers WHERE agent_id = $1
+-- Repos where agent has active work
+SELECT DISTINCT repo_id FROM gitswarm_streams
+WHERE agent_id = $1 AND status IN ('active', 'in_review')
+```
+
+### D15: Dashboard uses separate lightweight feed
+
+**Decision:** The React dashboard uses a simple WebSocket or SSE feed, not the MAP protocol. Events originate from MAP EventBus; a thin adapter pushes to a `dashboard:events` channel.
+
+**Rationale:** The dashboard is a human-facing UI that needs an event stream, not the full MAP protocol. MAP is for agent-to-agent and system-to-system communication. Keeping the dashboard feed simple means no MAP SDK in the browser and no protocol overhead for human observers.
+
+### D16: MAP extension methods + REST CRUD
+
+**Decision:** MAP extension methods (`x-gitswarm/*`) for agent real-time operations. REST stays for CRUD and as a fallback. OpenHive uses MAP gateway for events + REST for bulk ops. External tools use REST only.
+
+**Rationale:** When agent-1 submits a review via MAP, agent-2 (in the same scope) gets the event on the same connection in the same tick. REST requires a separate WebSocket hop. MAP makes the round-trip tighter because the operation and notification share the same transport.
+
+**MAP extension methods (agent real-time operations):**
+```
+x-gitswarm/stream/create    — create stream, immediate event to scope
+x-gitswarm/stream/review    — submit review, triggers consensus check
+x-gitswarm/stream/merge     — governance-gated merge, synchronous result
+x-gitswarm/consensus/check  — query live consensus state
+x-gitswarm/task/claim        — claim task with optimistic locking
+x-gitswarm/swarm/setup       — batch create streams with dependencies
+```
+
+**REST stays for:**
+- Agent registration (`POST /agents`)
+- Repo CRUD (`POST/PATCH/GET /gitswarm/repos`)
+- Mirror management
+- GitHub-compat facade (`/api/v3/`)
+- Any operation that doesn't benefit from real-time event delivery
+
+**Both available for overlap operations:**
+- `POST /gitswarm/repos/:id/streams` (REST) = `x-gitswarm/stream/create` (MAP)
+- REST is the fallback for agents that don't maintain a MAP connection
+
+**OpenHive integration:**
+- MAP gateway for bidirectional event streaming
+- REST for bulk operations (import repos, set up mirrors, batch configurations)
+
+### D17: self-driving-repo integration via event bridge
+
+**Decision:** Medium-depth integration. GitSwarm lifecycle events (stream.merged, stabilization.failed) bridge to self-driving-repo DAG triggers. self-driving-repo outcomes feed back as GitSwarm plugin events.
+
+**Rationale:** self-driving-repo's workflows compile to GitHub Actions YAML, which act_runner can execute on Gitea. The bridge is small (event mapping) and valuable (merged streams trigger deployment workflows automatically). Deep integration (embedding the DAG engine) is Phase 4C if needed.
 
 ---
 
@@ -1177,35 +1275,363 @@ Implementation leverages Gitea's API:
 
 **Dependencies:** Phase 1 complete. Phase 2 recommended but not strictly required (facade works without git-level enforcement, just with weaker guarantees).
 
-### Phase 4: Agent-Native Enhancements
+### Phase 4A: MAP-Native Agent Platform
 
-**Goal:** APIs that make GitSwarm uniquely valuable for agent coordination — things GitHub can't do.
+**Goal:** GitSwarm speaks MAP natively. Agents connect via the MAP SDK, register with their GitSwarm identity, join repo scopes, receive events, send messages, and invoke GitSwarm operations — all over a single connection. (See decisions D12-D16.)
+
+**Dependency:** `@multi-agent-protocol/sdk` as an npm dependency.
 
 | Step | Description | Effort | Files affected |
 |------|-------------|--------|----------------|
-| 4.1 | Real-time event streaming over WebSocket (extend existing service) | Medium | `src/services/websocket.ts` |
-| 4.2 | `GET /streams/:id/consensus` — live consensus state | Small | `src/routes/gitswarm/streams.ts` |
-| 4.3 | `POST /repos/:id/stabilize` — trigger buffer stabilization | Medium | `src/routes/gitswarm/streams.ts` |
-| 4.4 | `POST /repos/:id/promote` — promote buffer → main | Medium | `src/routes/gitswarm/streams.ts` |
-| 4.5 | Swarm coordination endpoint: `POST /repos/:id/swarm` | Large | New: `src/routes/gitswarm/swarm.ts` |
-| 4.6 | act_runner integration for CI (add to docker-compose, wire to plugin engine) | Medium | `docker-compose.yml`, `src/services/plugin-engine.ts` |
+| 4A.1 | MAP server setup + agent identity resolution | Medium | New: `src/services/map-server.ts` |
+| 4A.2 | Replace `/ws` endpoint with MAP protocol | Small | `src/index.ts` |
+| 4A.3 | GitSwarm event taxonomy + EventBus integration | Medium | New: `src/services/map-events.ts`, modify `src/services/activity.ts` |
+| 4A.4 | Repo-as-scope model with auto-join | Medium | `src/services/map-server.ts` |
+| 4A.5 | MAP extension methods (`x-gitswarm/*`) | Large | New: `src/services/map-handlers.ts` |
+| 4A.6 | Dashboard lightweight feed (separate from MAP) | Small | `src/index.ts` |
+| 4A.7 | Consensus state endpoint (REST + MAP) | Small | `src/routes/gitswarm/streams.ts`, `src/services/map-handlers.ts` |
+| 4A.8 | Swarm git coordination (REST + MAP) | Medium | New: `src/routes/gitswarm/swarm.ts`, `src/services/map-handlers.ts` |
+| 4A.9 | act_runner CI integration | Medium | `docker-compose.yml`, `src/services/plugin-engine.ts` |
 
-**Event streaming detail (step 4.1):**
+**Step 4A.1: MAP server setup**
+
+```typescript
+// src/services/map-server.ts
+import { MAPServer, websocketStream } from '@multi-agent-protocol/sdk/server';
+
+const mapServer = new MAPServer({
+  name: 'gitswarm',
+  version: '0.3.0',
+
+  // Custom agent registration: resolve API key → GitSwarm UUID
+  additionalHandlers: {
+    ...createGitSwarmHandlers(),  // x-gitswarm/* methods
+  },
+});
+
+// Agent registration hook: link MAP agent to GitSwarm identity
+mapServer.eventBus.on('agent.registered', async (event) => {
+  const { agentId, metadata } = event.data;
+  if (metadata?.api_key) {
+    const hash = hashApiKey(metadata.api_key);
+    const agent = await query('SELECT id FROM agents WHERE api_key_hash = $1', [hash]);
+    if (agent.rows[0]) {
+      // Store GitSwarm UUID ↔ MAP agent ID mapping
+      // The MAP agent ID IS the GitSwarm UUID when possible
+    }
+  }
+});
+```
+
+**Step 4A.3: Event taxonomy**
+
+GitSwarm events published through MAP's EventBus, scoped to repos:
+
+```typescript
+// All events are scoped to a repo (MAP scope = repo:{uuid})
+const GITSWARM_EVENTS = {
+  // Stream lifecycle
+  'gitswarm.stream.created':      { stream_id, branch, agent_id, stream_number },
+  'gitswarm.stream.updated':      { stream_id, branch, new_sha },
+  'gitswarm.stream.abandoned':    { stream_id, reason },
+
+  // Reviews & consensus
+  'gitswarm.review.submitted':    { stream_id, reviewer_id, verdict },
+  'gitswarm.consensus.reached':   { stream_id, ratio, threshold, approvals },
+  'gitswarm.consensus.lost':      { stream_id, ratio, reason },
+
+  // Merge
+  'gitswarm.merge.started':       { stream_id, target_branch },
+  'gitswarm.merge.completed':     { stream_id, merge_commit, target_branch },
+  'gitswarm.merge.failed':        { stream_id, reason },
+
+  // Buffer lifecycle
+  'gitswarm.stabilization.started':   { repo_id, buffer_commit },
+  'gitswarm.stabilization.passed':    { repo_id, tag },
+  'gitswarm.stabilization.failed':    { repo_id, breaking_stream_id },
+  'gitswarm.promotion.completed':     { repo_id, from_branch, to_branch },
+
+  // Governance
+  'gitswarm.council.proposal_created':  { proposal_id, type },
+  'gitswarm.council.vote_cast':         { proposal_id, agent_id, vote },
+  'gitswarm.council.proposal_resolved': { proposal_id, result },
+
+  // Tasks
+  'gitswarm.task.created':     { task_id, title, task_number },
+  'gitswarm.task.claimed':     { task_id, agent_id },
+  'gitswarm.task.completed':   { task_id, stream_id },
+};
+```
+
+The `ActivityService` is modified to emit to `mapServer.eventBus` instead of the old `WebSocketService.publishActivity()`. Events are published with `scope: repo:{id}` so MAP's subscription filtering works per-repo.
+
+**Step 4A.4: Repo-as-scope model**
+
+Each GitSwarm repo is a MAP scope. When an agent registers via MAP, auto-join logic runs:
+
+```typescript
+// On agent registration, auto-join relevant repo scopes
+async function autoJoinScopes(mapServer, agentId, gitswarmAgentId) {
+  // Repos where agent is maintainer/owner
+  const maintained = await query(`
+    SELECT repo_id FROM gitswarm_maintainers WHERE agent_id = $1
+  `, [gitswarmAgentId]);
+
+  // Repos where agent has active streams
+  const active = await query(`
+    SELECT DISTINCT repo_id FROM gitswarm_streams
+    WHERE agent_id = $1 AND status IN ('active', 'in_review')
+  `, [gitswarmAgentId]);
+
+  const repoIds = new Set([
+    ...maintained.rows.map(r => r.repo_id),
+    ...active.rows.map(r => r.repo_id),
+  ]);
+
+  for (const repoId of repoIds) {
+    mapServer.scopes.join(`repo:${repoId}`, agentId);
+  }
+}
+```
+
+Agents can explicitly `scopes/join` additional repos or `scopes/leave` repos they don't need.
+
+**Step 4A.5: MAP extension methods**
+
+Custom `x-gitswarm/*` methods registered as additional handlers on the MAP server. These are the primary API for MAP-connected agents:
+
+```typescript
+// src/services/map-handlers.ts
+export function createGitSwarmHandlers(): HandlerRegistry {
+  return {
+    // Create a stream (agent gets immediate event confirmation in same scope)
+    'x-gitswarm/stream/create': async (params, ctx) => {
+      const { repo_id, branch, base_branch, name } = params;
+      const agentId = resolveAgentFromSession(ctx.session);
+      // ... create stream in DB, create branch in Gitea
+      // Event auto-emitted to repo scope subscribers
+      return { stream_id, stream_number, branch };
+    },
+
+    // Submit review (triggers consensus check, returns result)
+    'x-gitswarm/stream/review': async (params, ctx) => {
+      const { stream_id, verdict, feedback } = params;
+      // ... insert review, check consensus
+      return { consensus: { reached, ratio, threshold } };
+    },
+
+    // Governance-gated merge (synchronous consensus check + merge)
+    'x-gitswarm/stream/merge': async (params, ctx) => {
+      const { stream_id } = params;
+      // ... check consensus, execute merge if reached
+      // Returns 'consensus_not_reached' error if not ready
+      return { merged: true, merge_commit };
+    },
+
+    // Query live consensus state
+    'x-gitswarm/consensus/check': async (params, ctx) => {
+      const { stream_id } = params;
+      return { reached, ratio, threshold, approvals, rejections, votes: [...] };
+    },
+
+    // Claim a task
+    'x-gitswarm/task/claim': async (params, ctx) => {
+      const { task_id } = params;
+      // ... optimistic lock claim
+      return { claimed: true, task };
+    },
+
+    // Batch create streams with dependencies (swarm setup)
+    'x-gitswarm/swarm/setup': async (params, ctx) => {
+      const { repo_id, streams } = params;
+      // ... create streams, set parent_stream_id, create branches
+      return { streams: [...created], clone_urls: {...} };
+    },
+  };
+}
+```
+
+**REST endpoints stay available as fallback** for the same operations. The MAP methods and REST endpoints share the same underlying service logic — they're two transports into the same business layer.
+
+**Step 4A.6: Dashboard lightweight feed**
+
+The React dashboard does NOT connect via MAP. A thin adapter subscribes to the MAP EventBus and pushes to a simple `/ws/dashboard` endpoint:
+
+```typescript
+// Dashboard feed: simple JSON event stream, not MAP protocol
+app.get('/ws/dashboard', { websocket: true }, (connection) => {
+  const handler = (event) => {
+    connection.socket.send(JSON.stringify({
+      type: event.type,
+      data: event.data,
+      timestamp: event.timestamp,
+    }));
+  };
+  mapServer.eventBus.on('*', handler);
+  connection.socket.on('close', () => mapServer.eventBus.off('*', handler));
+});
+```
+
+**Step 4A.8: Swarm git coordination**
+
+Available as both REST (`POST /api/v1/gitswarm/repos/:id/swarm`) and MAP (`x-gitswarm/swarm/setup`). Accepts pre-decomposed work — GitSwarm does not do task decomposition (D11):
+
+```typescript
+// Input: pre-decomposed streams with dependency ordering
+{
+  "repo_id": "uuid",
+  "task_id": "uuid",           // optional: link to gitswarm_task
+  "streams": [
+    { "agent_id": "uuid-1", "branch": "stream/backend",    "depends_on": [] },
+    { "agent_id": "uuid-2", "branch": "stream/api-routes", "depends_on": ["stream/backend"] },
+    { "agent_id": "uuid-3", "branch": "stream/tests",      "depends_on": ["stream/api-routes"] }
+  ]
+}
+
+// GitSwarm:
+// 1. Creates gitswarm_streams with parent_stream_id for dependency ordering
+// 2. Creates branches in Gitea via GiteaBackend
+// 3. Adds agents as Gitea collaborators
+// 4. Returns clone URLs per agent
+// 5. Emits gitswarm.swarm.created event to repo scope
+```
+
+**Exit criteria:**
+- Agents connect via MAP SDK, register with API key, auto-join repo scopes
+- Agents receive filtered events (per repo, per event type) with reconnection replay
+- Agents invoke `x-gitswarm/*` methods for stream/review/merge/consensus/task/swarm operations
+- Agent-to-agent messaging works within repo scopes
+- Dashboard receives events via separate lightweight feed
+- REST API unchanged and functional as fallback
+- act_runner enabled in docker-compose, CI results feed into plugin engine
+
+**Dependencies:** Phase 1 complete. `@multi-agent-protocol/sdk` npm package.
+
+### Phase 4B: Cross-System Integration (OpenHive + Federation)
+
+**Goal:** Connect GitSwarm to OpenHive via MAP federation. OpenHive coordinates swarms; GitSwarm coordinates git artifacts. Events flow bidirectionally. Agent identity is linked across systems.
+
+**Prerequisite context:**
+- **OpenHive** — stable, actively developed swarm hub. Provides agent/swarm discovery, task coordination, session tracking, and real-time events. Implements MAP as its federation protocol.
+- GitSwarm is already a MAP server (Phase 4A). Federation is adding a GatewayConnection to OpenHive.
 
 ```
-GET /api/v1/events/subscribe?repos=repo1,repo2&events=stream.*,merge.*
-
-Events: stream.created, stream.merged, review.submitted, consensus.reached,
-        merge.completed, stabilization.passed, stabilization.failed,
-        promotion.completed, council.proposal_created, council.vote_cast,
-        task.created, task.claimed, plugin.executed
+┌─────────────────────────────────────────────────────────────────┐
+│                     Agent Swarms                                 │
+│  (via Claude Code teams, custom agents, CI bots)                │
+└──────────┬──────────────────────────────────┬───────────────────┘
+           │ MAP protocol                     │ MAP protocol
+    ┌──────▼──────────┐              ┌────────▼────────────┐
+    │   OpenHive      │  MAP gateway │    GitSwarm         │
+    │   (swarm hub)   │◄────────────►│   (git governance)  │
+    │                 │              │                     │
+    │ - Discovery     │              │ - MAP server (4A)   │
+    │ - Task assign   │              │ - Streams           │
+    │ - Sessions      │              │ - Consensus         │
+    │ - Trajectories  │              │ - Merge ordering    │
+    └─────────────────┘              └──────────┬──────────┘
+                                                │
+                                          ┌─────▼─────┐
+                                          │   Gitea   │
+                                          │  (repos)  │
+                                          └───────────┘
 ```
 
-Implementation: Redis pub/sub channels per repo → fan out to WebSocket connections.
+| Step | Description | Effort | Files affected |
+|------|-------------|--------|----------------|
+| 4B.1 | MAP GatewayConnection to OpenHive | Medium | New: `src/services/openhive-gateway.ts` |
+| 4B.2 | Federated agent identity mapping table | Small | New migration 007, `src/services/map-server.ts` |
+| 4B.3 | OpenHive task → GitSwarm swarm bridge | Medium | `src/services/openhive-gateway.ts` |
+| 4B.4 | self-driving-repo event bridge (GitSwarm events → DAG triggers) | Medium | New: `src/services/sdr-bridge.ts` |
+| 4B.5 | act_runner ↔ self-driving-repo wiring | Medium | `src/services/plugin-engine.ts` |
 
-**Exit criteria:** Agents receive real-time events over WebSocket. Multi-agent swarm can be orchestrated via a single API call. CI runs via act_runner with results feeding back into stream status.
+**Step 4B.1: MAP federation to OpenHive**
 
-**Dependencies:** Phase 1 complete.
+Since GitSwarm is already a MAP server (Phase 4A), federation is configuration, not code:
+
+```typescript
+// src/services/openhive-gateway.ts
+import { GatewayConnection, websocketStream } from '@multi-agent-protocol/sdk';
+
+const gateway = new GatewayConnection(
+  websocketStream(new WebSocket(config.openhive.mapUrl)),
+  {
+    name: 'gitswarm',
+    // Selectively expose gitswarm.* events to OpenHive
+    federationConfig: {
+      expose: ['gitswarm.stream.*', 'gitswarm.consensus.*', 'gitswarm.merge.*'],
+    },
+  }
+);
+
+// OpenHive events received by GitSwarm:
+// openhive.task.assigned, openhive.swarm.status, etc.
+```
+
+An agent connected to OpenHive that subscribes to `gitswarm.*` events receives them via federation without a direct GitSwarm connection. Conversely, GitSwarm agents can see OpenHive events if federated.
+
+**Step 4B.2: Federated agent identity**
+
+```sql
+-- Migration 007: Cross-system agent identity
+CREATE TABLE IF NOT EXISTS gitswarm_agent_external_identities (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  system VARCHAR(50) NOT NULL,
+  external_id VARCHAR(255) NOT NULL,
+  external_name VARCHAR(255),
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(agent_id, system),
+  UNIQUE(system, external_id)
+);
+```
+
+**Step 4B.3: OpenHive task → GitSwarm swarm bridge**
+
+When OpenHive assigns decomposed tasks, it calls GitSwarm's `x-gitswarm/swarm/setup` via MAP federation (or REST as fallback):
+
+```
+OpenHive coordination assigns work:
+  → Sends MAP message to gitswarm system
+  → x-gitswarm/swarm/setup { repo_id, streams: [...] }
+  → GitSwarm creates streams, branches, returns clone URLs
+  → OpenHive distributes clone URLs to assigned agents
+
+GitSwarm emits events:
+  → gitswarm.merge.completed → federated to OpenHive
+  → OpenHive updates coordination state, triggers next phase
+```
+
+**Step 4B.4: self-driving-repo event bridge**
+
+Maps GitSwarm events to self-driving-repo workflow triggers:
+
+```
+gitswarm.stream.merged → pull_request.closed (merged=true)
+gitswarm.stabilization.failed → custom:stabilization.red
+```
+
+Workflows compiled by self-driving-repo execute on act_runner (4B.5).
+
+**Exit criteria:** OpenHive and GitSwarm exchange events via MAP federation. OpenHive can trigger swarm setups in GitSwarm. Agent identity linked across systems. self-driving-repo workflows triggered by GitSwarm events.
+
+**Dependencies:** Phase 4A complete. OpenHive operational.
+
+### Phase 4C: Unified Platform (future)
+
+**Goal:** Deep integration where GitSwarm, OpenHive, and MAP form a seamless multi-agent development platform.
+
+| Step | Description | Effort |
+|------|-------------|--------|
+| 4C.1 | Cross-repo swarm orchestration (one task spanning multiple repos) | Large |
+| 4C.2 | Deep self-driving-repo integration (DAG engine as Tier 4 plugin) | Large |
+| 4C.3 | Agent capability discovery (OpenHive capabilities → GitSwarm permission enrichment) | Medium |
+| 4C.4 | Unified dashboard (GitSwarm React UI shows OpenHive swarm state + MAP topology) | Large |
+
+**Phase 4C is speculative.** Build only when Phases 4A+4B are validated with real users.
+
+**Dependencies:** Phase 4B complete and validated.
 
 ### Phase 5: Cloud Readiness
 
@@ -1219,7 +1645,7 @@ Implementation: Redis pub/sub channels per repo → fan out to WebSocket connect
 | 5.4 | Usage metering + billing hooks (per-merge, per-agent-hour) | Medium | New: `src/services/billing.ts` |
 | 5.5 | Onboarding flow (sign up → provision tenant → import repos) | Large | New: onboarding routes + UI |
 
-**Dependencies:** Phases 1-3 complete. Phase 4 recommended.
+**Dependencies:** Phases 1-3 complete. Phase 4A recommended.
 
 ### Phase dependency graph
 
@@ -1232,10 +1658,20 @@ Phase 1: Gitea Foundation
   │       │
   │       └──→ Phase 5: Cloud Readiness
   │
-  └──→ Phase 4: Agent-Native Enhancements
+  └──→ Phase 4A: MAP-Native Agent Platform
+          │       (MAP SDK dependency)
+          │
+          └──→ Phase 4B: Cross-System Integration
+                  │       (OpenHive + Federation)
+                  │
+                  └──→ Phase 4C: Unified Platform (future)
 ```
 
-Phases 2, 3, and 4 can proceed in parallel after Phase 1. Phase 5 depends on 1-3 being stable.
+Phases 2, 3, and 4A can proceed in parallel after Phase 1.
+Phase 4A requires `@multi-agent-protocol/sdk` as an npm dependency.
+Phase 4B requires 4A complete + operational OpenHive instance.
+Phase 4C is speculative — only pursue if the composed architecture proves insufficient.
+Phase 5 can proceed independently after Phases 1-3.
 
 ---
 
