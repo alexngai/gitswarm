@@ -28,6 +28,12 @@ export interface AppConfig {
     externalUrl: string | undefined;
   };
   defaultGitBackend: 'github' | 'gitea' | 'cascade';
+  openhive: {
+    url: string | undefined;
+    apiKey: string | undefined;
+    syncEnabled: boolean;
+    syncIntervalMs: number;
+  };
   isDev: boolean;
 }
 
@@ -66,6 +72,13 @@ export const config: AppConfig = {
 
   defaultGitBackend: (process.env.DEFAULT_GIT_BACKEND as 'github' | 'gitea' | 'cascade') ||
     (process.env.GITEA_URL ? 'gitea' : 'github'),
+
+  openhive: {
+    url: process.env.OPENHIVE_URL,
+    apiKey: process.env.OPENHIVE_API_KEY,
+    syncEnabled: !!process.env.OPENHIVE_URL,
+    syncIntervalMs: parseInt(process.env.OPENHIVE_SYNC_INTERVAL_MS || '30000', 10),
+  },
 
   isDev: process.env.NODE_ENV !== 'production',
 };

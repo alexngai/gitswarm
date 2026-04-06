@@ -1507,73 +1507,50 @@ Available as both REST (`POST /api/v1/gitswarm/repos/:id/swarm`) and MAP (`x-git
 
 **Dependencies:** Phase 1 complete. `@multi-agent-protocol/sdk` npm package.
 
-### Phase 4B: Cross-System Integration (OpenHive + Federation)
+### Phase 4B: Cross-System Integration (OpenHive Sync)
 
-**Goal:** Connect GitSwarm to OpenHive via MAP federation. OpenHive coordinates swarms; GitSwarm coordinates git artifacts. Events flow bidirectionally. Agent identity is linked across systems.
+**Goal:** Enable OpenHive to make informed coordination decisions based on GitSwarm repo state. Agents are the primary interface (via MAP, Phase 4A). The sync service is a secondary channel for system-to-system state sharing.
 
-**Prerequisite context:**
-- **OpenHive** — stable, actively developed swarm hub. Provides agent/swarm discovery, task coordination, session tracking, and real-time events. Implements MAP as its federation protocol.
-- GitSwarm is already a MAP server (Phase 4A). Federation is adding a GatewayConnection to OpenHive.
+**Architectural principle:** MAP is the agent interface. The sync service is for system-level awareness. Agents connect directly to both GitSwarm and OpenHive via MAP — no system-to-system gateway is needed. (See D11, D12.)
+
+**Why no GatewayConnection:** MAP's `GatewayConnection` is designed for federating peer MAP systems (e.g., OpenHive A ↔ OpenHive B) where agents on either side need a unified view. GitSwarm and OpenHive are complementary services, not peers. Agents already hold direct connections to both systems and mediate between them. A system-to-system federation bridge would add coupling, reconnection complexity, and envelope routing overhead with minimal benefit.
+
+**Two integration channels:**
+1. **Agents via MAP** (real-time, bidirectional) — agents connect to both systems directly, carry task assignments from OpenHive, execute via GitSwarm
+2. **Sync service via REST** (periodic, GitSwarm → OpenHive) — GitSwarm pushes repo state summaries so OpenHive can make informed coordination decisions
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Agent Swarms                                 │
-│  (via Claude Code teams, custom agents, CI bots)                │
-└──────────┬──────────────────────────────────┬───────────────────┘
-           │ MAP protocol                     │ MAP protocol
-    ┌──────▼──────────┐              ┌────────▼────────────┐
-    │   OpenHive      │  MAP gateway │    GitSwarm         │
-    │   (swarm hub)   │◄────────────►│   (git governance)  │
-    │                 │              │                     │
-    │ - Discovery     │              │ - MAP server (4A)   │
-    │ - Task assign   │              │ - Streams           │
-    │ - Sessions      │              │ - Consensus         │
-    │ - Trajectories  │              │ - Merge ordering    │
-    └─────────────────┘              └──────────┬──────────┘
-                                                │
-                                          ┌─────▼─────┐
-                                          │   Gitea   │
-                                          │  (repos)  │
-                                          └───────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                       Agent Swarms                                    │
+│  (Claude Code teams, custom agents, CI bots)                         │
+└──────────┬──────────────────────────────────────┬────────────────────┘
+           │ MAP (direct connection)              │ MAP (direct connection)
+           │ x-gitswarm/* methods                 │ task assignments, coordination
+    ┌──────▼──────────┐                    ┌──────▼──────────┐
+    │   GitSwarm      │  REST sync         │   OpenHive      │
+    │   (git gov)     │───────────────────►│   (swarm hub)   │
+    │                 │  POST /coordination │                 │
+    │ MAPServer (4A)  │  /contexts          │ - Discovery     │
+    │ Gitea           │                    │ - Task assign   │
+    │ Governance      │                    │ - Sessions      │
+    └─────────────────┘                    └─────────────────┘
 ```
 
 | Step | Description | Effort | Files affected |
 |------|-------------|--------|----------------|
-| 4B.1 | MAP GatewayConnection to OpenHive | Medium | New: `src/services/openhive-gateway.ts` |
-| 4B.2 | Federated agent identity mapping table | Small | New migration 007, `src/services/map-server.ts` |
-| 4B.3 | OpenHive task → GitSwarm swarm bridge | Medium | `src/services/openhive-gateway.ts` |
-| 4B.4 | self-driving-repo event bridge (GitSwarm events → DAG triggers) | Medium | New: `src/services/sdr-bridge.ts` |
-| 4B.5 | act_runner ↔ self-driving-repo wiring | Medium | `src/services/plugin-engine.ts` |
+| 4B.1 | Federated agent identity mapping table | Small | New: `src/db/migrations/007_external_identities.sql` |
+| 4B.2 | OpenHive env config + agent identity resolution on MAP register | Small | `src/config/env.ts`, `src/services/map-server.ts` |
+| 4B.3 | Repo state aggregation query | Small | New: `src/services/repo-state.ts` |
+| 4B.4 | OpenHive sync service (EventBus subscriber → REST push) | Medium | New: `src/services/openhive-sync.ts` |
+| 4B.5 | Optional: startup swarm registration in OpenHive directory | Small | `src/services/openhive-sync.ts` |
 
-**Step 4B.1: MAP federation to OpenHive**
+**Step 4B.1: Federated agent identity**
 
-Since GitSwarm is already a MAP server (Phase 4A), federation is configuration, not code:
+When an agent connects to GitSwarm via MAP, it may present an identity from another system. This table links external identities to GitSwarm agent records. Populated when agents register with `metadata.openhive_id`, or when admins link identities via API.
 
-```typescript
-// src/services/openhive-gateway.ts
-import { GatewayConnection, websocketStream } from '@multi-agent-protocol/sdk';
-
-const gateway = new GatewayConnection(
-  websocketStream(new WebSocket(config.openhive.mapUrl)),
-  {
-    name: 'gitswarm',
-    // Selectively expose gitswarm.* events to OpenHive
-    federationConfig: {
-      expose: ['gitswarm.stream.*', 'gitswarm.consensus.*', 'gitswarm.merge.*'],
-    },
-  }
-);
-
-// OpenHive events received by GitSwarm:
-// openhive.task.assigned, openhive.swarm.status, etc.
-```
-
-An agent connected to OpenHive that subscribes to `gitswarm.*` events receives them via federation without a direct GitSwarm connection. Conversely, GitSwarm agents can see OpenHive events if federated.
-
-**Step 4B.2: Federated agent identity**
+**Step 4B.2: Schema**
 
 ```sql
--- Migration 007: Cross-system agent identity
 CREATE TABLE IF NOT EXISTS gitswarm_agent_external_identities (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -1587,34 +1564,25 @@ CREATE TABLE IF NOT EXISTS gitswarm_agent_external_identities (
 );
 ```
 
-**Step 4B.3: OpenHive task → GitSwarm swarm bridge**
+**Step 4B.3: Repo state aggregation**
 
-When OpenHive assigns decomposed tasks, it calls GitSwarm's `x-gitswarm/swarm/setup` via MAP federation (or REST as fallback):
+Query service (`src/services/repo-state.ts`) that computes per-repo summaries: open stream counts, consensus status, buffer health, active agents, recent merge/stabilization/promotion timestamps. Used by the sync service and also exposed as a REST endpoint.
 
-```
-OpenHive coordination assigns work:
-  → Sends MAP message to gitswarm system
-  → x-gitswarm/swarm/setup { repo_id, streams: [...] }
-  → GitSwarm creates streams, branches, returns clone URLs
-  → OpenHive distributes clone URLs to assigned agents
+**Step 4B.4: OpenHive sync service**
 
-GitSwarm emits events:
-  → gitswarm.merge.completed → federated to OpenHive
-  → OpenHive updates coordination state, triggers next phase
-```
+Internal service (`src/services/openhive-sync.ts`) that subscribes to GitSwarm's MAP EventBus and pushes repo state to OpenHive via REST (`POST /coordination/contexts`). Triggers on significant events (merge completed, stabilization result, promotion) plus a configurable periodic interval (default 30s).
 
-**Step 4B.4: self-driving-repo event bridge**
+**What OpenHive receives and uses it for:**
+- `buffer_status: "red"` → hold off on assigning new work until CI is green
+- `open_streams` counts → distribute work evenly across repos
+- `active_agents` → know which agents are already occupied
+- Cross-project dependency tracking via merge timestamps
 
-Maps GitSwarm events to self-driving-repo workflow triggers:
+**Step 4B.5: Optional startup swarm registration**
 
-```
-gitswarm.stream.merged → pull_request.closed (merged=true)
-gitswarm.stabilization.failed → custom:stabilization.red
-```
+On startup, GitSwarm registers itself in OpenHive's swarm directory (`POST /api/v1/map/swarms`) so agents can discover which GitSwarm serves which repo. Agents on OpenHive then connect directly to GitSwarm via MAP.
 
-Workflows compiled by self-driving-repo execute on act_runner (4B.5).
-
-**Exit criteria:** OpenHive and GitSwarm exchange events via MAP federation. OpenHive can trigger swarm setups in GitSwarm. Agent identity linked across systems. self-driving-repo workflows triggered by GitSwarm events.
+**Exit criteria:** Federated agent identities linkable across systems. OpenHive receives periodic repo state summaries from GitSwarm. GitSwarm discoverable in OpenHive's swarm directory. Agents connect directly to both systems via MAP (Phase 4A).
 
 **Dependencies:** Phase 4A complete. OpenHive operational.
 
@@ -1624,10 +1592,11 @@ Workflows compiled by self-driving-repo execute on act_runner (4B.5).
 
 | Step | Description | Effort |
 |------|-------------|--------|
-| 4C.1 | Cross-repo swarm orchestration (one task spanning multiple repos) | Large |
-| 4C.2 | Deep self-driving-repo integration (DAG engine as Tier 4 plugin) | Large |
-| 4C.3 | Agent capability discovery (OpenHive capabilities → GitSwarm permission enrichment) | Medium |
-| 4C.4 | Unified dashboard (GitSwarm React UI shows OpenHive swarm state + MAP topology) | Large |
+| 4C.1 | self-driving-repo event bridge (GitSwarm events → DAG triggers, outcomes → plugin events) | Medium |
+| 4C.2 | act_runner ↔ self-driving-repo wiring (compiled workflows execute on Gitea CI) | Medium |
+| 4C.3 | Cross-repo swarm orchestration (one task spanning multiple repos) | Large |
+| 4C.4 | Agent capability discovery (OpenHive capabilities → GitSwarm permission enrichment) | Medium |
+| 4C.5 | Unified dashboard (GitSwarm React UI shows OpenHive swarm state + MAP topology) | Large |
 
 **Phase 4C is speculative.** Build only when Phases 4A+4B are validated with real users.
 
@@ -1661,10 +1630,10 @@ Phase 1: Gitea Foundation
   └──→ Phase 4A: MAP-Native Agent Platform
           │       (MAP SDK dependency)
           │
-          └──→ Phase 4B: Cross-System Integration
-                  │       (OpenHive + Federation)
+          └──→ Phase 4B: OpenHive Sync
+                  │       (REST push, no gateway)
                   │
-                  └──→ Phase 4C: Unified Platform (future)
+                  └──→ Phase 4C: SDR + Deep Integration (future)
 ```
 
 Phases 2, 3, and 4A can proceed in parallel after Phase 1.

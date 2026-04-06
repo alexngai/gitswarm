@@ -181,6 +181,20 @@ export function createGitSwarmMAPServer(): MAPServer {
 
       // Auto-join relevant repo scopes
       await autoJoinScopes(server, agentId, agent.id);
+
+      // Link external identity if provided (e.g., OpenHive swarm agent ID)
+      if (metadata.openhive_id) {
+        try {
+          await query(`
+            INSERT INTO gitswarm_agent_external_identities (agent_id, system, external_id, external_name, metadata)
+            VALUES ($1, 'openhive', $2, $3, $4)
+            ON CONFLICT (agent_id, system) DO UPDATE SET
+              external_id = $2, external_name = $3, metadata = $4, updated_at = NOW()
+          `, [agent.id, metadata.openhive_id, metadata.openhive_name || null, JSON.stringify(metadata.openhive_metadata || {})]);
+        } catch {
+          // Non-fatal: identity linking failed
+        }
+      }
     }
   });
 

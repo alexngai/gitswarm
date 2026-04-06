@@ -20,6 +20,8 @@ import PluginEngine from './services/plugin-engine.js';
 import ConfigSyncService from './services/config-sync.js';
 import { createGitSwarmMAPServer, initializeMAPServer } from './services/map-server.js';
 import { setMapServerRef } from './services/map-handlers.js';
+import { StateSyncService } from './services/state-sync.js';
+import { OpenHiveSyncTarget } from './services/openhive-sync.js';
 import { websocketStream } from '@multi-agent-protocol/sdk';
 
 // Route imports
@@ -272,6 +274,18 @@ async function start(): Promise<void> {
     initializeMAPServer(mapServer).catch(err => {
       console.warn('MAP server initialization failed:', (err as Error).message);
     });
+
+    // Start state sync service with configured targets (non-blocking)
+    const stateSync = new StateSyncService(mapServer, {
+      syncIntervalMs: config.openhive.syncIntervalMs,
+    });
+    stateSync.addTarget(new OpenHiveSyncTarget());
+    // Future: stateSync.addTarget(new OtherSyncTarget());
+    if (stateSync.targetCount > 0) {
+      stateSync.start().catch(err => {
+        console.warn('State sync startup failed:', (err as Error).message);
+      });
+    }
 
     // Run startup sync in background (non-blocking)
     startupSync();
