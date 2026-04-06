@@ -18,6 +18,11 @@ import EmbeddingsService from './services/embeddings.js';
 import NotificationService from './services/notifications.js';
 import PluginEngine from './services/plugin-engine.js';
 import ConfigSyncService from './services/config-sync.js';
+import { createGitSwarmMAPServer, initializeMAPServer } from './services/map-server.js';
+import { setMapServerRef } from './services/map-handlers.js';
+import { StateSyncService } from './services/state-sync.js';
+import { OpenHiveSyncTarget } from './services/openhive-sync.js';
+import { websocketStream } from '@multi-agent-protocol/sdk';
 
 // Route imports
 import { agentRoutes } from './routes/agents.js';
@@ -37,12 +42,17 @@ import metricsRoutes, { recordRequest } from './routes/metrics.js';
 import reportRoutes from './routes/reports.js';
 import adminRoutes from './routes/admin.js';
 import { gitswarmRoutes } from './routes/gitswarm/index.js';
+import { internalGitHookRoutes } from './routes/internal/git-hooks.js';
+import { githubCompatRoutes } from './routes/github-compat/index.js';
+import { giteaAdmin } from './services/gitea-admin.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Initialize services
 const wsService = new WebSocketService(redis);
+const mapServer = createGitSwarmMAPServer();
+setMapServerRef(mapServer);
 const activityService = new ActivityService(db, wsService);
 const embeddingsService = new EmbeddingsService(db);
 const notificationService = new NotificationService(db, redis);
@@ -144,9 +154,42 @@ app.register(adminRoutes, { prefix: `${apiPrefix}/admin`, db } as any);
 // GitSwarm routes (agent development ecosystem)
 app.register(gitswarmRoutes, { prefix: apiPrefix, activityService, pluginEngine, configSyncService } as any);
 
-// WebSocket endpoint for real-time activity
+// Internal routes (git hooks, no auth prefix — authenticated via shared secret)
+app.register(internalGitHookRoutes, { prefix: apiPrefix } as any);
+
+// GitHub-compatible API facade (/api/v3/)
+app.register(githubCompatRoutes, { prefix: '/api/v3', pluginEngine } as any);
+
+// MAP protocol WebSocket endpoint (primary agent connection)
 app.get('/ws', { websocket: true }, (connection) => {
+  const stream = websocketStream(connection.socket as any);
+  const router = mapServer.accept(stream, { role: 'agent' });
+  router.start();
+});
+
+// Dashboard WebSocket endpoint (lightweight JSON feed, not MAP protocol)
+app.get('/ws/dashboard', { websocket: true }, (connection) => {
+  // Also add to legacy wsService for backward compat
   wsService.addClient(connection.socket);
+
+  // Subscribe to MAP events and forward as simple JSON
+  const handler = (event: any) => {
+    if (connection.socket.readyState === 1) {
+      try {
+        connection.socket.send(JSON.stringify({
+          type: event.type,
+          data: event.data,
+          timestamp: event.timestamp,
+        }));
+      } catch {
+        // Ignore send errors
+      }
+    }
+  };
+  mapServer.eventBus.on('*', handler);
+  connection.socket.on('close', () => {
+    mapServer.eventBus.off('*', handler);
+  });
 });
 
 // Skill documentation endpoint
@@ -227,8 +270,38 @@ async function start(): Promise<void> {
     console.log(`API prefix: ${apiPrefix}`);
     console.log(`WebSocket: ws://${config.host}:${config.port}/ws`);
 
+    // Initialize MAP server scopes for existing repos (non-blocking)
+    initializeMAPServer(mapServer).catch(err => {
+      console.warn('MAP server initialization failed:', (err as Error).message);
+    });
+
+    // Start state sync service with configured targets (non-blocking)
+    const stateSync = new StateSyncService(mapServer, {
+      syncIntervalMs: config.openhive.syncIntervalMs,
+    });
+    stateSync.addTarget(new OpenHiveSyncTarget());
+    // Future: stateSync.addTarget(new OtherSyncTarget());
+    if (stateSync.targetCount > 0) {
+      stateSync.start().catch(err => {
+        console.warn('State sync startup failed:', (err as Error).message);
+      });
+    }
+
     // Run startup sync in background (non-blocking)
     startupSync();
+
+    // Verify Gitea server-side hooks are installed (non-blocking)
+    if (giteaAdmin.isConfigured) {
+      giteaAdmin.verifyAllHooks({
+        apiUrl: `http://localhost:${config.port}/api/${config.api.version}`,
+      }).then(({ checked, reinstalled }) => {
+        if (checked > 0) {
+          console.log(`Gitea hooks: verified ${checked} repos, reinstalled ${reinstalled}`);
+        }
+      }).catch(err => {
+        console.warn('Gitea hook verification failed:', (err as Error).message);
+      });
+    }
   } catch (err) {
     app.log.error(err);
     process.exit(1);
@@ -250,4 +323,4 @@ process.on('SIGTERM', shutdown);
 start();
 
 // Export for testing
-export { app, wsService, activityService, embeddingsService, notificationService, pluginEngine, configSyncService };
+export { app, wsService, mapServer, activityService, embeddingsService, notificationService, pluginEngine, configSyncService };

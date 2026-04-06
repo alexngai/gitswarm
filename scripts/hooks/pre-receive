@@ -1,0 +1,53 @@
+#!/bin/bash
+# GitSwarm pre-receive hook
+#
+# Installed in Gitea bare repos to enforce governance at the git protocol level.
+# Calls the GitSwarm internal API before accepting each push.
+#
+# Environment variables (set by Gitea or the hook installer):
+#   GITSWARM_API_URL       - GitSwarm API base URL (e.g., http://api:3000/api/v1)
+#   GITSWARM_INTERNAL_SECRET - Shared secret for authenticating with GitSwarm
+#   GITEA_PUSHER_NAME      - Username of the pusher (set by Gitea)
+
+GITSWARM_API_URL="${GITSWARM_API_URL:-http://api:3000/api/v1}"
+GITSWARM_INTERNAL_SECRET="${GITSWARM_INTERNAL_SECRET:-}"
+REPO_PATH="$(pwd)"
+
+while read oldrev newrev refname; do
+  # Skip delete pushes (newrev = 0000...)
+  if [ "$newrev" = "0000000000000000000000000000000000000000" ]; then
+    continue
+  fi
+
+  RESULT=$(curl -sf --max-time 10 \
+    "${GITSWARM_API_URL}/internal/git/pre-receive" \
+    -H "Content-Type: application/json" \
+    -H "X-Internal-Secret: ${GITSWARM_INTERNAL_SECRET}" \
+    -d "{
+      \"repo_path\": \"${REPO_PATH}\",
+      \"ref\": \"${refname}\",
+      \"old_sha\": \"${oldrev}\",
+      \"new_sha\": \"${newrev}\",
+      \"pusher\": \"${GITEA_PUSHER_NAME:-unknown}\"
+    }" 2>/dev/null)
+
+  # If curl fails (GitSwarm down), fail-open to avoid blocking all git operations
+  if [ $? -ne 0 ]; then
+    echo "GitSwarm: governance check unavailable — allowing push (fail-open)" >&2
+    continue
+  fi
+
+  ALLOWED=$(echo "$RESULT" | grep -o '"allowed":\s*\(true\|false\)' | grep -o 'true\|false')
+
+  if [ "$ALLOWED" != "true" ]; then
+    REASON=$(echo "$RESULT" | grep -o '"reason":"[^"]*"' | sed 's/"reason":"//;s/"$//')
+    echo "" >&2
+    echo "GitSwarm: push denied" >&2
+    echo "  Ref:    ${refname}" >&2
+    echo "  Reason: ${REASON:-governance check failed}" >&2
+    echo "" >&2
+    exit 1
+  fi
+done
+
+exit 0

@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { query } from '../config/database.js';
 import { authenticate, generateApiKey, hashApiKey } from '../middleware/authenticate.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
+import { giteaAdmin } from '../services/gitea-admin.js';
 
 export async function agentRoutes(app: FastifyInstance, options: Record<string, any> = {}): Promise<void> {
   const { activityService } = options;
@@ -43,6 +44,28 @@ export async function agentRoutes(app: FastifyInstance, options: Record<string, 
 
     const agent = result.rows[0];
 
+    // Create Gitea user + token if Gitea is configured (D2: 1:1 agent-to-Gitea-user mapping)
+    let giteaUsername: string | undefined;
+    if (giteaAdmin.isConfigured) {
+      try {
+        const giteaUser = await giteaAdmin.createAgentUser(agent.name);
+        const giteaToken = await giteaAdmin.createAgentToken(giteaUser.login, giteaUser.password);
+
+        // Store mapping (token stored as plaintext for clone URL generation —
+        // it's a machine-to-machine token in a self-hosted system)
+        await query(`
+          INSERT INTO gitswarm_agent_gitea_users (agent_id, gitea_user_id, gitea_username, gitea_token_hash)
+          VALUES ($1, $2, $3, $4)
+        `, [agent.id, giteaUser.id, giteaUser.login, giteaToken.sha1]);
+
+        giteaUsername = giteaUser.login;
+      } catch (err) {
+        // Non-fatal: agent is created but Gitea user creation failed.
+        // Log and continue — agent can still use the platform without Gitea.
+        console.error('Failed to create Gitea user for agent:', (err as Error).message);
+      }
+    }
+
     // Log activity
     if (activityService) {
       activityService.logActivity({
@@ -50,7 +73,7 @@ export async function agentRoutes(app: FastifyInstance, options: Record<string, 
         event_type: 'agent_registered',
         target_type: 'agent',
         target_id: agent.id,
-        metadata: { agent_name: agent.name },
+        metadata: { agent_name: agent.name, gitea_username: giteaUsername },
       }).catch(err => console.error('Failed to log activity:', err));
     }
 
@@ -62,6 +85,7 @@ export async function agentRoutes(app: FastifyInstance, options: Record<string, 
         karma: agent.karma,
         status: agent.status,
         created_at: agent.created_at,
+        gitea_username: giteaUsername,
       },
       api_key: apiKey,
       warning: 'Save your api_key now. It will not be shown again.',

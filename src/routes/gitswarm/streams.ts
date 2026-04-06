@@ -565,6 +565,31 @@ export async function streamRoutes(app: FastifyInstance, options: Record<string,
   });
 
   // ============================================================
+  // Consensus state (live query)
+  // ============================================================
+
+  app.get('/gitswarm/repos/:repoId/streams/:streamId/consensus', {
+    preHandler: [authenticate, rateLimitRead],
+  }, async (request, reply) => {
+    const { repoId, streamId } = (request.params as any);
+
+    const streamCheck = await query(
+      'SELECT id FROM gitswarm_streams WHERE id = $1 AND repo_id = $2',
+      [streamId, repoId]
+    );
+
+    if (streamCheck.rows.length === 0) {
+      return reply.status(404).send({ error: 'Stream not found' });
+    }
+
+    // Import the shared consensus function from map-handlers
+    const { checkConsensusDetailed } = await import('../../services/map-handlers.js');
+    const consensus = await checkConsensusDetailed(streamId, repoId);
+
+    return { consensus };
+  });
+
+  // ============================================================
   // Merge completed (records actual merge — called after git merge)
   // ============================================================
 
@@ -658,6 +683,14 @@ export async function streamRoutes(app: FastifyInstance, options: Record<string,
     const client = await getClient();
     try {
       await client.query('BEGIN');
+
+      // Record pending merge for pre-receive hook validation (Phase 2 governance).
+      // The pre-receive hook checks this table to verify that a push to a
+      // protected/buffer branch was initiated by a governance-approved merge.
+      await client.query(`
+        INSERT INTO gitswarm_pending_merges (repo_id, stream_id, expected_sha, status, expires_at)
+        VALUES ($1, $2, $3, 'pending', NOW() + INTERVAL '5 minutes')
+      `, [repoId, streamId, merge_commit || null]);
 
       // Record the merge
       await client.query(`

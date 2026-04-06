@@ -1,57 +1,33 @@
-# BotHub Docker Compose Configuration
+# GitSwarm Docker Compose Configuration
 # For local development and testing
+# Includes: GitSwarm API, Gitea (git hosting), PostgreSQL, Redis
 
 version: '3.8'
 
 services:
-  # PostgreSQL with pgvector extension
-  postgres:
-    image: pgvector/pgvector:pg16
-    container_name: bothub-postgres
-    environment:
-      POSTGRES_USER: bothub
-      POSTGRES_PASSWORD: bothub_dev_password
-      POSTGRES_DB: bothub
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./src/db/migrations:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bothub"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Redis for caching and pub/sub
-  redis:
-    image: redis:7-alpine
-    container_name: bothub-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # BotHub API (for production builds)
+  # GitSwarm API server
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: bothub-api
+    container_name: gitswarm-api
     ports:
       - "3000:3000"
     environment:
       NODE_ENV: production
       PORT: 3000
       HOST: 0.0.0.0
-      DATABASE_URL: postgresql://bothub:bothub_dev_password@postgres:5432/bothub
+      DATABASE_URL: postgresql://gitswarm:gitswarm_password@postgres:5432/gitswarm
       REDIS_URL: redis://redis:6379
       SESSION_SECRET: ${SESSION_SECRET:-change-me-in-production}
+      # Gitea integration (default git backend)
+      GITEA_URL: http://gitea:3000
+      GITEA_ADMIN_TOKEN: ${GITEA_ADMIN_TOKEN:-}
+      GITEA_INTERNAL_SECRET: ${GITEA_INTERNAL_SECRET:-gitswarm-internal-secret}
+      GITEA_SSH_URL: ssh://git@localhost:2222
+      GITEA_EXTERNAL_URL: http://localhost:3001
+      DEFAULT_GIT_BACKEND: gitea
+      # Optional: GitHub (for hybrid mode)
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
@@ -63,12 +39,95 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      gitea:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Gitea — lightweight git hosting (GitHub-compatible API)
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitswarm-gitea
+    ports:
+      - "3001:3000"    # Gitea web/API
+      - "2222:22"      # Git SSH
+    environment:
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=postgres:5432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=gitea
+      - GITEA__database__PASSWD=gitea_password
+      - GITEA__server__ROOT_URL=http://localhost:3001
+      - GITEA__server__SSH_PORT=2222
+      - GITEA__server__SSH_DOMAIN=localhost
+      - GITEA__webhook__ALLOWED_HOST_LIST=api,gitswarm-api,localhost,host.docker.internal
+      - GITEA__service__DISABLE_REGISTRATION=false
+      - GITEA__api__ENABLE_SWAGGER=false
+    volumes:
+      - gitea_data:/data
+      - gitea_repos:/data/gitea-repositories
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # PostgreSQL with pgvector (shared by GitSwarm and Gitea)
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: gitswarm-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-databases.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+      - ./src/db/migrations:/docker-entrypoint-initdb.d/migrations:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    container_name: gitswarm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # act_runner — GitHub Actions-compatible CI
+  act_runner:
+    image: gitea/act_runner:latest
+    container_name: gitswarm-runner
+    environment:
+      - GITEA_INSTANCE_URL=http://gitea:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      gitea:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   postgres_data:
   redis_data:
+  gitea_data:
+  gitea_repos:
 
 networks:
   default:
-    name: bothub-network
+    name: gitswarm-network

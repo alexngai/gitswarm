@@ -407,7 +407,7 @@ describe('Fix #5: Review sync before consensus check', () => {
 describe('Fix #7: Config template does not contain server-owned fields', () => {
   it('template config.yml should not include agent_access or min_karma as YAML keys', async () => {
     const { readFileSync } = await import('fs');
-    const content = readFileSync('/home/user/gitswarm/templates/.gitswarm/config.yml', 'utf-8');
+    const content = readFileSync('./templates/.gitswarm/config.yml', 'utf-8');
 
     // Should NOT have these as actual YAML keys (only in comments)
     const lines = content.split('\n').filter(l => !l.trim().startsWith('#'));
@@ -420,7 +420,7 @@ describe('Fix #7: Config template does not contain server-owned fields', () => {
 
   it('template should document server-owned fields in comments', async () => {
     const { readFileSync } = await import('fs');
-    const content = readFileSync('/home/user/gitswarm/templates/.gitswarm/config.yml', 'utf-8');
+    const content = readFileSync('./templates/.gitswarm/config.yml', 'utf-8');
 
     expect(content).toContain('server-owned');
     expect(content).toContain('agent_access');
