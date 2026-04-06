@@ -565,31 +565,6 @@ export async function streamRoutes(app: FastifyInstance, options: Record<string,
   });
 
   // ============================================================
-  // Consensus state (live query)
-  // ============================================================
-
-  app.get('/gitswarm/repos/:repoId/streams/:streamId/consensus', {
-    preHandler: [authenticate, rateLimitRead],
-  }, async (request, reply) => {
-    const { repoId, streamId } = (request.params as any);
-
-    const streamCheck = await query(
-      'SELECT id FROM gitswarm_streams WHERE id = $1 AND repo_id = $2',
-      [streamId, repoId]
-    );
-
-    if (streamCheck.rows.length === 0) {
-      return reply.status(404).send({ error: 'Stream not found' });
-    }
-
-    // Import the shared consensus function from map-handlers
-    const { checkConsensusDetailed } = await import('../../services/map-handlers.js');
-    const consensus = await checkConsensusDetailed(streamId, repoId);
-
-    return { consensus };
-  });
-
-  // ============================================================
   // Merge completed (records actual merge — called after git merge)
   // ============================================================
 

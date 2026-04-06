@@ -1,0 +1,52 @@
+# Local development stack: Gitea + PostgreSQL only
+# Run GitSwarm server separately via `npm run dev`
+#
+# Usage:
+#   docker compose -f scripts/local-stack.yml up -d
+#   npm run dev
+
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: gitswarm-dev-postgres
+    environment:
+      POSTGRES_USER: gitswarm
+      POSTGRES_PASSWORD: gitswarm_dev
+      POSTGRES_DB: gitswarm
+    ports:
+      - "5433:5432"
+    volumes:
+      - dev_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitswarm"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitswarm-dev-gitea
+    ports:
+      - "3001:3000"
+      - "2222:22"
+    environment:
+      - GITEA__database__DB_TYPE=sqlite3
+      - GITEA__server__ROOT_URL=http://localhost:3001
+      - GITEA__server__SSH_PORT=2222
+      - GITEA__server__SSH_DOMAIN=localhost
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__service__DISABLE_REGISTRATION=false
+      - GITEA__webhook__ALLOWED_HOST_LIST=*
+    volumes:
+      - dev_gitea_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  dev_postgres_data:
+  dev_gitea_data:
