@@ -1,16 +1,6 @@
 import { defineConfig } from 'vitest/config';
-import { resolve } from 'path';
-
-const sdkDir = resolve(__dirname, 'node_modules/@multi-agent-protocol/sdk/dist');
 
 export default defineConfig({
-  resolve: {
-    alias: {
-      '@multi-agent-protocol/sdk/server': resolve(sdkDir, 'server.js'),
-      '@multi-agent-protocol/sdk/testing': resolve(sdkDir, 'testing.js'),
-      '@multi-agent-protocol/sdk': resolve(sdkDir, 'index.js'),
-    },
-  },
   test: {
     globals: true,
     environment: 'node',
