@@ -8,8 +8,10 @@ export default defineConfig({
     hookTimeout: 30000,
     setupFiles: ['./tests/setup.ts'],
     include: ['tests/**/*.test.ts'],
-    deps: {
-      inline: ['@multi-agent-protocol/sdk'],
+    server: {
+      deps: {
+        inline: ['@multi-agent-protocol/sdk'],
+      },
     },
     coverage: {
       provider: 'v8',
