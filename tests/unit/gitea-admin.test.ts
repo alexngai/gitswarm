@@ -9,11 +9,13 @@ describe('GiteaAdmin', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.resetModules();
 
     // Set env before importing
     process.env.GITEA_URL = 'http://gitea:3000';
     process.env.GITEA_ADMIN_TOKEN = 'test-admin-token';
     process.env.GITEA_INTERNAL_SECRET = 'test-internal-secret';
+    delete process.env.GITEA_EXTERNAL_URL;
 
     // Dynamic import to pick up env
     const mod = await import('../../src/services/gitea-admin.js');
@@ -24,6 +26,7 @@ describe('GiteaAdmin', () => {
     delete process.env.GITEA_URL;
     delete process.env.GITEA_ADMIN_TOKEN;
     delete process.env.GITEA_INTERNAL_SECRET;
+    delete process.env.GITEA_EXTERNAL_URL;
   });
 
   function mockFetchResponse(status: number, body: any) {

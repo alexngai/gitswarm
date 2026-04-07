@@ -212,7 +212,7 @@ export default async function adminRoutes(fastify: FastifyInstance, options: Rec
     }
 
     // Perform action
-    let actionResult: Record<string, any> = {};
+    const actionResult: Record<string, any> = {};
     switch (action) {
       case 'dismiss':
         // Just mark as dismissed

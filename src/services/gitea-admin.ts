@@ -4,6 +4,7 @@
  * Manages Gitea resources (orgs, repos, users, webhooks, hooks)
  * on behalf of GitSwarm. Uses Gitea's REST API with an admin token.
  */
+import { createHmac, timingSafeEqual } from 'crypto';
 import { config } from '../config/env.js';
 
 interface GiteaOrg {
@@ -551,15 +552,13 @@ exit 0`;
   verifyWebhookSignature(payload: string, signature: string): boolean {
     if (!this.internalSecret) return false;
 
-    const crypto = require('crypto');
-    const expected = crypto
-      .createHmac('sha256', this.internalSecret)
+    const expected = createHmac('sha256', this.internalSecret)
       .update(payload)
       .digest('hex');
 
     if (signature.length !== expected.length) return false;
 
-    return crypto.timingSafeEqual(
+    return timingSafeEqual(
       Buffer.from(signature),
       Buffer.from(expected)
     );

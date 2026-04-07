@@ -100,7 +100,7 @@ export async function syncRoutes(app: FastifyInstance, options: Record<string, a
     } = (request.body as any);
 
     // Find or create personal org for this agent
-    let orgResult = await query(
+    const orgResult = await query(
       `SELECT id FROM gitswarm_orgs WHERE owner_id = $1 AND is_personal = true`,
       [agentId]
     );
