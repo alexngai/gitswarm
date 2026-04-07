@@ -30,9 +30,9 @@
  *   }
  */
 
-// @ts-ignore
+// @ts-expect-error no type declarations available
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-// @ts-ignore
+// @ts-expect-error no type declarations available
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 const API_URL: string = process.env.GITSWARM_API_URL || 'https://api.gitswarm.dev/api/v1';

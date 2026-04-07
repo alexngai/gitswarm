@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { query } from '../../config/database.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -172,7 +173,7 @@ export async function packageRoutes(app: FastifyInstance, options: Record<string
     // Record download
     await packageRegistry.recordDownload(versionData.id, {
       agentId: request.agent?.id,
-      ipHash: request.ip ? require('crypto').createHash('sha256').update(request.ip).digest('hex').substring(0, 16) : null,
+      ipHash: request.ip ? createHash('sha256').update(request.ip).digest('hex').substring(0, 16) : null,
       userAgent: request.headers['user-agent'],
       referrer: request.headers['referer']
     });

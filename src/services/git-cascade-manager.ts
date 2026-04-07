@@ -43,7 +43,7 @@ let MultiAgentRepoTracker: any = null;
 let Database: any = null;
 
 try {
-  // @ts-ignore
+  // @ts-expect-error git-cascade has no type declarations
   const gc = await import('git-cascade');
   MultiAgentRepoTracker = gc.MultiAgentRepoTracker;
 } catch {

@@ -4,7 +4,11 @@
 name: CI
 
 on:
-  workflow_dispatch:  # Temporarily disabled - was triggering on push/PR to main
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 env:
   NODE_VERSION: '20'
@@ -46,7 +50,7 @@ jobs:
         run: npm ci
 
       - name: Run tests
-        run: npm test
+        run: npm run test:unit
 
       - name: Upload coverage
         uses: codecov/codecov-action@v3
